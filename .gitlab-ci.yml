@@ -52,13 +52,13 @@ default:
 
 .fetch_cudnn_dev:template:
     cache:
-        - key: dev_cudnn_9_30_cuda_13_3
+        - key: dev_cudnn_9_30_cuda_13_4
           paths:
               - downloads
     before_script:
         - mkdir -p downloads
         - ls -1 downloads/
-        - python3 ci/fetch_cudnn.py --base-url https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/BLOSSOM/v9.30 --cuda-version 13.3 --require-artifact-prop pipeline_type=merge_request
+        - python3 ci/fetch_cudnn.py --base-url https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/BLOSSOM/v9.30 --cuda-version 13.4 --require-artifact-prop pipeline_type=merge_request
         - find /debug_cudnn
         - export CUDNN_PATH=/debug_cudnn # This is required for source building FE
         - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/debug_cudnn/lib64 # This is required for dlopening BE
