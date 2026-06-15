@@ -165,7 +165,7 @@ To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA
 - Results obtained on NVIDIA GB300 GPU
 
 ### GB300 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/dsv3/gb300/dsv3_top_left_causal.png)
+![DeepSeek V3 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/dsv3/gb300/dsv3_top_left.png)
 - SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
