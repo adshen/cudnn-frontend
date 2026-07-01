@@ -23,15 +23,21 @@ GITLAB_BRANCH = os.environ.get("GITLAB_SYNC_BRANCH", "develop")
 GITLAB_REMOTE_REF = "refs/remotes/gitlab-sync/develop"
 
 ALLOWED_GITLAB_ONLY_PATTERNS = (
+    # Repository infrastructure and documentation.
     ".gitlab-ci.yml",
     ".pre-commit-config.yaml",
-    "benchmark/norms/results_internal/**",
-    "benchmark/sdpa_benchmark_training/results_internal/**",
     "ci/**",
     "dockers/**",
     "docs/**",
     "internal/**",
+    # Internal benchmark results and tests.
+    "benchmark/norms/results_internal/**",
+    "benchmark/sdpa_benchmark_training/results_internal/**",
     "test/pycudnnTest/**",
+    # TBD GEMM feature.
+    "benchmark/TBD/gemm/**",
+    "python/cudnn/TBD/**",
+    "test/python/TBD/gemm/**",
 )
 
 

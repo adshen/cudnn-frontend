@@ -89,7 +89,6 @@ analysis:guardwords_scan:
 analysis:github-file-sync:
     needs: []
     stage: analysis
-    allow_failure: true
     image: python:3.12
     tags:
         - Blackwell
