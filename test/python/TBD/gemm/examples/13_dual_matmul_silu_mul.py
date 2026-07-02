@@ -40,9 +40,6 @@ def main(M: int = 256, N: int = 256, K: int = 128) -> None:
     DQ.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
     compiled = jit_from_cudnn_graph(g, cta_group=1)
-    print(f"[13] {compiled.chain.summary()}")
-    print(f"[13] num_gemms={compiled.chain.num_gemms} " f"distinct A={compiled.chain.num_a_operands} B={compiled.chain.num_b_operands}")
-    print(f"[13] generated kernel: {compiled.generated_path}")
 
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")

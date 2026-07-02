@@ -14,10 +14,8 @@ Usage:
 from __future__ import annotations
 
 import cudnn
-import cudnn.TBD.gemm  # noqa: F401
+import cudnn.TBD.gemm  # noqa: F401  (registers TBD_eng0 + installs hook)
 import torch
-
-from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 
 
 def main(M: int = 256, N: int = 256, K: int = 128) -> None:
@@ -32,16 +30,20 @@ def main(M: int = 256, N: int = 256, K: int = 128) -> None:
     Y = g.relu(input=C, name="r")
     Y.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
-    print(f"[05] {compiled.chain.summary()}")
-    print(f"[05] generated kernel: {compiled.generated_path}")
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.select_engines(["TBD_eng0"])
+    g.check_support()
+    g.build_plans()
 
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.float16, device="cuda")
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.float16, device="cuda")
     c = torch.empty(1, M, N, dtype=torch.float16, device="cuda")
 
-    compiled({A: a, B: b, Y: c})
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, Y: c}, workspace)
     torch.cuda.synchronize()
 
     ref = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))

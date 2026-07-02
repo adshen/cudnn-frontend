@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
+from cudnn.TBD.gemm.graph_analyzer import analyze, analyze_with_binding
 from cudnn.TBD.gemm.tile_config import by_name
 
 
@@ -22,16 +23,23 @@ def _mkdata(M: int, N: int, K: int, B: int = 1):
     return a, b
 
 
-def _vp(compiled, a, b, outs, *aux):
-    """Variant-pack dict {cuDNN tensor: buffer} from the compiled binding.
-    ``outs`` fills chain.outputs slot order (terminal, then taps); ``aux`` the
-    epilogue aux tensors in order."""
-    bd = compiled.binding
+def _vp(g, a, b, outs, *aux):
+    """Variant-pack dict {cuDNN tensor: buffer} keyed by the graph's tensors
+    (role->tensor recovered from the public analyzer binding). ``outs`` fills
+    chain.outputs slot order (terminal, then taps); ``aux`` the epilogue aux
+    tensors in order."""
+    bd = analyze_with_binding(g)[1]
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     vp = {bd.a_operands[0]: a, bd.b_operands[0]: b}
     vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
     vp.update({x: buf for x, buf in zip(bd.aux, aux)})
     return vp
+
+
+def _plan(g, **kw):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, **kw)
 
 
 def test_matmul_tap_only() -> None:
@@ -50,11 +58,11 @@ def test_matmul_tap_only() -> None:
     Y = g.relu(input=C, name="r")
     Y.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_tap]))
+    plan(_vp(g, a, b, [c_term, c_tap]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -89,11 +97,11 @@ def test_epilogue_reduction_tap_scalar(mode, ref_fn) -> None:
     R.set_dim([1, 1, 1]).set_stride([1, 1, 1])
     R.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_red = torch.empty(1, 1, 1, dtype=torch.float32, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_red]))
+    plan(_vp(g, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -133,11 +141,11 @@ def test_epilogue_reduction_tap_scalar_int32(mode, ref_fn) -> None:
     R.set_dim([1, 1, 1]).set_stride([1, 1, 1])
     R.set_output(True).set_data_type(cudnn.data_type.INT32)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.int32, device="cuda")
     c_red = torch.empty(1, 1, 1, dtype=torch.int32, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_red]))
+    plan(_vp(g, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.int32)
@@ -186,11 +194,11 @@ def test_epilogue_reduction_tap_partial(mode, red_shape: str, ref_dims: tuple[in
     R.set_dim(red_dims).set_stride([red_dims[1] * red_dims[2], red_dims[2], 1])
     R.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K, B)
     c_term = torch.empty(B, M, N, dtype=torch.bfloat16, device="cuda")
     c_red = torch.empty(*red_dims, dtype=torch.float32, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_red]))
+    plan(_vp(g, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -239,12 +247,12 @@ def test_epilogue_reduction_tap_strided_output(mode, red_shape: str, ref_dims: t
     R.set_dim(red_dims).set_stride(red_stride)
     R.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K, B)
     c_term = torch.empty(B, M, N, dtype=torch.bfloat16, device="cuda")
     c_red = torch.empty_strided(tuple(red_dims), tuple(red_stride), dtype=torch.float32, device="cuda")
     assert not c_red.is_contiguous()
-    compiled(_vp(compiled, a, b, [c_term, c_red]))
+    plan(_vp(g, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -284,11 +292,11 @@ def test_epilogue_reduction_tap_scalar_big_cgrp_multi_cta(mode, ref_fn) -> None:
     R.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster4x2")
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=2)
+    plan = _plan(g, config=cfg, cta_group=2)
     a, b = _mkdata(M, N, K, B)
     c_term = torch.empty(B, M, N, dtype=torch.float32, device="cuda")
     c_red = torch.empty(1, 1, 1, dtype=torch.float32, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_red]))
+    plan(_vp(g, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -328,11 +336,11 @@ def test_epilogue_reduction_tap_scalar_int32_big_cgrp_multi_cta(mode, ref_fn) ->
     R.set_output(True).set_data_type(cudnn.data_type.INT32)
 
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster4x2")
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=2)
+    plan = _plan(g, config=cfg, cta_group=2)
     a, b = _mkdata(M, N, K, B)
     c_term = torch.empty(B, M, N, dtype=torch.int32, device="cuda")
     c_red = torch.empty(1, 1, 1, dtype=torch.int32, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_red]))
+    plan(_vp(g, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.int32)
@@ -361,12 +369,12 @@ def test_mid_op_tap() -> None:
     Y = g.relu(input=Cb, name="r")
     Y.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     bias_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_tap], bias_t))
+    plan(_vp(g, a, b, [c_term, c_tap], bias_t))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -396,11 +404,11 @@ def test_dag_two_branches_from_matmul() -> None:
     Y2 = g.gelu_approx_tanh(input=C, name="g")
     Y2.set_output(True)  # → terminal (slot 0)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_tap]))
+    plan(_vp(g, a, b, [c_term, c_tap]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -432,13 +440,13 @@ def test_dag_two_branches_with_per_branch_ops() -> None:
     Y2 = g.gelu_approx_tanh(input=Cb2, name="g")
     Y2.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     bias1_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
     bias2_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_tap], bias1_t, bias2_t))
+    plan(_vp(g, a, b, [c_term, c_tap], bias1_t, bias2_t))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -466,10 +474,10 @@ def test_fan_in_relu_plus_gelu() -> None:
     Y = g.add(a=R, b=G, name="add")
     Y.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -495,11 +503,11 @@ def test_fan_in_with_intermediate_tap() -> None:
     Y = g.mul(a=R, b=G, name="mul")
     Y.set_output(True)  # terminal
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_relu = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_relu]))
+    plan(_vp(g, a, b, [c_term, c_relu]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -597,10 +605,10 @@ def test_complex_fusion_dag() -> None:
     Y = g.tanh(input=SC, name="t")
     Y.set_output(True)  # terminal (BF16)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
 
     # ---- Validate IR structure ---------------------------------------------
-    chain = compiled.chain
+    chain = analyze(g)
     assert len(chain.ops) == 7
     assert [op.op for op in chain.ops] == ["add", "relu", "mul", "gelu_tanh", "add", "mul", "tanh"]
     # parent_idx + parent_idx_b layout
@@ -636,9 +644,9 @@ def test_complex_fusion_dag() -> None:
     c_relu = torch.empty(1, M, N, device="cuda", dtype=torch.float32)
     c_addS = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
 
-    compiled(
+    plan(
         _vp(
-            compiled,
+            g,
             a,
             b,
             [c_term, c_mm, c_bias, c_relu, c_addS],
@@ -697,13 +705,13 @@ def test_two_taps_matmul_and_mid_op() -> None:
     Y = g.gelu_approx_tanh(input=Cb, name="g")
     Y.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     a, b = _mkdata(M, N, K)
     bias_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap_mm = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
     c_tap_bias = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled(_vp(compiled, a, b, [c_term, c_tap_mm, c_tap_bias], bias_t))
+    plan(_vp(g, a, b, [c_term, c_tap_mm, c_tap_bias], bias_t))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -737,15 +745,15 @@ def test_virtual_bf16_intermediate_loses_precision() -> None:
     Y.set_data_type(cudnn.data_type.FLOAT)  # fp32 output so we can compare tightly
     Y.set_output(True)
 
-    chain = jit_from_cudnn_graph(g).chain
+    chain = analyze(g)
     assert chain.matmul.out_dtype == "bf16"  # C rounded
     assert chain.ops[0].out_dtype == "bf16"  # T rounded before gelu
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
 
     a, b = _mkdata(M, N, K)
     scale_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
     c_out = torch.empty(1, M, N, device="cuda", dtype=torch.float32)
-    compiled(_vp(compiled, a, b, [c_out], scale_t))
+    plan(_vp(g, a, b, [c_out], scale_t))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -782,12 +790,12 @@ def test_m_major_op_tap() -> None:
     Y.set_output(True)
 
     cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=2, scheduler="clc")
+    plan = _plan(g, config=cfg, cta_group=2, scheduler="clc")
 
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, N, M, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
     c_tap = torch.empty(1, N, M, dtype=tap_tdt, device="cuda").transpose(1, 2)
-    compiled(_vp(compiled, a, b, [c_term, c_tap]))
+    plan(_vp(g, a, b, [c_term, c_tap]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())

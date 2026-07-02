@@ -106,9 +106,6 @@ def main(
 
     cfg = next(c for c in CATALOG if c.name == "CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
     compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=2)
-    print(f"[12] {compiled.chain.summary()}")
-    print(f"[12] block_scale: {compiled.chain.block_scale.combo}  " f"num_experts={compiled.chain.moe.num_experts}")
-    print(f"[12] generated kernel: {compiled.generated_path}")
 
     # Runtime tensors: packed FP4 (view as x2), SF in F8_128x4 blocked layout.
     # SFA is reordered + padded to 128 rows PER GROUP, then concatenated (general

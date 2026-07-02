@@ -51,10 +51,16 @@ from cudnn.TBD.gemm.kernel_registry import candidates as _candidates
 from cudnn.TBD.gemm.tile_config import CATALOG, TileConfig
 
 
-def _vp_moe(compiled, token, weight, fto, output):
-    """MoE single-GEMM variant-pack dict from the compiled binding."""
-    bd = compiled.binding
-    return {bd.a_operands[0]: token, bd.b_operands[0]: weight, bd.first_token_offset: fto, bd.outputs[0]: output}
+def _vp_moe(handles, token, weight, fto, output):
+    """MoE single-GEMM variant-pack dict keyed by the graph's tensors."""
+    TOK, W, FTO, OUT = handles
+    return {TOK: token, W: weight, FTO: fto, OUT: output}
+
+
+def _build_plan(g, cfg, name):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
 
 
 def _build_spec_map():
@@ -98,7 +104,7 @@ def _graph_moe(S: int, N: int, K: int, E: int):
         name="moe",
     )
     out.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
-    return g
+    return g, (tok, w, fto, out)
 
 
 def _offsets(S: int, E: int) -> torch.Tensor:
@@ -383,13 +389,13 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf) -> None:
         if cfg is None or not _compatible(cfg, N, K):
             continue
         try:
-            g = _graph_moe(S, N, K, E)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+            g, h = _graph_moe(S, N, K, E)
+            plan = _build_plan(g, cfg, name)
             for _ in range(warmup):
-                compiled(_vp_moe(compiled, wtok, ww, offsets, wout))
+                plan(_vp_moe(h, wtok, ww, offsets, wout))
             for i in range(iters):
                 tok, w, out = pool[i % nbuf]
-                compiled(_vp_moe(compiled, tok, w, offsets, out))
+                plan(_vp_moe(h, tok, w, offsets, out))
             torch.cuda.synchronize()
             print(f"[worker] OK   {name}")
         except Exception as e:
@@ -518,11 +524,11 @@ def main() -> int:
                 if args.stream:
                     print(f"  ▶ running {name} ...", flush=True)
                 try:
-                    g = _graph_moe(S, N, K, E)
-                    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+                    g, h = _graph_moe(S, N, K, E)
+                    plan = _build_plan(g, cfg, name)
                     ms = timer(
-                        _rotating(lambda t, _c=compiled: _c(_vp_moe(_c, t[0], t[1], offsets, t[2])), pool),
-                        lambda _c=compiled: _c(_vp_moe(_c, wtok, ww, offsets, wout)),
+                        _rotating(lambda t, _plan=plan, _h=h: _plan(_vp_moe(_h, t[0], t[1], offsets, t[2])), pool),
+                        lambda _plan=plan, _h=h: _plan(_vp_moe(_h, wtok, ww, offsets, wout)),
                         warmup=args.warmup,
                         iters=args.iters,
                     )

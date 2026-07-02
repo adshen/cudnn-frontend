@@ -50,17 +50,16 @@ from cudnn.TBD.gemm.kernel_registry import candidates as _candidates
 from cudnn.TBD.gemm.tile_config import CATALOG, TileConfig
 
 
-def _vp_moe_bs(compiled, token, weight, sfa, sfb, fto, output):
-    """MoE block-scale single-GEMM variant-pack dict from the compiled binding."""
-    bd = compiled.binding
-    return {
-        bd.a_operands[0]: token,
-        bd.b_operands[0]: weight,
-        bd.sfa_operands[0]: sfa,
-        bd.sfb_operands[0]: sfb,
-        bd.first_token_offset: fto,
-        bd.outputs[0]: output,
-    }
+def _vp_moe_bs(handles, token, weight, sfa, sfb, fto, output):
+    """MoE block-scale single-GEMM variant-pack dict keyed by the graph's tensors."""
+    TOK, W, SFA, SFB, FTO, OUT = handles
+    return {TOK: token, W: weight, SFA: sfa, SFB: sfb, FTO: fto, OUT: output}
+
+
+def _build_plan(g, cfg, name):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
 
 
 # combo : (is_fp4, block_size, a_dtype, sf_dtype)
@@ -100,7 +99,7 @@ def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
         name="moe",
     )
     out.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
-    return g
+    return g, (tok, w, SFA, SFB, fto, out)
 
 
 def _build_spec_map():
@@ -108,7 +107,7 @@ def _build_spec_map():
     MoE-block-scale strategy, via the registry funnel (MOE_BLOCK_SCALE templates
     only). Enumerated from an analyzed nvfp4 graph (the template set is the same
     for all combos)."""
-    chain = analyze(_graph_moe_bs(512, 256, 512, 2, "nvfp4"))
+    chain = analyze(_graph_moe_bs(512, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _candidates(chain):
         label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
@@ -462,13 +461,13 @@ def _nsys_worker(shape, combo, configs, warmup, iters, nbuf) -> None:
         if cfg is None or not _compatible(cfg, N, K, combo):
             continue
         try:
-            g = _graph_moe_bs(S, N, K, E, combo)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+            g, h = _graph_moe_bs(S, N, K, E, combo)
+            plan = _build_plan(g, cfg, name)
             for _ in range(warmup):
-                compiled(_vp_moe_bs(compiled, wset[0], wset[1], wset[2], wset[3], offsets, wset[4]))
+                plan(_vp_moe_bs(h, wset[0], wset[1], wset[2], wset[3], offsets, wset[4]))
             for i in range(iters):
                 t = pool[i % nbuf]
-                compiled(_vp_moe_bs(compiled, t[0], t[1], t[2], t[3], offsets, t[4]))
+                plan(_vp_moe_bs(h, t[0], t[1], t[2], t[3], offsets, t[4]))
             torch.cuda.synchronize()
             print(f"[worker] OK   {name}")
         except Exception as e:
@@ -601,11 +600,11 @@ def main() -> int:
                 if args.stream:
                     print(f"  ▶ running {name} ...", flush=True)
                 try:
-                    g = _graph_moe_bs(S, N, K, E, combo)
-                    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+                    g, h = _graph_moe_bs(S, N, K, E, combo)
+                    plan = _build_plan(g, cfg, name)
                     ms = timer(
-                        _rotating(lambda t, _c=compiled: _c(_vp_moe_bs(_c, t[0], t[1], t[2], t[3], offsets, t[4])), pool),
-                        lambda _c=compiled: _c(_vp_moe_bs(_c, wset[0], wset[1], wset[2], wset[3], offsets, wset[4])),
+                        _rotating(lambda t, _plan=plan, _h=h: _plan(_vp_moe_bs(_h, t[0], t[1], t[2], t[3], offsets, t[4])), pool),
+                        lambda _plan=plan, _h=h: _plan(_vp_moe_bs(_h, wset[0], wset[1], wset[2], wset[3], offsets, wset[4])),
                         warmup=args.warmup,
                         iters=args.iters,
                     )

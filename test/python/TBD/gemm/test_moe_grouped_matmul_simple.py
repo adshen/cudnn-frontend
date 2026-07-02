@@ -16,6 +16,31 @@ from cudnn.TBD.gemm.graph_analyzer import analyze
 from cudnn.TBD.gemm.tile_config import CATALOG
 
 
+class _Plan:
+    """Test handle that JIT-compiles a recorded graph with a forced tile config
+    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
+    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
+    aux_names and is callable with a variant pack."""
+
+    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
+        self.g = graph
+        kw = dict(cta_group=cta_group, scheduler=scheduler)
+        if config is not None:
+            kw["config"] = config
+        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        self.chain = self._compiled.chain
+        self.binding = self._compiled.binding
+        self.block_scale = self.chain.has_block_scale
+        self.aux_names = [t.name for t in self.chain.aux_tensors]
+
+    def __call__(self, variant_pack):
+        return self._compiled(variant_pack)
+
+
+def _plan(graph, config=None, cta_group=2, scheduler="clc"):
+    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
+
+
 def _vp_moe(compiled, token, weight, fto, output):
     """MoE single-GEMM variant-pack dict from the binding."""
     bd = compiled.binding
@@ -461,7 +486,7 @@ def test_moe_e2e(group_sizes, offset_cudnn_dt, offset_torch_dt, cfg_name, cta_gr
     E, N, K = 8, 256, 128
     S = sum(group_sizes)
     cfg = next(c for c in CATALOG if c.name == cfg_name)
-    compiled = jit_from_cudnn_graph(
+    compiled = _plan(
         _build_graph(E, S, N, K, offset_dt=offset_cudnn_dt),
         config=cfg,
         cta_group=cta_group,
@@ -502,7 +527,7 @@ def test_moe_block_quant_epilogue(
     S = sum(group_sizes)
     scale_shape = _quant_scale_shape(S, N, scale_reorder)
     cfg = next(c for c in CATALOG if c.name == cfg_name)
-    compiled = jit_from_cudnn_graph(
+    compiled = _plan(
         _build_graph(
             E,
             S,
@@ -565,7 +590,7 @@ def _run_moe_reduction(
         group_sizes = [64, 0, 120, 72]
     S = sum(group_sizes)
     cfg = next(c for c in CATALOG if c.name == cfg_name)
-    compiled = jit_from_cudnn_graph(
+    compiled = _plan(
         _build_graph(
             E,
             S,
@@ -737,7 +762,7 @@ def test_moe_nonpacked_tensors(cfg_name, cta_group, mode) -> None:
     E, N, K = 8, 256, 128
     S = sum(group_sizes)
     cfg = next(c for c in CATALOG if c.name == cfg_name)
-    compiled = jit_from_cudnn_graph(_build_graph(E, S, N, K), config=cfg, cta_group=cta_group)
+    compiled = _plan(_build_graph(E, S, N, K), config=cfg, cta_group=cta_group)
 
     token, weight, output = _mk_nonpacked_data(S, N, K, E, mode)
     offsets = _offsets(group_sizes, S)
@@ -813,7 +838,7 @@ def test_moe_bxe_gt_e(cfg_name, cta_group) -> None:
     ]
     num_groups = len(offset_values)  # 36 > E=9
     cfg = next(c for c in CATALOG if c.name == cfg_name)
-    compiled = jit_from_cudnn_graph(_build_graph(E, S, N, K), config=cfg, cta_group=cta_group)
+    compiled = _plan(_build_graph(E, S, N, K), config=cfg, cta_group=cta_group)
 
     torch.manual_seed(0)
     token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")

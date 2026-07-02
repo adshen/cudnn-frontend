@@ -42,8 +42,6 @@ def main(M: int = 256, N: int = 256, K: int = 256) -> None:
     C.set_data_type(cudnn.data_type.FLOAT)  # widen int32 acc -> fp32 out
 
     compiled = jit_from_cudnn_graph(g, config=CONFIG_sm100_128x128x128_128x128x32_cluster1x1, cta_group=1)
-    print(f"[10] {compiled.chain.summary()}")
-    print(f"[10] generated kernel: {compiled.generated_path}")
 
     torch.manual_seed(0)
     a = torch.randint(-40, 40, (1, M, K), dtype=torch.int8, device="cuda")

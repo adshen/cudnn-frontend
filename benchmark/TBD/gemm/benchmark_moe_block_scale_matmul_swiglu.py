@@ -35,16 +35,24 @@ import cudnn
 import cudnn.TBD.gemm  # noqa: F401  (installs hook)
 import torch
 
+from types import SimpleNamespace
+
 from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.graph_analyzer import analyze
 from cudnn.TBD.gemm.kernel_registry import candidates as _registry_candidates
 
 
-def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
-    """MoE block-scale multi-GEMM variant-pack dict from the binding. Each pair
-    is ``((token, sfa), (weight, sfb))``; dedup by packed-data identity into
-    distinct A/B slots, + first_token_offset + outputs + aux."""
-    bd = compiled.binding
+def _build_plan(g, cfg, cta_group, sched):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+
+
+def _vp_moe_bs_mg(handles, gemm_pairs, fto, outs, *aux):
+    """MoE block-scale multi-GEMM variant-pack dict keyed by the graph's tensors.
+    Each pair is ``((token, sfa), (weight, sfb))``; dedup by packed-data identity
+    into distinct A/B slots, + first_token_offset + outputs + aux."""
+    bd = handles
     a_seen, b_seen, sfa_seen, sfb_seen = [], [], [], []
     for (ag, sfag), (bg, sfbg) in gemm_pairs:
         if not any(ag is x for x in a_seen):
@@ -114,7 +122,9 @@ def _graph_swiglu(S, N, K, E, combo):
     mu = g.mul(a=s0, b=c1, name="mul0")
     dq = g.mul(a=mu, b=sf, name="dequant0")
     dq.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-    return g
+    return g, SimpleNamespace(
+        first_token_offset=fto, a_operands=[tok], b_operands=[w0, w1], sfa_operands=[SFA], sfb_operands=[SFB0, SFB1], outputs=[dq], aux=[sf]
+    )
 
 
 def _offsets(S, E):
@@ -196,7 +206,7 @@ def _build_spec_map():
     """Legacy label -> (geometry cfg, cta_group, scheduler) for every multi-GEMM
     MoE block-scale strategy. Dual block-scale TMEM fits two accs + SF only for
     cta_tile_n<=128; cgrp_size_n=1, cta_tile_m=128."""
-    chain = analyze(_graph_swiglu(1024, 256, 512, 2, "nvfp4"))
+    chain = analyze(_graph_swiglu(1024, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
         if cfg.arch != "sm100" or cfg.cta_tile_n > 128 or cfg.cgrp_size_n != 1 or cfg.cta_tile_m != 128:
@@ -254,18 +264,18 @@ def main() -> int:
             continue
         cfg, cta_group, sched = _SPEC_MAP[label]
         try:
-            g = _graph_swiglu(S, N, K, E, combo)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+            g, h = _graph_swiglu(S, N, K, E, combo)
+            plan = _build_plan(g, cfg, cta_group, sched)
         except (NotImplementedError, ValueError):
             continue
         gemm = [((tok, sfa), (w0, sfb0)), ((tok, sfa), (w1, sfb1))]
         try:
-            compiled(_vp_moe_bs_mg(compiled, gemm, offsets, out, scale))
+            plan(_vp_moe_bs_mg(h, gemm, offsets, out, scale))
             torch.cuda.synchronize()
         except Exception as e:  # noqa: BLE001
             print(f"  {label:66s} LAUNCH FAIL: {type(e).__name__}: {str(e)[:30]}")
             continue
-        ms = _time_ms(lambda: compiled(_vp_moe_bs_mg(compiled, gemm, offsets, out, scale)), warmup=args.warmup, iters=args.iters, delayed=delayed)
+        ms = _time_ms(lambda: plan(_vp_moe_bs_mg(h, gemm, offsets, out, scale)), warmup=args.warmup, iters=args.iters, delayed=delayed)
         tflops = flops / (ms * 1e-3) / 1e12
         ratio = bl_ms / ms if ms > 0 else 0.0
         print(f"  {label:66s} {tflops:8.2f} TFLOP/s  {ms:8.3f} ms   {ratio:>7.2f}×")

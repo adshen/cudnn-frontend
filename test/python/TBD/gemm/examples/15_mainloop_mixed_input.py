@@ -16,10 +16,8 @@ cast is `identity`, so it is lossless; any unary op chain works the same way
 from __future__ import annotations
 
 import cudnn
-import cudnn.TBD.gemm  # noqa: F401  (installs hook)
+import cudnn.TBD.gemm  # noqa: F401  (registers TBD_eng0 + installs hook)
 import torch
-
-from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 
 
 def _run(M: int, N: int, K: int) -> None:
@@ -36,18 +34,20 @@ def _run(M: int, N: int, K: int) -> None:
     C = g.matmul(A=Ai, B=B, name="mm")
     C.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)  # picks a mainloop template
-    print(f"[15] {compiled.chain.summary()}")
-    assert compiled.chain.mainloop_a_cast
-    assert compiled.chain.matmul.a_dtype == "bf16"
-    assert compiled.chain.mainloop_a_load_dtype == "int8"
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.select_engines(["TBD_eng0"])
+    g.check_support()
+    g.build_plans()
 
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch.int8).cuda()
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-4, 4).to(torch.bfloat16).cuda()
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
 
-    compiled({A: a, B: b, C: c})
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, C: c}, workspace)
     torch.cuda.synchronize()
 
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)

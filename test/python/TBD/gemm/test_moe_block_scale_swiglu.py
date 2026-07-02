@@ -26,6 +26,31 @@ from cudnn.TBD.gemm.graph_analyzer import analyze
 from cudnn.TBD.gemm.tile_config import CATALOG
 
 
+class _Plan:
+    """Test handle that JIT-compiles a recorded graph with a forced tile config
+    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
+    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
+    aux_names and is callable with a variant pack."""
+
+    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
+        self.g = graph
+        kw = dict(cta_group=cta_group, scheduler=scheduler)
+        if config is not None:
+            kw["config"] = config
+        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        self.chain = self._compiled.chain
+        self.binding = self._compiled.binding
+        self.block_scale = self.chain.has_block_scale
+        self.aux_names = [t.name for t in self.chain.aux_tensors]
+
+    def __call__(self, variant_pack):
+        return self._compiled(variant_pack)
+
+
+def _plan(graph, config=None, cta_group=2, scheduler="clc"):
+    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
+
+
 def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
     """MoE block-scale multi-GEMM variant-pack dict from the binding. Each pair
     is ``((token, sfa), (weight, sfb))``; dedup by packed-data identity into
@@ -214,7 +239,7 @@ def test_dual_moe_block_scale_swiglu(combo, cfg_name, cta_group) -> None:
     scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
 
     cfg = next(c for c in CATALOG if c.name == cfg_name)
-    compiled = jit_from_cudnn_graph(_build_graph(E, S, N, K, num_groups, combo), config=cfg, cta_group=cta_group)
+    compiled = _plan(_build_graph(E, S, N, K, num_groups, combo), config=cfg, cta_group=cta_group)
     assert compiled.chain.block_scale.combo == combo
 
     # SFA padded to 128 rows PER GROUP, then concatenated; SFB per-expert.
@@ -274,7 +299,7 @@ def test_dual_moe_block_scale_swiglu_reduction_scalar() -> None:
     scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
 
     cfg = next(c for c in CATALOG if c.name == _GEOMETRIES[1][0])
-    compiled = jit_from_cudnn_graph(
+    compiled = _plan(
         _build_graph(
             E,
             S,

@@ -122,11 +122,17 @@ def _build_spec_map():
 _SPEC_MAP = _build_spec_map()
 
 
-def _vp(compiled, a, b, c):
-    """Variant-pack dict {cuDNN tensor: buffer} from the compiled binding.
+def _vp(handles, a, b, c):
+    """Variant-pack dict {cuDNN tensor: buffer} keyed by the graph's tensors.
     `a` is the narrow (load-dtype) A root operand."""
-    bd = compiled.binding
-    return {bd.a_operands[0]: a, bd.b_operands[0]: b, bd.outputs[0]: c}
+    A, B, C = handles
+    return {A: a, B: b, C: c}
+
+
+def _build_plan(g, cfg, name):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +156,7 @@ def _graph_mixed_input(batch: int, M: int, N: int, K: int, load_dt: str, tin_dt:
     Bt = g.tensor(name="bTensor", dim=[batch, K, N], stride=[K * N, 1, K])
     C = g.matmul(A=Ai, B=Bt, name="mm")
     C.set_output(True).set_data_type(cu_tout)
-    return g
+    return g, (A, Bt, C)
 
 
 def _mkdata(batch: int, M: int, N: int, K: int, load_dt: str, tin_dt: str, tout_dt: str):
@@ -432,13 +438,13 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf, load_dt, tin_dt, tout_dt) 
         if cfg is None or not _compatible(cfg, M, N, K, tin_dt):
             continue
         try:
-            g = _graph_mixed_input(B, M, N, K, load_dt, tin_dt, tout_dt)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+            g, h = _graph_mixed_input(B, M, N, K, load_dt, tin_dt, tout_dt)
+            plan = _build_plan(g, cfg, name)
             for _ in range(warmup):
-                compiled(_vp(compiled, wa, wb, wc))
+                plan(_vp(h, wa, wb, wc))
             for i in range(iters):
                 a, b, c = pool[i % nbuf]
-                compiled(_vp(compiled, a, b, c))
+                plan(_vp(h, a, b, c))
             torch.cuda.synchronize()
             print(f"[worker] OK   {name}")
         except Exception as e:
@@ -566,11 +572,11 @@ def main() -> int:
                 if args.stream:
                     print(f"  ▶ running {name} ...", flush=True)
                 try:
-                    g = _graph_mixed_input(B, M, N, K, load_dt, tin_dt, tout_dt)
-                    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+                    g, h = _graph_mixed_input(B, M, N, K, load_dt, tin_dt, tout_dt)
+                    plan = _build_plan(g, cfg, name)
                     ms = timer(
-                        _rotating(lambda t, _c=compiled: _c(_vp(_c, t[0], t[1], t[2])), pool),
-                        lambda _c=compiled: _c(_vp(_c, wa, wb, wc)),
+                        _rotating(lambda t, _plan=plan, _h=h: _plan(_vp(_h, t[0], t[1], t[2])), pool),
+                        lambda _plan=plan, _h=h: _plan(_vp(_h, wa, wb, wc)),
                         warmup=args.warmup,
                         iters=args.iters,
                     )

@@ -2130,6 +2130,39 @@ def _check_block_quant_supported(
 _FORCE_STG_EPI = False
 
 
+def probe_supported(
+    graph: cudnn.pygraph,
+    config: TileConfig = DEFAULT_CONFIG,
+    *,
+    cta_group: int = 2,
+    scheduler: str = "clc",
+) -> None:
+    """Cheap eligibility check — the gates :func:`jit_from_cudnn_graph` runs, but
+    WITHOUT ``cute.compile``. Raises ``NotImplementedError`` / ``ValueError`` if
+    the GEMM engine cannot run the graph. Used by the TBD engine probe to decide
+    whether to list ``TBD_eng0`` in the plan list (see cudnn.TBD.heuristics).
+
+    Block-scale / MoE have their per-side gates inside the specialized ``_jit_*``
+    compile paths; analysis succeeding is treated as eligible for those and the
+    full validation surfaces at compile time (when the engine is selected)."""
+    chain, _binding = analyze_with_binding(graph)
+    if chain.has_moe or chain.has_block_scale:
+        return  # specialized paths validate at compile
+    if chain.is_multi_gemm:
+        from .kernel_registry import select_template
+
+        tmpl = select_template(chain, config, cta_group, scheduler)
+        if not tmpl.supports_multi_gemm:
+            raise NotImplementedError(
+                f"multi-GEMM ({chain.num_gemms} parallel GEMMs) is only supported "
+                f"by the 1ctamma CLC template this pass; got cta_group={cta_group}, "
+                f"scheduler={scheduler!r} → {tmpl.file}."
+            )
+    _check_supported(chain, config)
+    _check_dtype_config_compat(chain, config, cta_group)
+    _check_input_alignment(chain)
+
+
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,

@@ -29,6 +29,31 @@ from test_block_scale import (
 )
 
 
+class _Plan:
+    """Test handle that JIT-compiles a recorded graph with a forced tile config
+    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
+    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
+    aux_names and is callable with a variant pack."""
+
+    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
+        self.g = graph
+        kw = dict(cta_group=cta_group, scheduler=scheduler)
+        if config is not None:
+            kw["config"] = config
+        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        self.chain = self._compiled.chain
+        self.binding = self._compiled.binding
+        self.block_scale = self.chain.has_block_scale
+        self.aux_names = [t.name for t in self.chain.aux_tensors]
+
+    def __call__(self, variant_pack):
+        return self._compiled(variant_pack)
+
+
+def _plan(graph, config=None, cta_group=2, scheduler="clc"):
+    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
+
+
 def _vp_bs_mg(compiled, gemm_pairs, outs, *aux):
     """Block-scale multi-GEMM variant-pack dict from the binding. Each pair is
     ``((a, sfa), (b, sfb))``; dedup by packed-data identity into distinct A/B
@@ -193,7 +218,7 @@ def _run(combo, config_name, M, N, K):
     pairs, ref = _dual_bs_runtime(combo, M, N, K)
 
     g = _build_dual_bs_graph(M, N, K, combo=combo)
-    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
+    compiled = _plan(g, **_kw(config_name))
     assert compiled.chain.is_multi_gemm and compiled.block_scale
     assert compiled.chain.block_scale.combo == combo
 
@@ -230,7 +255,7 @@ def _run_reduction(
         reduction_mode=mode,
         red_dims=red_dims,
     )
-    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
+    compiled = _plan(g, **_kw(config_name))
     assert compiled.chain.is_multi_gemm and compiled.block_scale
     assert compiled.chain.reductions
 
@@ -355,7 +380,4 @@ def test_dual_block_scale_reduction_rejects_int32():
         red_dtype=cudnn.data_type.INT32,
     )
     with pytest.raises(NotImplementedError, match="fp32 compute/output"):
-        jit_from_cudnn_graph(
-            g,
-            **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"),
-        )
+        jit_from_cudnn_graph(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))

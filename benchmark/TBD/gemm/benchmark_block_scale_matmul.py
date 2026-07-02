@@ -89,10 +89,16 @@ _SPEC_MAP = _build_spec_map()
 from cudnn.TBD.gemm.tile_config import CATALOG, TileConfig, validate_block_scale_config
 
 
-def _vp_bs(compiled, a, b, c, sfa, sfb):
-    """Block-scale single-GEMM variant-pack dict from the compiled binding."""
-    bd = compiled.binding
-    return {bd.a_operands[0]: a, bd.b_operands[0]: b, bd.sfa_operands[0]: sfa, bd.sfb_operands[0]: sfb, bd.outputs[0]: c}
+def _vp_bs(handles, a, b, c, sfa, sfb):
+    """Block-scale single-GEMM variant-pack dict keyed by the graph's tensors."""
+    A, B, C, SFA, SFB = handles
+    return {A: a, B: b, SFA: sfa, SFB: sfb, C: c}
+
+
+def _build_plan(g, cfg, name):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +137,7 @@ def _graph_block_scale(batch: int, M: int, N: int, K: int, combo: str):
     Bd = g.block_scale_dequantize(input=Bt, descale=SFB, block_size=[block_size, 1])
     C = g.matmul(A=Ad, B=Bd, name="mm")
     C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)  # BF16 output
-    return g
+    return g, (A, Bt, C, SFA, SFB)
 
 
 def _ceil_div(a, b):
@@ -589,14 +595,14 @@ def _nsys_worker(shape, combo, configs, warmup, iters, ref_mode, nbuf) -> None:
         if cfg is None or not _compatible(cfg, M, N, K, combo):
             continue
         try:
-            g = _graph_block_scale(B, M, N, K, combo)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+            g, h = _graph_block_scale(B, M, N, K, combo)
+            plan = _build_plan(g, cfg, name)
             wa, wb, wc, wsfa, wsfb = wset
             for _ in range(warmup):
-                compiled(_vp_bs(compiled, wa, wb, wc, wsfa, wsfb))
+                plan(_vp_bs(h, wa, wb, wc, wsfa, wsfb))
             for i in range(iters):
                 s = pool[i % nbuf]
-                compiled(_vp_bs(compiled, s[0], s[1], s[2], s[3], s[4]))
+                plan(_vp_bs(h, s[0], s[1], s[2], s[3], s[4]))
             torch.cuda.synchronize()
             print(f"[worker] OK   {name}")
         except Exception as e:
@@ -758,15 +764,15 @@ def main() -> int:
                 if args.stream:
                     print(f"  ▶ running {name} ...", flush=True)
                 try:
-                    g = _graph_block_scale(B, M, N, K, combo)
-                    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+                    g, h = _graph_block_scale(B, M, N, K, combo)
+                    plan = _build_plan(g, cfg, name)
                     wa, wb, wc, wsfa, wsfb = wset
                     ms = timer(
                         _rotating(
-                            lambda s, _c=compiled: _c(_vp_bs(_c, s[0], s[1], s[2], s[3], s[4])),
+                            lambda s, _plan=plan, _h=h: _plan(_vp_bs(_h, s[0], s[1], s[2], s[3], s[4])),
                             pool,
                         ),
-                        lambda _c=compiled: _c(_vp_bs(_c, wa, wb, wc, wsfa, wsfb)),
+                        lambda _plan=plan, _h=h: _plan(_vp_bs(_h, wa, wb, wc, wsfa, wsfb)),
                         warmup=args.warmup,
                         iters=args.iters,
                     )

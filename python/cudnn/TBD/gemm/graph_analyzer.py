@@ -26,11 +26,14 @@ automatically analyzable. Graphs built BEFORE the import are not — call
 
 from __future__ import annotations
 
+import logging
 import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
 import cudnn
+
+_LOG = logging.getLogger(__name__)
 
 from .fusion_ir import (
     AMajor,
@@ -631,6 +634,54 @@ def _patched_tensor_set_dim(self, dim):
 def _patched_tensor_set_reordering_type(self, rt):
     _TENSOR_REORDERING_OVERRIDE[id(self)] = rt.name if getattr(rt, "name", "NONE") != "NONE" else None
     return _ORIGINALS["tensor.set_reordering_type"](self, rt)
+
+
+# ---------------------------------------------------------------------------
+# GEMM engine (named "TBD_eng0") — registered with the shared cudnn.TBD dispatch
+# (see cudnn/TBD/heuristics.py). ``probe_gemm_plan`` decides eligibility (no
+# compile); ``build_gemm_plan`` JIT-compiles when the engine is selected. The
+# engine selects its own config; forced-config callers use jit_from_cudnn_graph.
+# ---------------------------------------------------------------------------
+
+
+def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
+    """Cheap eligibility check for the ``TBD_eng0`` GEMM engine — analyze + the
+    support gates, NO ``cute.compile``. Returns True if the GEMM engine should be
+    listed in the plan list for this graph. Never raises (a probe must not break
+    the native path)."""
+    state = _get_state(graph)
+    if state is None or not state.get("ops"):
+        return False  # graph wasn't recorded by the hook → not a GEMM candidate
+    from .compiler import probe_supported
+
+    try:
+        probe_supported(graph)
+    except (NotImplementedError, ValueError):
+        return False
+    except Exception:  # noqa: BLE001
+        _LOG.debug("cudnn.TBD.gemm: probe_supported raised unexpectedly; ineligible", exc_info=True)
+        return False
+    return True
+
+
+def build_gemm_plan(graph: cudnn.pygraph):
+    """Analyze + JIT the recorded graph into a compiled GEMM plan.
+
+    Returns a callable :class:`CompiledFusedGemm` on success; raises
+    ``NotImplementedError`` / ``ValueError`` (type + message preserved) when the
+    engine rejects the graph — same as calling ``jit_from_cudnn_graph`` directly.
+    Raises ``ValueError`` if the graph was never recorded (import-order error)."""
+    state = _get_state(graph)
+    if state is None or not state.get("ops"):
+        raise ValueError(
+            "cudnn.TBD.gemm: this graph has no recorded ops — import "
+            "cudnn.TBD.gemm BEFORE constructing the graph so the recorder hook "
+            "is installed before g = cudnn.pygraph(...). The op chain cannot be "
+            "reconstructed after the fact."
+        )
+    from .compiler import jit_from_cudnn_graph
+
+    return jit_from_cudnn_graph(graph)
 
 
 def install_recorder() -> None:

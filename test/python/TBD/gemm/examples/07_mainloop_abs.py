@@ -11,10 +11,8 @@ cases: A-only (`abs(A) @ B`), B-only (`A @ relu(B)`), and both
 from __future__ import annotations
 
 import cudnn
-import cudnn.TBD.gemm  # noqa: F401  (installs hook)
+import cudnn.TBD.gemm  # noqa: F401  (registers TBD_eng0 + installs hook)
 import torch
-
-from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 
 _T = {"abs": torch.abs, "relu": torch.relu, "none": lambda x: x}
 
@@ -32,16 +30,20 @@ def _run(aop: str, bop: str, M: int, N: int, K: int) -> None:
     C = g.matmul(A=Ai, B=Bi, name="mm")
     C.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
-    print(f"[07] {compiled.chain.summary()}")
-    assert compiled.chain.has_mainloop_fusion
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.select_engines(["TBD_eng0"])
+    g.check_support()
+    g.build_plans()
 
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
 
-    compiled({A: a, B: b, C: c})
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, C: c}, workspace)
     torch.cuda.synchronize()
 
     ref = torch.einsum("bmk,bnk->bmn", _T[aop](a.float()), _T[bop](b.float())).to(torch.bfloat16)
@@ -65,8 +67,12 @@ def _run_scaled(M: int, N: int, K: int, av: float = 2.0, bv: float = 0.5) -> Non
     C = g.matmul(A=As, B=Bs, name="mm")
     C.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
-    print(f"[07] {compiled.chain.summary()}  aux={compiled.aux_names}")
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.select_engines(["TBD_eng0"])
+    g.check_support()
+    g.build_plans()
 
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
@@ -76,7 +82,8 @@ def _run_scaled(M: int, N: int, K: int, av: float = 2.0, bv: float = 0.5) -> Non
         "alpha": torch.full((1, 1, 1), av, dtype=torch.bfloat16, device="cuda"),
         "beta": torch.full((1, 1, 1), bv, dtype=torch.bfloat16, device="cuda"),
     }
-    compiled({A: a, B: b, C: c, **auxmap})
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, C: c, **auxmap}, workspace)
     torch.cuda.synchronize()
 
     ref = torch.einsum("bmk,bnk->bmn", a.float() * av, b.float() * bv).to(torch.bfloat16)

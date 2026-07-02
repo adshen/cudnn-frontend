@@ -18,6 +18,31 @@ from cudnn.TBD.gemm.graph_analyzer import analyze
 from cudnn.TBD.gemm.tile_config import CATALOG, DEFAULT_CONFIG, by_name
 
 
+class _Plan:
+    """Test handle that JIT-compiles a recorded graph with a forced tile config
+    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
+    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
+    aux_names and is callable with a variant pack."""
+
+    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
+        self.g = graph
+        kw = dict(cta_group=cta_group, scheduler=scheduler)
+        if config is not None:
+            kw["config"] = config
+        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        self.chain = self._compiled.chain
+        self.binding = self._compiled.binding
+        self.block_scale = self.chain.has_block_scale
+        self.aux_names = [t.name for t in self.chain.aux_tensors]
+
+    def __call__(self, variant_pack):
+        return self._compiled(variant_pack)
+
+
+def _plan(graph, config=None, cta_group=2, scheduler="clc"):
+    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
+
+
 def _vp_mg(compiled, gemm_pairs, outs, *aux):
     """Variant-pack dict for a multi-GEMM call. Dedups the per-GEMM (a, b)
     pairs by tensor identity into the binding's distinct A / B slots (first
@@ -202,7 +227,7 @@ def test_multi_gemm_2ctamma_compiles() -> None:
     C1 = g.matmul(A=A, B=B1, name="m1")
     Y = g.add(a=C0, b=C1, name="a")
     Y.set_output(True)
-    compiled = jit_from_cudnn_graph(g, _N256_C2_CFG, cta_group=2)
+    compiled = _plan(g, _N256_C2_CFG, cta_group=2)
     assert compiled.chain.num_gemms == 2
 
 
@@ -345,7 +370,7 @@ def test_dual_silu_mul_end_to_end() -> None:
     MU = g.mul(a=S0, b=C1, name="m")
     DQ = g.mul(a=MU, b=sc, name="d")
     DQ.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-    compiled = jit_from_cudnn_graph(g, DEFAULT_CONFIG, cta_group=1)
+    compiled = _plan(g, DEFAULT_CONFIG, cta_group=1)
 
     torch.manual_seed(0)
     a, b0 = _rand(M, N, K, 0.4)
@@ -370,7 +395,7 @@ def test_distinct_operands_end_to_end() -> None:
     R = g.relu(input=C0, name="r")
     Y = g.add(a=R, b=C1, name="a")
     Y.set_output(True)
-    compiled = jit_from_cudnn_graph(g, _N128_CFG, cta_group=1)
+    compiled = _plan(g, _N128_CFG, cta_group=1)
 
     torch.manual_seed(1)
     a0, b0 = _rand(M, N, K, 0.4)
@@ -393,7 +418,7 @@ def test_three_gemm_end_to_end() -> None:
     P = g.mul(a=Cs[0], b=Cs[1], name="p")
     Y = g.add(a=P, b=Cs[2], name="ad")
     Y.set_output(True)
-    compiled = jit_from_cudnn_graph(g, _N128_CFG, cta_group=1)
+    compiled = _plan(g, _N128_CFG, cta_group=1)
     assert compiled.chain.num_gemms == 3
 
     torch.manual_seed(2)
@@ -420,7 +445,7 @@ def test_three_gemm_end_to_end() -> None:
 def test_multi_gemm_reduction_scalar_fp32(mode, ref_dims) -> None:
     M, N, K = 256, 128, 128
     g = _build_dual_add_reduction(1, M, N, K, mode, [1, 1, 1])
-    compiled = jit_from_cudnn_graph(g, _N128_CFG, cta_group=1)
+    compiled = _plan(g, _N128_CFG, cta_group=1)
 
     a, b0, b1 = _mk_bf16(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
@@ -450,7 +475,7 @@ def test_multi_gemm_reduction_scalar_int32(mode, ref_dims) -> None:
     if sm[0] * 10 + sm[1] not in (100, 110):
         pytest.skip("int8 multi-GEMM requires SM100 or SM110")
     g = _build_dual_add_reduction_int32(1, M, N, K, mode, [1, 1, 1])
-    compiled = jit_from_cudnn_graph(g, _N128_CFG, cta_group=1)
+    compiled = _plan(g, _N128_CFG, cta_group=1)
 
     a, b0, b1 = _mk_int8(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.int32, device="cuda")
@@ -476,7 +501,7 @@ def test_multi_gemm_reduction_scalar_int32(mode, ref_dims) -> None:
 def test_multi_gemm_reduction_strided_output_fp32(mode, red_dims, red_stride, ref_dims) -> None:
     M, N, K = 256, 128, 128
     g = _build_dual_add_reduction(1, M, N, K, mode, red_dims)
-    compiled = jit_from_cudnn_graph(g, _N128_CFG, cta_group=1)
+    compiled = _plan(g, _N128_CFG, cta_group=1)
 
     a, b0, b1 = _mk_bf16(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
@@ -504,7 +529,7 @@ def test_multi_gemm_reduction_big_cgrp_multi_cta(mode, ref_fn) -> None:
     B, M, N, K = 2, 512, 256, 128
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster4x2")
     g = _build_dual_add_reduction(B, M, N, K, mode, [1, 1, 1])
-    compiled = jit_from_cudnn_graph(g, cfg, cta_group=2)
+    compiled = _plan(g, cfg, cta_group=2)
 
     a, b0, b1 = _mk_bf16(M, N, K, B)
     c_term = torch.empty(B, M, N, dtype=torch.float32, device="cuda")
@@ -526,7 +551,7 @@ def test_single_gemm_still_runs_on_1ctamma() -> None:
     C = g.matmul(A=A, B=B, name="mm")
     Y = g.relu(input=C, name="r")
     Y.set_output(True)
-    compiled = jit_from_cudnn_graph(g, DEFAULT_CONFIG, cta_group=1)
+    compiled = _plan(g, DEFAULT_CONFIG, cta_group=1)
 
     torch.manual_seed(3)
     a, b = _rand(M, N, K)

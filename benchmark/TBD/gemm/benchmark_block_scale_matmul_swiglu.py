@@ -36,16 +36,24 @@ import cudnn
 import cudnn.TBD.gemm  # noqa: F401  (installs hook)
 import torch
 
+from types import SimpleNamespace
+
 from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.graph_analyzer import analyze
 from cudnn.TBD.gemm.kernel_registry import candidates as _registry_candidates
 
 
-def _vp_bs_mg(compiled, gemm_pairs, outs, *aux):
-    """Block-scale multi-GEMM variant-pack dict from the binding. Each pair is
-    ``((a, sfa), (b, sfb))``; dedup by packed-data identity into distinct A/B
-    slots (SF travels with its data), + outputs + aux."""
-    bd = compiled.binding
+def _build_plan(g, cfg, cta_group, sched):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+
+
+def _vp_bs_mg(handles, gemm_pairs, outs, *aux):
+    """Block-scale multi-GEMM variant-pack dict keyed by the graph's tensors. Each
+    pair is ``((a, sfa), (b, sfb))``; dedup by packed-data identity into distinct
+    A/B slots (SF travels with its data), + outputs + aux."""
+    bd = handles
     a_seen, b_seen, sfa_seen, sfb_seen = [], [], [], []
     for (ag, sfag), (bg, sfbg) in gemm_pairs:
         if not any(ag is x for x in a_seen):
@@ -110,7 +118,7 @@ def _graph(B, M, N, K, bs=16):
     C1 = g.matmul(A=Ad, B=B1d, name="mm1")
     Y = g.mul(a=g.swish(input=C0), b=C1)
     Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-    return g
+    return g, SimpleNamespace(a_operands=[A], b_operands=[B0, B1], sfa_operands=[SFA], sfb_operands=[SFB0, SFB1], outputs=[Y], aux=[])
 
 
 def _mkdata(B, M, N, K, bs=16):
@@ -183,7 +191,7 @@ def _build_spec_map():
     the full suffixed names. Block-scale pins cta_tile_n=128 (SF 128x4 swizzle +
     dual-GEMM TMEM: 256 overflows, 64/32 break the swizzle), so only those
     geometries appear."""
-    chain = analyze(_graph(1, 256, 128, 512))  # a dual nvfp4 block-scale chain
+    chain = analyze(_graph(1, 256, 128, 512)[0])  # a dual nvfp4 block-scale chain
     m = {}
     for t, cfg in _registry_candidates(chain):
         if cfg.arch != "sm100" or cfg.cta_tile_m != 128 or cfg.cta_tile_n != 128:
@@ -235,19 +243,20 @@ def main() -> int:
             continue
         cfg, cta_group, sched = _SPEC_MAP[name]
         try:
-            compiled = jit_from_cudnn_graph(_graph(B, M, N, K), config=cfg, cta_group=cta_group, scheduler=sched)
+            g, h = _graph(B, M, N, K)
+            plan = _build_plan(g, cfg, cta_group, sched)
         except (NotImplementedError, ValueError) as e:
             print(f"  {name:62s} SKIP: {str(e)[:42]}")
             continue
         try:
-            compiled(_vp_bs_mg(compiled, pairs, out))
+            plan(_vp_bs_mg(h, pairs, out))
             torch.cuda.synchronize()
         except Exception as e:  # noqa: BLE001
             print(f"  {name:62s} LAUNCH FAIL: {type(e).__name__}: {str(e)[:30]}")
             continue
         ok = torch.allclose(out.float(), ref.float(), rtol=2e-2, atol=2e-1)  # swish: fast approx
         err = (out.float() - ref.float()).abs().max().item()
-        ms = _time_ms(lambda: compiled(_vp_bs_mg(compiled, pairs, out)), warmup=args.warmup, iters=args.iters, delayed=delayed)
+        ms = _time_ms(lambda: plan(_vp_bs_mg(h, pairs, out)), warmup=args.warmup, iters=args.iters, delayed=delayed)
         ratio = bl_ms / ms if ms > 0 else 0.0
         flag = "" if ok else f"  !! maxerr={err:.3g}"
         print(f"  {name:62s} {flops / (ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{ms:8.3f} ms   {ratio:>7.2f}×{flag}")

@@ -13,11 +13,36 @@ import cudnn.TBD.gemm  # noqa: F401  (installs recorder)
 import pytest
 import torch
 
+from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.graph_analyzer import analyze
 import re
 
-from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.tile_config import by_name
+
+
+class _Plan:
+    """Test handle that JIT-compiles a recorded graph with a forced tile config
+    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
+    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
+    aux_names and is callable with a variant pack."""
+
+    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
+        self.g = graph
+        kw = dict(cta_group=cta_group, scheduler=scheduler)
+        if config is not None:
+            kw["config"] = config
+        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        self.chain = self._compiled.chain
+        self.binding = self._compiled.binding
+        self.block_scale = self.chain.has_block_scale
+        self.aux_names = [t.name for t in self.chain.aux_tensors]
+
+    def __call__(self, variant_pack):
+        return self._compiled(variant_pack)
+
+
+def _plan(graph, config=None, cta_group=2, scheduler="clc"):
+    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
 
 
 def _vp_bs(compiled, a, b, outs, sfa, sfb, *aux):
@@ -433,7 +458,7 @@ def _run_bs_numeric(combo, config_name, M, N, K, out_major="n"):
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, out_major=out_major)
-    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
+    compiled = _plan(g, **_kw(config_name))
     assert compiled.block_scale and compiled.chain.block_scale.combo == combo
 
     if out_major == "m":
@@ -496,7 +521,7 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
         sfb_log = _rand_e8m0((N, sf_k), dev)
 
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=sf_dt, a_dt=a_dt)
-    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
+    compiled = _plan(g, **_kw(config_name))
     c_storage = torch.zeros(1, M, N + c_pad, dtype=torch.float16, device=dev)
     c = c_storage[:, :, :N]
     assert not a_rt.is_contiguous() or not b_rt.is_contiguous()
@@ -588,7 +613,7 @@ def _run_bs_quant_numeric(
         scale_dim=scale_dim,
         global_scale=global_scale is not None,
     )
-    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
+    compiled = _plan(g, **_kw(config_name))
     assert compiled.block_scale and compiled.chain.block_quant is not None
 
     q = torch.empty(1, M, N, dtype=out_torch_dt, device=dev)
@@ -757,7 +782,7 @@ def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_s
         a_dt=a_dt,
         red_stride=red_stride,
     )
-    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
+    compiled = _plan(g, **_kw(config_name))
     assert compiled.block_scale and compiled.chain.reductions
 
     c_term = torch.empty(1, M, N, dtype=torch.float32, device=dev)
@@ -863,10 +888,7 @@ def test_block_scale_reduction_rejects_int32():
         red_compute_dtype=cudnn.data_type.INT32,
     )
     with pytest.raises(NotImplementedError, match="fp32 compute/output"):
-        jit_from_cudnn_graph(
-            g,
-            **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"),
-        )
+        jit_from_cudnn_graph(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
 
 
 @_GPU
@@ -908,7 +930,7 @@ def test_nvfp4_oob_shape(config_name):
     Bd = g.block_scale_dequantize(input=B, descale=SFB, block_size=[bs, 1])
     C = g.matmul(A=Ad, B=Bd, name="mm")
     C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
+    compiled = _plan(g, **_kw(config_name))
 
     c = torch.zeros(1, M, N, dtype=torch.bfloat16, device=dev)
     compiled(
@@ -964,7 +986,7 @@ def test_mxfp8_m_major_a_n_major_b(config_name, M, N, K):
     g = _build_nvfp4_graph(M, N, K, block_size=bs, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3, a_major="m", b_major="n")
     chain = analyze(g)
     assert chain.matmul.a_major == "m" and chain.matmul.b_major == "n"
-    compiled = jit_from_cudnn_graph(g, **_kw(config_name))
+    compiled = _plan(g, **_kw(config_name))
 
     c = torch.zeros(1, M, N, dtype=torch.float16, device=dev)
     compiled(_vp_bs(compiled, a_rt_m, b_rt_n, c, _to_blocked(sfa_log).view(1, M, sf_k), _to_blocked(sfb_log).view(1, N, sf_k)))

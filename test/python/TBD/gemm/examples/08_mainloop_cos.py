@@ -16,10 +16,8 @@ K in {288 (K%16==0), 264 (K%16==8, partial OOB K-block)}.
 from __future__ import annotations
 
 import cudnn
-import cudnn.TBD.gemm  # noqa: F401  (installs hook)
+import cudnn.TBD.gemm  # noqa: F401  (registers TBD_eng0 + installs hook)
 import torch
-
-from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 
 
 def _run(M: int, N: int, K: int) -> None:
@@ -35,14 +33,19 @@ def _run(M: int, N: int, K: int) -> None:
     C = g.matmul(A=Ac, B=Bc, name="mm")
     C.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g)
-    assert compiled.chain.has_mainloop_fusion_a and compiled.chain.has_mainloop_fusion_b
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.select_engines(["TBD_eng0"])
+    g.check_support()
+    g.build_plans()
 
     torch.manual_seed(0)
     a = (torch.rand(1, M, K, device="cuda") * 6.0 - 3.0).to(torch.bfloat16)
     b = (torch.rand(1, N, K, device="cuda") * 6.0 - 3.0).to(torch.bfloat16)
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled({A: a, B: b, C: c})
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, C: c}, workspace)
     torch.cuda.synchronize()
 
     ref = torch.einsum("bmk,bnk->bmn", torch.cos(a.float()), torch.cos(b.float())).to(torch.bfloat16)

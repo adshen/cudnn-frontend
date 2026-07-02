@@ -85,6 +85,31 @@ from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.tile_config import CATALOG
 
 
+class _Plan:
+    """Test handle that JIT-compiles a recorded graph with a forced tile config
+    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
+    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
+    aux_names and is callable with a variant pack."""
+
+    def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
+        self.g = graph
+        kw = dict(cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
+        if config is not None:
+            kw["config"] = config
+        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        self.chain = self._compiled.chain
+        self.binding = self._compiled.binding
+        self.block_scale = self.chain.has_block_scale
+        self.aux_names = [t.name for t in self.chain.aux_tensors]
+
+    def __call__(self, variant_pack):
+        return self._compiled(variant_pack)
+
+
+def _plan(graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
+    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
+
+
 def _vp(compiled, a, b, outs, *aux):
     """Variant-pack dict from the compiled binding (A/B + outputs + aux)."""
     bd = compiled.binding
@@ -865,7 +890,7 @@ def _run_case(
     cfg, cta_group, scheduler = _resolve(config_name)
     g, aux_names = _build_graph(M, N, K, in_dt, out_dt, chain, a_major, b_major, out_major)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -915,7 +940,7 @@ def _run_batched_case(
     cfg, cta_group, scheduler = _resolve(config_name)
     g, aux_names = _build_batched_graph(batch, M, N, K, in_dt, out_dt, case.chain, batched_aux=case.batched_aux)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -964,7 +989,7 @@ def _run_rank3_broadcast_case(case: Rank3BroadcastCase) -> None:
     cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
     g, aux_names = _build_rank3_broadcast_graph(batch, M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, case)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1001,7 +1026,7 @@ def _run_epilogue_dtype_case(aux_dtype: str, out_dtype: str) -> None:
     cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
     g = _build_epilogue_dtype_graph(M, N, K, aux_dtype, out_dtype)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1031,7 +1056,7 @@ def _run_mixed_dtype_broadcast_case(case: MixedDtypeBroadcastCase) -> None:
     cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
     g = _build_mixed_dtype_broadcast_graph(batch, M, N, K, case)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1125,7 +1150,7 @@ def test_rank1_per_col_fusion() -> None:
     cur = g.bias(input=cur, bias=bias, name="b")
     cur.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     a, b, c = _mkdata(M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, seed=0)
     bias_runtime = (torch.arange(N, dtype=torch.int32) % 5 - 2).to(dtype=_TORCH_DTYPE[_DEFAULT_IN_DT], device="cuda")
 
@@ -1152,7 +1177,7 @@ def test_rank1_scalar_fusion() -> None:
     cur = g.add(a=cur, b=scale, name="add")
     cur.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     a, b, c = _mkdata(M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, seed=0)
     scale_runtime = torch.tensor([2], dtype=_TORCH_DTYPE[_DEFAULT_IN_DT], device="cuda")
 
@@ -1179,7 +1204,7 @@ def test_batched_rank1_per_col_fusion() -> None:
     cur = g.bias(input=cur, bias=bias, name="b")
     cur.set_output(True)
 
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     a, b, c = _mkbatched_data(batch, M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, seed=0)
     bias_runtime = (torch.arange(N, dtype=torch.int32) % 5 - 2).to(dtype=_TORCH_DTYPE[_DEFAULT_IN_DT], device="cuda")
 
@@ -1224,7 +1249,7 @@ def test_nonpacked_epilogue_aux_and_output(
     cfg, cta_group, scheduler = _resolve(config_name)
     g, aux_names = _build_nonpacked_epilogue_graph(batch, M, N, K, in_dt, out_dt, aux_bcast)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(
@@ -1271,7 +1296,7 @@ def test_zero_stride_epilogue_aux_broadcast(
     in_dt = out_dt = "bf16"
     cfg, cta_group, scheduler = _resolve(config_name)
     g, aux_names = _build_zero_stride_aux_epilogue_graph(batch, M, N, K, in_dt, out_dt)
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
 
     a, b, c = _mkbatched_nonpacked_data(batch, M, N, K, in_dt, out_dt, seed=0)
     aux = _mkaux_zero_stride_per_elem(batch, M, N, in_dt, seed=13)
@@ -1330,7 +1355,7 @@ def test_epilogue_uint8_output_preserves_values_above_int8_positive_range() -> N
     cfg, cta_group, scheduler = _resolve(_DEFAULT_CONFIG)
     g = _build_epilogue_dtype_graph(M, N, K, "fp32", "uint8")
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1372,7 +1397,7 @@ def test_epilogue_int32_compute_type() -> None:
     )
     cur.set_output(True).set_data_type(cudnn.data_type.INT32)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1415,7 +1440,7 @@ def test_additional_unary_epilogue_ops(op: str) -> None:
     cur = _apply_unary(g, op, cur, "new_unary")
     cur.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
@@ -1460,7 +1485,7 @@ def test_additional_binary_epilogue_ops(
         cur = _apply_binary(g, op, aux, cur, "new_binary")
     cur.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     try:
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler, force_stg_epi=True)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)

@@ -24,6 +24,31 @@ from cudnn.TBD.gemm.tile_config import CATALOG
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
 
+class _Plan:
+    """Test handle that JIT-compiles a recorded graph with a forced tile config
+    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
+    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
+    aux_names and is callable with a variant pack."""
+
+    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
+        self.g = graph
+        kw = dict(cta_group=cta_group, scheduler=scheduler)
+        if config is not None:
+            kw["config"] = config
+        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        self.chain = self._compiled.chain
+        self.binding = self._compiled.binding
+        self.block_scale = self.chain.has_block_scale
+        self.aux_names = [t.name for t in self.chain.aux_tensors]
+
+    def __call__(self, variant_pack):
+        return self._compiled(variant_pack)
+
+
+def _plan(graph, config=None, cta_group=2, scheduler="clc"):
+    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
+
+
 def _vp_mg(compiled, gemm_pairs, outs, *aux):
     """Multi-GEMM variant-pack dict from the compiled binding (dedup pairs by
     tensor identity → distinct A/B slots, + outputs + aux)."""
@@ -97,7 +122,7 @@ def _run(B, M, N, K, in_dt, out_dt, cfg, *, seed=0, cta_group=1, scheduler="clc"
     b1 = torch.randn(B, N, K, device="cuda", dtype=_TORCH_DT[in_dt]) * 0.4
     scale = torch.tensor([[[0.5]]], device="cuda", dtype=torch.float32)
     out = torch.zeros(B, M, N, device="cuda", dtype=_TORCH_DT[out_dt])
-    compiled = jit_from_cudnn_graph(_build_swiglu(B, M, N, K, in_dt, out_dt), config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(_build_swiglu(B, M, N, K, in_dt, out_dt), config=cfg, cta_group=cta_group, scheduler=scheduler)
     compiled(_vp_mg(compiled, [(a, b0), (a, b1)], out, scale))
     torch.cuda.synchronize()
     return out, _reference(a, b0, b1, scale, out_dt)
@@ -172,7 +197,7 @@ def test_swiglu_nonpacked_tensors(label, cta_group, scheduler, cfg, mode) -> Non
     a, b0, b1, out, scale = _nonpacked_inputs(B, M, N, K, "bf16", "bf16", mode)
     assert not a.is_contiguous() or not b0.is_contiguous() or not b1.is_contiguous()
     assert not out.is_contiguous()
-    compiled = jit_from_cudnn_graph(
+    compiled = _plan(
         _build_swiglu(B, M, N, K, "bf16", "bf16"),
         config=cfg,
         cta_group=cta_group,

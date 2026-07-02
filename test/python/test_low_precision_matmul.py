@@ -277,12 +277,17 @@ def create_matmul_dequantize_graph(cudnn_handle, A, B, A_descale, B_descale, BLO
 
     with cudnn.graph(cudnn_handle) as (g, _):
 
-        batch_size, M, N, K = (
-            A_descale.shape[0],
-            A_descale.shape[1],
-            B_descale.shape[1],
-            A_descale.shape[2],
-        )
+        # Scale tensors are block-reduced along K: A is (b, M, K/block),
+        # B is (b, K/block, N) (see general_block_scale_matmul.cpp).
+        batch_size, M = A_descale.shape[0], A_descale.shape[1]
+        N = B_descale.shape[2]
+        block_scale_dim_a_k = A_descale.shape[2]
+        block_scale_dim_b_k = B_descale.shape[1]
+        assert A_descale.shape[0] == B_descale.shape[0], f"A_descale / B_descale batch mismatch: {A_descale.shape[0]} vs {B_descale.shape[0]}"
+        assert (
+            block_scale_dim_a_k == block_scale_dim_b_k
+        ), f"A_descale / B_descale block-scale K dims must match: block_scale_dim_a_k={block_scale_dim_a_k} vs block_scale_dim_b_k={block_scale_dim_b_k}"
+        K = block_scale_dim_a_k * BLOCK_SIZE
 
         A_cudnn_tensor = g.tensor(
             name="tensor_a",
@@ -301,7 +306,7 @@ def create_matmul_dequantize_graph(cudnn_handle, A, B, A_descale, B_descale, BLO
         A_descale_tensor = g.tensor(
             name="block_descale_a",
             dim=A_descale.shape,
-            stride=(M * K, K, 1),
+            stride=(M * block_scale_dim_a_k, block_scale_dim_a_k, 1),
             data_type=convert_to_cudnn_type(A_descale.dtype),
             reordering_type=cudnn.tensor_reordering.F8_128x4,
         )
@@ -309,7 +314,7 @@ def create_matmul_dequantize_graph(cudnn_handle, A, B, A_descale, B_descale, BLO
         B_descale_tensor = g.tensor(
             name="block_descale_b",
             dim=B_descale.shape,
-            stride=(N * K, 1, K),
+            stride=(block_scale_dim_b_k * N, 1, block_scale_dim_b_k),
             data_type=convert_to_cudnn_type(B_descale.dtype),
             reordering_type=cudnn.tensor_reordering.F8_128x4,
         )
@@ -413,8 +418,9 @@ def test_low_precision_fp4_matmul(cudnn_handle):
     A = _bfloat16_to_float4_e2m1fn_x2(A_ref)
     B = _bfloat16_to_float4_e2m1fn_x2(B_ref)
 
-    A_descale = torch.full((batch_size, M, K), 1.0, dtype=torch.float8_e4m3fn, device="cuda")
-    B_descale = torch.full((batch_size, K, N), 1.0, device="cuda", dtype=torch.float8_e4m3fn)
+    # One scale per BLOCK_SIZE-wide block along K (F8_128x4 reordering).
+    A_descale = torch.full((batch_size, M, K // BLOCK_SIZE), 1.0, dtype=torch.float8_e4m3fn, device="cuda")
+    B_descale = torch.full((batch_size, K // BLOCK_SIZE, N), 1.0, device="cuda", dtype=torch.float8_e4m3fn)
 
     g, uids = create_matmul_dequantize_graph(cudnn_handle, A, B, A_descale, B_descale, BLOCK_SIZE)
 

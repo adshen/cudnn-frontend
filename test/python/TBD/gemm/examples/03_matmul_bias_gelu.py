@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import cudnn
-import cudnn.TBD.gemm  # noqa: F401  (installs hook)
+import cudnn.TBD.gemm  # noqa: F401  (registers TBD_eng0 + installs hook)
 import torch
-
-from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 
 
 def main(M: int = 256, N: int = 256, K: int = 128) -> None:
@@ -24,9 +22,12 @@ def main(M: int = 256, N: int = 256, K: int = 128) -> None:
     Y = g.gelu_approx_tanh(input=Cb, name="g")
     Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = jit_from_cudnn_graph(g)
-    print(f"[03] {compiled.chain.summary()}")
-    print(f"[03] generated kernel: {compiled.generated_path}")
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    g.select_engines(["TBD_eng0"])
+    g.check_support()
+    g.build_plans()
 
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
@@ -38,7 +39,8 @@ def main(M: int = 256, N: int = 256, K: int = 128) -> None:
     c_tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     bias_t = torch.randn(1, M, 1, device="cuda", dtype=torch.bfloat16)
 
-    compiled({A: a, B: b, bias: bias_t, Y: c_term, C: c_tap})
+    workspace = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, bias: bias_t, Y: c_term, C: c_tap}, workspace)
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))

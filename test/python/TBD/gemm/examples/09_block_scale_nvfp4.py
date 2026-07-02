@@ -86,9 +86,6 @@ def main(M: int = 256, N: int = 256, K: int = 512, block_size: int = 16) -> None
     C.set_output(True).set_data_type(cudnn.data_type.HALF)
 
     compiled = jit_from_cudnn_graph(g, config=CONFIG_sm100_128x256x128_128x256x32_cluster1x1, cta_group=1)
-    print(f"[09] {compiled.chain.summary()}")
-    print(f"[09] block_scale: {compiled.chain.block_scale.combo}")
-    print(f"[09] generated kernel: {compiled.generated_path}")
 
     # Runtime: A/B as packed FP4 (view as float4_e2m1fn_x2), SF in blocked layout.
     a_f4 = a_u8.view(torch.float4_e2m1fn_x2)

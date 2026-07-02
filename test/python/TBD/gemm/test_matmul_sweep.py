@@ -70,8 +70,34 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU
 
 import cudnn
 import cudnn.TBD.gemm  # noqa: F401  — installs the cudnn.pygraph recorder hook
-from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph, _current_sm
+from cudnn.TBD.gemm.compiler import _current_sm, jit_from_cudnn_graph
 from cudnn.TBD.gemm.tile_config import CATALOG
+
+
+class _Plan:
+    """Test handle that JIT-compiles a recorded graph with a forced tile config
+    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly via the
+    low-level entry rather than letting the TBD engine auto-select). Exposes
+    chain / binding / block_scale / aux_names and is callable
+    with a variant pack."""
+
+    def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
+        self.g = graph
+        kw = dict(cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
+        if config is not None:
+            kw["config"] = config
+        self._compiled = jit_from_cudnn_graph(graph, **kw)
+        self.chain = self._compiled.chain
+        self.binding = self._compiled.binding
+        self.block_scale = self.chain.has_block_scale
+        self.aux_names = [t.name for t in self.chain.aux_tensors]
+
+    def __call__(self, variant_pack):
+        return self._compiled(variant_pack)
+
+
+def _plan(graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
+    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
 
 
 def _vp(compiled, a, b, outs, *aux):
@@ -648,7 +674,7 @@ def _get_compiled(
 
     try:
         g = _build_graph(*anchor, in_dt, out_dt, a_major, b_major, out_major)
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         msg = f"JIT compile failed: {type(e).__name__}: {first[:200]}"
@@ -706,7 +732,7 @@ def _get_batched_compiled(
 
     try:
         g = _build_batched_graph(batch, *anchor, in_dt, out_dt, a_major, b_major, out_major)
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         msg = f"JIT compile failed: {type(e).__name__}: {first[:200]}"
@@ -775,7 +801,7 @@ def _get_batch_broadcast_compiled(
 
     try:
         g = _build_batch_broadcast_graph(batch, *anchor, in_dt, out_dt, broadcast_side, a_major, b_major)
-        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+        compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     except Exception as e:
         first = str(e).splitlines()[0] if str(e) else ""
         msg = f"JIT compile failed: {type(e).__name__}: {first[:200]}"
@@ -845,7 +871,7 @@ def test_dense_block_scale_quant_epilogue() -> None:
     M = N = K = 128
     block_size = 32
     g = _build_block_quant_graph(M, N, K, block_size)
-    compiled = jit_from_cudnn_graph(
+    compiled = _plan(
         g,
         config=cfg,
         cta_group=cta_group,
@@ -1231,7 +1257,7 @@ def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
     C.set_output(True)
     C.set_data_type(cudnn.data_type.HALF)
 
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     assert compiled.chain.matmul.a_dtype == a_dt
     assert compiled.chain.matmul.b_dtype == b_dt
 
@@ -1301,7 +1327,7 @@ def test_int8_matmul(config_name: str, out_dt: str) -> None:
     C.set_output(True)
     C.set_data_type(cudnn_dt)
 
-    compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
     assert compiled.chain.matmul.accum_dtype == "int32"
     assert compiled.chain.output_dtype == out_dt
 

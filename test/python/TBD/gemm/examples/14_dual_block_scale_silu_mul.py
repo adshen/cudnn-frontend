@@ -54,12 +54,6 @@ def main(M: int = 256, N: int = 128, K: int = 512) -> None:
 
     cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
     compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=1, scheduler="clc")
-    print(f"[14] {compiled.chain.summary()}")
-    print(
-        f"[14] combo={compiled.chain.block_scale.combo} num_gemms={compiled.chain.num_gemms} "
-        f"distinct A={compiled.chain.num_a_operands} B={compiled.chain.num_b_operands}"
-    )
-    print(f"[14] generated kernel: {compiled.generated_path}")
 
     dev = "cuda"
     torch.manual_seed(0)

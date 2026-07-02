@@ -42,15 +42,23 @@ import cudnn
 import cudnn.TBD.gemm  # noqa: F401  (installs hook)
 import torch
 
+from types import SimpleNamespace
+
 from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.graph_analyzer import analyze
 from cudnn.TBD.gemm.kernel_registry import candidates as _registry_candidates
 
 
-def _vp_mg(compiled, gemm_pairs, outs, *aux):
-    """Multi-GEMM variant-pack dict from the compiled binding (dedup pairs by
+def _build_plan(g, cfg, cta_group, sched):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+
+
+def _vp_mg(handles, gemm_pairs, outs, *aux):
+    """Multi-GEMM variant-pack dict keyed by the graph's tensors (dedup pairs by
     tensor identity → distinct A/B slots, + outputs + aux)."""
-    bd = compiled.binding
+    bd = handles
     a_seen, b_seen = [], []
     for ag, bg in gemm_pairs:
         if not any(ag is x for x in a_seen):
@@ -92,7 +100,7 @@ def _graph_swiglu(B: int, M: int, N: int, K: int, in_dt: str, out_dt: str):
     MU = g.mul(a=S0, b=C1, name="mul0")
     DQ = g.mul(a=MU, b=scale, name="dequant0")
     DQ.set_output(True).set_data_type(_CUDNN_DT[out_dt])
-    return g
+    return g, SimpleNamespace(a_operands=[A], b_operands=[B0, B1], outputs=[DQ], aux=[scale])
 
 
 def _mkdata(B, M, N, K, in_dt, out_dt):
@@ -157,7 +165,7 @@ def _build_spec_map():
     the full suffixed names. Multi-GEMM TMEM fits `num_gemms` accumulators only
     for cta_tile_n<=256 (2*256<=512); 1ctamma uses cluster1x1, 2ctamma cluster2x1
     (both cta_tile_m=128). K_bytes 64 and 128 both run (TMEM sizing is K-agnostic)."""
-    chain = analyze(_graph_swiglu(1, 256, 256, 256, "bf16", "bf16"))
+    chain = analyze(_graph_swiglu(1, 256, 256, 256, "bf16", "bf16")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
         if cfg.arch != "sm100" or cfg.cta_tile_n > 256 or cfg.cgrp_size_n != 1 or cfg.cta_tile_m != 128:
@@ -224,19 +232,19 @@ def main() -> int:
             continue
         cfg, cta_group, sched = _SPEC_MAP[label]
         try:
-            g = _graph_swiglu(B, M, N, K, in_dt, out_dt)
-            compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
+            g, h = _graph_swiglu(B, M, N, K, in_dt, out_dt)
+            plan = _build_plan(g, cfg, cta_group, sched)
         except (NotImplementedError, ValueError):
             continue  # geometry/strategy can't run this shape/dtype — skip
         try:
-            compiled(_vp_mg(compiled, [(a, b0), (a, b1)], out, scale))
+            plan(_vp_mg(h, [(a, b0), (a, b1)], out, scale))
             torch.cuda.synchronize()
         except Exception as e:  # noqa: BLE001
             print(f"  {label:62s} LAUNCH FAIL: {type(e).__name__}: {str(e)[:30]}")
             continue
         err = (out.float() - ref.float()).abs().max().item()
         ok = torch.allclose(out.float(), ref.float(), rtol=args.rtol, atol=args.atol)
-        ms = _time_ms(lambda: compiled(_vp_mg(compiled, [(a, b0), (a, b1)], out, scale)), warmup=args.warmup, iters=args.iters, delayed=delayed)
+        ms = _time_ms(lambda: plan(_vp_mg(h, [(a, b0), (a, b1)], out, scale)), warmup=args.warmup, iters=args.iters, delayed=delayed)
         tflops = flops / (ms * 1e-3) / 1e12
         ratio = bl_ms / ms if ms > 0 else 0.0
         flag = "" if ok else f"  !! maxerr={err:.3g}"

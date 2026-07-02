@@ -73,8 +73,6 @@ def main() -> None:
 
     cfg = next(c for c in CATALOG if c.name == "CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
     compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=2)
-    print(f"[11] {compiled.chain.summary()}")
-    print(f"[11] generated kernel: {compiled.generated_path}")
 
     torch.manual_seed(0)
     token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")

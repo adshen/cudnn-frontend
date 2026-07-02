@@ -19,13 +19,13 @@ import re
 
 from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.epilogue_codegen import generate_mainloop
-from cudnn.TBD.gemm.graph_analyzer import analyze
+from cudnn.TBD.gemm.graph_analyzer import analyze, analyze_with_binding
 from cudnn.TBD.gemm.tile_config import by_name
 
 
-def _vp(compiled, a, b, outs, *aux):
-    """Variant-pack dict from the compiled binding (A/B + outputs + aux)."""
-    bd = compiled.binding
+def _vp(g, a, b, outs, *aux):
+    """Variant-pack dict keyed by the graph's tensors (binding from the public analyzer)."""
+    bd = analyze_with_binding(g)[1]
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     vp = {bd.a_operands[0]: a, bd.b_operands[0]: b}
     vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
@@ -42,6 +42,12 @@ def _kw(legacy_name):
     m = _LEGACY_RE.match(legacy_name)
     assert m, legacy_name
     return dict(config=by_name(m.group(1)), cta_group=int(m.group(2)), scheduler="static" if m.group(3) else "clc")
+
+
+def _plan(g, **kw):
+    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
+    Returns the compiled kernel (callable with a variant-pack dict)."""
+    return jit_from_cudnn_graph(g, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +213,8 @@ _TORCH_OP = {"abs": torch.abs, "relu": torch.relu, "neg": torch.neg, "cos": torc
 
 def _run_e2e(op, cfg_name, M, N, K, io_dtype, torch_dtype, out_major="n"):
     g = _mainloop_graph(op, M, N, K, io_dtype=io_dtype, out_major=out_major)
-    compiled = jit_from_cudnn_graph(g, **_kw(cfg_name))
-    assert compiled.chain.has_mainloop_fusion
+    plan = _plan(g, **_kw(cfg_name))
+    assert analyze(g).has_mainloop_fusion
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch_dtype, device="cuda")
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch_dtype, device="cuda")
@@ -216,7 +222,7 @@ def _run_e2e(op, cfg_name, M, N, K, io_dtype, torch_dtype, out_major="n"):
         c = torch.empty(1, N, M, dtype=torch_dtype, device="cuda").transpose(1, 2)
     else:
         c = torch.empty(1, M, N, dtype=torch_dtype, device="cuda")
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", _TORCH_OP[op](a.float()), b.float()).to(torch_dtype)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
@@ -285,15 +291,15 @@ def test_e2e_mainloop_int8(op, cfg) -> None:
     C.set_output(True)
     C.set_data_type(cudnn.data_type.FLOAT)
 
-    compiled = jit_from_cudnn_graph(g, **_kw(cfg))
-    assert compiled.chain.has_mainloop_fusion
-    assert compiled.chain.matmul.accum_dtype == "int32"
+    plan = _plan(g, **_kw(cfg))
+    assert analyze(g).has_mainloop_fusion
+    assert analyze(g).matmul.accum_dtype == "int32"
 
     torch.manual_seed(0)
     a = torch.randint(-8, 8, (1, M, K), dtype=torch.int8, device="cuda")
     b = torch.randint(-8, 8, (1, N, K), dtype=torch.int8, device="cuda")
     c = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
 
     ref = torch.einsum("bmk,bnk->bmn", _TORCH_OP[op](a.cpu().to(torch.int64)), b.cpu().to(torch.int64)).float()
@@ -316,12 +322,12 @@ def test_e2e_mainloop_multicast_and_oob() -> None:
 
 def _run_e2e_ab(aop, bop, cfg_name, M, N, K):
     g = _mainloop_graph_ab(aop, bop, M, N, K)
-    compiled = jit_from_cudnn_graph(g, **_kw(cfg_name))
+    plan = _plan(g, **_kw(cfg_name))
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
     fa = _TORCH_OP[aop] if aop != "none" else (lambda x: x)
     fb = _TORCH_OP[bop] if bop != "none" else (lambda x: x)
@@ -401,7 +407,7 @@ def test_analyzer_rejects_per_row_mainloop_aux() -> None:
 
 def _run_scaled(scale_a, scale_b, cfg_name, M, N, K, av=2.0, bv=0.5):
     g = _scaled_graph(scale_a, scale_b, M, N, K)
-    compiled = jit_from_cudnn_graph(g, **_kw(cfg_name))
+    plan = _plan(g, **_kw(cfg_name))
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
@@ -410,7 +416,7 @@ def _run_scaled(scale_a, scale_b, cfg_name, M, N, K, av=2.0, bv=0.5):
         "alpha": torch.full((1, 1, 1), av, dtype=torch.bfloat16, device="cuda"),
         "beta": torch.full((1, 1, 1), bv, dtype=torch.bfloat16, device="cuda"),
     }
-    compiled(_vp(compiled, a, b, c, *[auxmap[n] for n in compiled.aux_names]))
+    plan(_vp(g, a, b, c, *[auxmap[n] for n in [t.name for t in analyze(g).aux_tensors]]))
     torch.cuda.synchronize()
     aa = a.float() * (av if scale_a else 1.0)
     bb = b.float() * (bv if scale_b else 1.0)
@@ -439,12 +445,12 @@ def _run_cos2(cfg_name, M, N, K):
     """cos(A) @ cos(B): both chains map 0->1, so a partial last K-tile needs the
     mainloop's swizzle-aware OOB zeroing (works for any K%8, incl. K%16!=0)."""
     g = _mainloop_graph_ab("cos", "cos", M, N, K)
-    compiled = jit_from_cudnn_graph(g, **_kw(cfg_name))
+    plan = _plan(g, **_kw(cfg_name))
     torch.manual_seed(0)
     a = (torch.rand(1, M, K, device="cuda") * 6 - 3).to(torch.bfloat16)
     b = (torch.rand(1, N, K, device="cuda") * 6 - 3).to(torch.bfloat16)
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", torch.cos(a.float()), torch.cos(b.float())).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=6e-1, rtol=2e-2)
@@ -468,12 +474,12 @@ def test_e2e_cos_a_only_oob_ok() -> None:
     # needed even though cos(0)=1. K=264 (partial OOB) must still be correct.
     M, N, K = 256, 256, 264
     g = _mainloop_graph_ab("cos", "none", M, N, K)
-    compiled = jit_from_cudnn_graph(g)
+    plan = _plan(g)
     torch.manual_seed(0)
     a = (torch.rand(1, M, K, device="cuda") * 6 - 3).to(torch.bfloat16)
     b = (torch.rand(1, N, K, device="cuda") * 6 - 3).to(torch.bfloat16)
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", torch.cos(a.float()), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=6e-1, rtol=2e-2)
@@ -505,8 +511,9 @@ def test_fp32_matmul_rejected_no_implicit_cast() -> None:
 
     for with_op in (False, True):
         analyze(_fp32_graph(with_op))  # IR construction is fine — no dtype judgment
+        gg = _fp32_graph(with_op)
         with pytest.raises(NotImplementedError, match="does not support input/acc dtype combo"):
-            jit_from_cudnn_graph(_fp32_graph(with_op), **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+            jit_from_cudnn_graph(gg, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
 
 
 # ---------------------------------------------------------------------------
@@ -567,15 +574,15 @@ def test_analyzer_same_dtype_mainloop_is_not_a_cast() -> None:
 def test_e2e_mixed_input_int8_bf16(cfg, cast_a, cast_b) -> None:
     M, N, K = 512, 512, 512
     g, A, B, C = _mixed_input_graph(cast_a, cast_b, M, N, K)
-    compiled = jit_from_cudnn_graph(g, **_kw(cfg))
-    assert compiled.chain.has_mainloop_fusion
-    assert compiled.chain.mainloop_a_cast == cast_a
-    assert compiled.chain.mainloop_b_cast == cast_b
+    plan = _plan(g, **_kw(cfg))
+    assert analyze(g).has_mainloop_fusion
+    assert analyze(g).mainloop_a_cast == cast_a
+    assert analyze(g).mainloop_b_cast == cast_b
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch.int8 if cast_a else torch.bfloat16).cuda()
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-4, 4).to(torch.int8 if cast_b else torch.bfloat16).cuda()
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     # Bit-exact: identity is lossless and the values fit bf16 mantissa exactly.
@@ -587,12 +594,12 @@ def test_e2e_mixed_input_koob() -> None:
     # tile; int8 0 -> identity -> bf16 0, so K-OOB is harmless (no koob_fix).
     M, N, K = 512, 512, 576
     g, A, B, C = _mixed_input_graph(True, False, M, N, K)
-    compiled = jit_from_cudnn_graph(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+    plan = _plan(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch.int8).cuda()
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-4, 4).to(torch.bfloat16).cuda()
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
@@ -623,9 +630,9 @@ def test_e2e_mixed_input_cast_targets(load, mma, torch_load, cu_mma) -> None:
     C = g.matmul(A=Ai, B=B, name="mm")
     C.set_output(True)
     C.set_data_type(cudnn.data_type.BFLOAT16)
-    compiled = jit_from_cudnn_graph(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+    plan = _plan(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
     load_lit = {"int8": "int8", "e4m3": "fp8_e4m3", "bf16": "bf16"}[load]
-    assert compiled.chain.mainloop_a_cast and compiled.chain.mainloop_a_load_dtype == load_lit
+    assert analyze(g).mainloop_a_cast and analyze(g).mainloop_a_load_dtype == load_lit
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch_load).cuda()
     b = (
@@ -642,7 +649,7 @@ def test_e2e_mixed_input_cast_targets(load, mma, torch_load, cu_mma) -> None:
         .cuda()
     )
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
@@ -675,13 +682,13 @@ def test_e2e_mixed_input_int8_fp8_2ctamma() -> None:
     C = g.matmul(A=Ai, B=B, name="mm")
     C.set_output(True)
     C.set_data_type(cudnn.data_type.BFLOAT16)
-    compiled = jit_from_cudnn_graph(g, **_kw("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
-    assert compiled.chain.mainloop_a_cast and compiled.chain.matmul.a_dtype == "fp8_e4m3"
+    plan = _plan(g, **_kw("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"))
+    assert analyze(g).mainloop_a_cast and analyze(g).matmul.a_dtype == "fp8_e4m3"
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch.int8).cuda()
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-4, 4).to(torch.float8_e4m3fn).cuda()
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
-    compiled(_vp(compiled, a, b, c))
+    plan(_vp(g, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
