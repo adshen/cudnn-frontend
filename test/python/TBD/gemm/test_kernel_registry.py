@@ -1,10 +1,9 @@
 """Tests for the six-dimension support funnel (kernel_registry.py).
 
-Tile configs are pure geometry; the template supplies cta_group / static /
-arch. These tests pin: template files exist & are uniquely keyed by strategy;
-the graph-type and mma-type×arch stages; the 2-CTA cgrp_size_m constraint and the
-cluster-m=128 known-bad exclusion; select_template's strategy-driven choice; and
-that the staged funnel == a naive full scan.
+Tile configs are pure geometry; the template supplies cta_group/static/arch.
+Pins template-file uniqueness, the graph-type + mma-type×arch stages, the
+2-CTA constraints + cluster-m=128 exclusion, select_template, and that the
+staged funnel equals a naive full scan.
 """
 
 from __future__ import annotations
@@ -98,16 +97,15 @@ def test_every_template_declares_graph_type_and_arch() -> None:
 
 
 def test_per_arch_active_sm_ranges() -> None:
-    """Pin the per-template active-GPU SM ranges: sm100 templates run across the
-    whole Blackwell family [100,120)."""
+    """sm100 templates run across the whole Blackwell family [100,120)."""
     expected = {"sm100": (100, 120)}
     for t in TEMPLATES:
         assert (t.sm_lo, t.sm_hi) == expected[t.arch], (t.file, t.sm_lo, t.sm_hi)
 
 
 def test_template_only_accepts_own_arch_config() -> None:
-    """An sm<NNN> template accepts ONLY sm<NNN> configs — the arch axis is the
-    first checked, so an own-arch config never rejects on arch."""
+    """An sm<NNN> template accepts ONLY sm<NNN> configs; an own-arch config
+    never rejects on the arch axis."""
     sm100_cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster1x1")
     assert sm100_cfg.arch == "sm100"
     chain = _matmul_chain()
@@ -125,8 +123,7 @@ def test_classify_graph_type() -> None:
 
 
 def test_moe_has_templates_conv_is_placeholder() -> None:
-    # MoE grouped matmul now has 1ctamma + 2ctamma templates; CONVOLUTION is
-    # still a placeholder graph type with no template.
+    # MoE has 1ctamma + 2ctamma templates; CONVOLUTION is a placeholder (no template).
     assert len([t for t in TEMPLATES if t.graph_type is GraphType.MOE]) == 2
     assert not [t for t in TEMPLATES if t.graph_type is GraphType.CONVOLUTION]
 
@@ -161,7 +158,7 @@ def test_cluster_m128_excluded_from_traversal_but_renderable() -> None:
     # ... and absent from the traversal candidate set
     cfgs = {(t.file, c.name) for t, c in candidates(chain)}
     assert ("sm100_matmul_2ctamma.py", _G_M64) not in cfgs
-    # ... but select_template still renders it for single-point JIT
+    # ... but still renderable for single-point JIT
     assert select_template(chain, by_name(_G_M64), 2, CLC).file == "sm100_matmul_2ctamma.py"
 
 

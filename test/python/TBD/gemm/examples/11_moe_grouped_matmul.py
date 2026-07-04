@@ -1,16 +1,9 @@
 """Example 11: MoE grouped matmul forward (mode=NONE).
 
-Builds a graph with the **pure cuDNN frontend API** (`moe_grouped_matmul`), hands
-it to cudnn.TBD.gemm for analysis + GEMM kernel JIT, runs, and compares to a torch
-group-loop reference.
-
 Each routed group g computes
     out[first_token_offset[g] : first_token_offset[g+1]] =
         token[that range] @ weight[g].T
-
-Usage:
-    source active_tbd.sh
-    python cudnn.TBD.gemm/examples/11_moe_grouped_matmul.py
+Compared against a torch group-loop reference.
 """
 
 from __future__ import annotations
@@ -55,12 +48,25 @@ def main() -> None:
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    # token: [1, S, K] BF16 row-major
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    # weight: [E, K, N] BF16, column-major in K×N (== (E, N, K) row-major memory)
-    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    # first_token_offset: [E, 1, 1] INT32
-    fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    tok = g.tensor(
+        name="token",
+        dim=[1, S, K],
+        stride=[S * K, K, 1],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    # weight [E, K, N] K-major (== (E, N, K) row-major in memory)
+    w = g.tensor(
+        name="weight",
+        dim=[E, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[E, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.INT32,
+    )
     out = g.moe_grouped_matmul(
         tok,
         w,
@@ -76,7 +82,7 @@ def main() -> None:
 
     torch.manual_seed(0)
     token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
-    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")  # (E, N, K)
+    weight = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
     offsets = _offsets(group_sizes, S)
 

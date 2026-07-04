@@ -1,31 +1,8 @@
-"""Benchmark every MoE-block-scale CATALOG config on a single MoE grouped
-block-scale matmul shape (FP4/FP8 + per-block SF) vs a cuBLAS BF16 batched-GEMM
-reference.
+"""Benchmark MoE grouped block-scale matmul (FP4/FP8 + per-block SF) configs vs a
+cuBLAS BF16 batched-GEMM reference. `--shape` is G,M,N,K (even split, S=G*M).
 
-Combines ``benchmark_moe_grouped_matmul.py`` (G,M,N,K shape, even group split,
-batched-GEMM reference, the three timing modes + buffer rotation + nsys workflow)
-with ``benchmark_block_scale_matmul.py``'s narrow-dtype data setup (FP4 E2M1 / FP8
-E4M3 packed inputs + F8_128x4-reordered scale factors). ``--combo`` picks
-nvfp4 / mxfp4 / mxfp8.
-
-The reference is a single **BF16 batched GEMM** over the G equal-sized groups
-(torch.matmul on BF16 operands). It is NOT a block-scaled GEMM — there is no
-stock batched FP4 MoE GEMM to compare against — so the "vs cuBLAS" ratio reads as
-"FP4/FP8-MoE throughput relative to the equivalent BF16 batched GEMM" (a ratio
-> 1 means the low-precision MoE kernel beats BF16 cuBLAS on the same problem).
-Both use FLOPS = 2·S·N·K (S = G*M total tokens).
-
-`--shape` is `G,M,N,K`: G groups, M tokens per group (even split), N, K. Total
-tokens S = G*M; num_groups == G. SFA is reordered + padded to 128 rows PER GROUP
-(group sizes need not be 128-aligned). Three timing modes (delayed / nsys /
-events) and `--rotate-buffers` behave exactly as in benchmark_matmul.
-
-    source active_tbd.sh
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_block_scale_matmul.py                          # nvfp4, delayed
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_block_scale_matmul.py --combo mxfp8            # fp8 + e8m0
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_block_scale_matmul.py --timing nsys           # ground-truth
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_block_scale_matmul.py --shape 8,512,4096,4096  # G,M,N,K
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_block_scale_matmul.py --configs CONFIG_a,CONFIG_b
+The reference is NOT a block-scaled GEMM — it's dense BF16 over the G groups — so
+the "vs cuBLAS" ratio is FP4/FP8-MoE throughput relative to equivalent BF16 cuBLAS.
 """
 
 from __future__ import annotations
@@ -47,7 +24,7 @@ import torch
 from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.graph_analyzer import analyze
 from cudnn.TBD.gemm.kernel_registry import candidates as _candidates
-from cudnn.TBD.gemm.tile_config import CATALOG, TileConfig
+from cudnn.TBD.gemm.tile_config import TileConfig
 
 
 def _vp_moe_bs(handles, token, weight, sfa, sfb, fto, output):
@@ -57,8 +34,7 @@ def _vp_moe_bs(handles, token, weight, sfa, sfb, fto, output):
 
 
 def _build_plan(g, cfg, name):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile the recorded graph with a forced tile config -> compiled kernel."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
 
 
@@ -70,9 +46,7 @@ _COMBOS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Graph + data setup
-# ---------------------------------------------------------------------------
+# Graph + data setup.
 
 
 def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
@@ -85,9 +59,26 @@ def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
     )
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
     w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=a_dt)
-    SFA = g.tensor(name="SFA", dim=[1, S, sf_k], stride=[S * sf_k, sf_k, 1], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
-    SFB = g.tensor(name="SFB", dim=[E, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
-    fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    SFA = g.tensor(
+        name="SFA",
+        dim=[1, S, sf_k],
+        stride=[S * sf_k, sf_k, 1],
+        data_type=sf_dt,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    SFB = g.tensor(
+        name="SFB",
+        dim=[E, sf_k, N],
+        stride=[sf_k * N, 1, sf_k],
+        data_type=sf_dt,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[E, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.INT32,
+    )
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size])
     w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1])
     out = g.moe_grouped_matmul(
@@ -103,10 +94,8 @@ def _graph_moe_bs(S: int, N: int, K: int, E: int, combo: str):
 
 
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group, scheduler) for every sweepable
-    MoE-block-scale strategy, via the registry funnel (MOE_BLOCK_SCALE templates
-    only). Enumerated from an analyzed nvfp4 graph (the template set is the same
-    for all combos)."""
+    """Label -> (geometry cfg, cta_group, scheduler) for every MoE-block-scale
+    strategy. Enumerated from an nvfp4 graph (template set is combo-independent)."""
     chain = analyze(_graph_moe_bs(512, 256, 512, 2, "nvfp4")[0])
     m = {}
     for t, cfg in _candidates(chain):
@@ -129,8 +118,7 @@ def _ceil_div(a, b):
 
 
 def _to_blocked(x):
-    """(rows, cols) scale tensor -> F8_128x4 blocked layout, flat (padded to 128
-    rows / 4 cols)."""
+    """(rows, cols) scale tensor -> flat F8_128x4 blocked layout (padded to 128 rows / 4 cols)."""
     rows, cols = x.shape
     nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
     pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
@@ -146,9 +134,8 @@ def _rand_e8m0(shape, dev):
 def _mkdata(S: int, N: int, K: int, E: int, combo: str):
     """MoE-block-scale runtime tensors: (token, weight, sfa, sfb, output).
 
-    token/weight are packed FP4 (viewed as float4_e2m1fn_x2) or FP8; SFA is
-    reordered + padded to 128 rows PER GROUP then concatenated (even split);
-    SFB is per-expert; output is BF16."""
+    token/weight are packed FP4 or FP8. SFA is reordered + padded to 128 rows PER
+    GROUP then concatenated (even split); SFB is per-expert; output is BF16."""
     dev = "cuda"
     torch.manual_seed(0)
     is_fp4, block_size, _, _ = _COMBOS[combo]
@@ -169,7 +156,7 @@ def _mkdata(S: int, N: int, K: int, E: int, combo: str):
         sfa_log = _rand_e8m0((S, sf_k), dev)
         sfb_log = _rand_e8m0((E, N, sf_k), dev)
 
-    # SFA padded PER GROUP (even split); SFB per-expert.
+    # SFA padded to 128 rows PER GROUP (group sizes need not be 128-aligned); SFB per-expert.
     sfa = torch.cat([_to_blocked(sfa_log[g * group_m : (g + 1) * group_m]) for g in range(E)]).view(1, -1, 1)
     sfb = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).reshape(E, sf_k, N)
     out = torch.empty(1, S, N, dtype=torch.bfloat16, device=dev)
@@ -185,9 +172,8 @@ def _mkdata_bf16(S: int, N: int, K: int, E: int):
     return tok, w, out
 
 
-# ---------------------------------------------------------------------------
-# Buffer rotation — defeat the hot-L2 artifact on small shapes (see benchmark_matmul)
-# ---------------------------------------------------------------------------
+# Buffer rotation: rotate timed launches across N independent tensor sets so a
+# kernel never re-reads its inputs from a hot L2 (inflates small-shape TFLOPS).
 
 _L2_BYTES_B200 = 126 * 1024 * 1024
 _AUTO_POOL_BUDGET_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
@@ -245,24 +231,7 @@ def _rotating(fn_of_buf: Callable, pool: list) -> Callable:
     return lambda i: fn_of_buf(pool[i % n])
 
 
-def _cta_k_elems(cfg: TileConfig, combo: str) -> int:
-    is_fp4 = _COMBOS[combo][0]
-    return cfg.cta_tile_k_bytes * 8 // (4 if is_fp4 else 8)
-
-
-def _compatible(cfg: TileConfig, N: int, K: int, combo: str) -> bool:
-    """MoE absorbs any per-group M via TMA OOB, so only N / K must tile cleanly.
-    K-tile is in DATA elements (FP4: cta_tile_k_bytes*2). Also enforce the SF
-    block-size divides the K-tile (validate_block_scale_config invariant)."""
-    block_size = _COMBOS[combo][1]
-    _tm, tn = cfg.cgrp_tile_mn
-    cta_k = _cta_k_elems(cfg, combo)
-    return N % tn == 0 and K % cta_k == 0 and cta_k % block_size == 0
-
-
-# ---------------------------------------------------------------------------
-# cuBLAS reference — BF16 batched GEMM over the E equal-sized groups
-# ---------------------------------------------------------------------------
+# cuBLAS reference — BF16 batched GEMM over the E equal-sized groups.
 
 
 def _cublas_launch(buf, S: int, N: int, K: int, E: int) -> None:
@@ -273,9 +242,7 @@ def _cublas_launch(buf, S: int, N: int, K: int, E: int) -> None:
     torch.matmul(tok_g, w.transpose(-1, -2), out=out_g)
 
 
-# ---------------------------------------------------------------------------
-# Timing (events / delayed) — identical to benchmark_matmul / bench_moe_grouped
-# ---------------------------------------------------------------------------
+# Timing (events / delayed).
 
 
 def _time_ms_events(timed_fn, warmup_fn, *, warmup, iters) -> float:
@@ -293,8 +260,8 @@ def _time_ms_events(timed_fn, warmup_fn, *, warmup, iters) -> float:
 
 
 def _time_ms_delayed(timed_fn, warmup_fn, *, warmup, iters) -> float:
-    """Kernel-only timing: hide host-launch overhead behind a delay kernel.
-    See benchmark_matmul._time_ms_delayed for the rationale."""
+    """Kernel-only timing: hide host-launch overhead behind a delay kernel
+    (queue a long _sleep first so launches enqueue behind it, then run back-to-back)."""
     for _ in range(warmup):
         warmup_fn()
     torch.cuda.synchronize()
@@ -312,9 +279,7 @@ def _time_ms_delayed(timed_fn, warmup_fn, *, warmup, iters) -> float:
     return start.elapsed_time(end) / iters
 
 
-# ---------------------------------------------------------------------------
-# nsys mode — same machinery as benchmark_moe_grouped_matmul (+ --combo)
-# ---------------------------------------------------------------------------
+# nsys mode.
 
 
 def _nsys_run_and_parse(shape, combo, configs, warmup, iters, nbuf) -> dict[str, float]:
@@ -420,8 +385,7 @@ def _parse_nsys_stats(text: str) -> dict[str, float]:
 
 
 def _kernel_match_token(cfg: TileConfig, cta_group: int) -> str:
-    """`<G>ctamma_<geometry_name>` — the substring the generated symbol
-    `_kernel_sm100_moe_grouped_block_scale_matmul_fwd_<G>ctamma_<geom>` carries."""
+    """`<G>ctamma_<geometry_name>` — the substring the nsys-demangled kernel symbol carries."""
     return f"{cta_group}ctamma_{cfg.geometry_name}"
 
 
@@ -432,9 +396,7 @@ def _find_cublas_time(kern_times: dict[str, float]) -> tuple[str, float] | None:
     return max(cands, key=lambda x: x[1])
 
 
-# ---------------------------------------------------------------------------
-# Worker mode (re-exec'd under nsys)
-# ---------------------------------------------------------------------------
+# Worker mode (re-exec'd under nsys).
 
 
 def _nsys_worker(shape, combo, configs, warmup, iters, nbuf) -> None:
@@ -458,7 +420,7 @@ def _nsys_worker(shape, combo, configs, warmup, iters, nbuf) -> None:
     name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
     for name in configs or list(_SPEC_MAP):
         cfg = name_to_cfg.get(name)
-        if cfg is None or not _compatible(cfg, N, K, combo):
+        if cfg is None:
             continue
         try:
             g, h = _graph_moe_bs(S, N, K, E, combo)
@@ -474,20 +436,30 @@ def _nsys_worker(shape, combo, configs, warmup, iters, nbuf) -> None:
             print(f"[worker] FAIL {name}: {type(e).__name__}: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# Main.
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shape", default="8,512,4096,4096", help="G,M,N,K (groups × per-group-M × N × K; default " "8,512,4096,4096 → S=G*M=4096 tokens)")
+    parser.add_argument(
+        "--shape",
+        default="8,512,4096,4096",
+        help="G,M,N,K (groups × per-group-M × N × K; default " "8,512,4096,4096 → S=G*M=4096 tokens)",
+    )
     parser.add_argument("--combo", choices=tuple(_COMBOS), default="nvfp4")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)  # CLAUDE.md: keep <= 20
-    parser.add_argument("--configs", default=None, help="comma-separated config names (default: every MoE-block-scale entry)")
+    parser.add_argument(
+        "--configs",
+        default=None,
+        help="comma-separated config names (default: every MoE-block-scale entry)",
+    )
     parser.add_argument("--timing", choices=("delayed", "events", "nsys"), default="delayed")
-    parser.add_argument("--stream", action="store_true", help="print each config's result as soon as it finishes (events/delayed)")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="print each config's result as soon as it finishes (events/delayed)",
+    )
     parser.add_argument(
         "--rotate-buffers",
         default="auto",
@@ -514,7 +486,6 @@ def main() -> int:
         _nsys_worker(args.shape, combo, configs, args.warmup, args.iters, nbuf)
         return 0
 
-    group_m = M
     flops = 2 * S * N * K
     config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
     name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
@@ -539,7 +510,7 @@ def main() -> int:
         return f"  {name:50s} {tflops:8.2f}   {ms:7.3f}   {ratio:>9.2f}×"
 
     if args.timing == "nsys":
-        print(f"  [timing: nsys median kernel duration]\n")
+        print("  [timing: nsys median kernel duration]\n")
         kern_times = _nsys_run_and_parse(args.shape, combo, config_names, args.warmup, args.iters, nbuf)
         cublas_hit = _find_cublas_time(kern_times)
         if cublas_hit:
@@ -553,9 +524,6 @@ def main() -> int:
             cfg = name_to_cfg.get(name)
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
-                continue
-            if not _compatible(cfg, N, K, combo):
-                rows.append((name, 0.0, float("inf"), "incompatible"))
                 continue
             tok = _kernel_match_token(cfg, _SPEC_MAP[name][1])
             matches = [(k, v) for k, v in kern_times.items() if tok in k]
@@ -585,15 +553,22 @@ def main() -> int:
         )
         cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12
         if args.stream:
-            print(_fmt_row("cuBLAS BF16 (reference)", cublas_tflops, cublas_ms, "", cublas_tflops), flush=True)
+            print(
+                _fmt_row(
+                    "cuBLAS BF16 (reference)",
+                    cublas_tflops,
+                    cublas_ms,
+                    "",
+                    cublas_tflops,
+                ),
+                flush=True,
+            )
 
         ctx_dead = False
         for name in config_names:
             cfg = name_to_cfg.get(name)
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
-            elif not _compatible(cfg, N, K, combo):
-                row = (name, 0.0, float("inf"), "incompatible")
             elif ctx_dead:
                 row = (name, 0.0, float("inf"), "skipped (CUDA context dead)")
             else:
@@ -603,7 +578,10 @@ def main() -> int:
                     g, h = _graph_moe_bs(S, N, K, E, combo)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
-                        _rotating(lambda t, _plan=plan, _h=h: _plan(_vp_moe_bs(_h, t[0], t[1], t[2], t[3], offsets, t[4])), pool),
+                        _rotating(
+                            lambda t, _plan=plan, _h=h: _plan(_vp_moe_bs(_h, t[0], t[1], t[2], t[3], offsets, t[4])),
+                            pool,
+                        ),
                         lambda _plan=plan, _h=h: _plan(_vp_moe_bs(_h, wset[0], wset[1], wset[2], wset[3], offsets, wset[4])),
                         warmup=args.warmup,
                         iters=args.iters,
@@ -612,7 +590,14 @@ def main() -> int:
                 except Exception as e:
                     msg = str(e).splitlines()[0][:50] if str(e) else type(e).__name__
                     row = (name, 0.0, float("inf"), f"ERR {msg}")
-                    if any(s in str(e) for s in ("illegal memory access", "unspecified launch failure", "CUDA_ERROR_LAUNCH_FAILED")):
+                    if any(
+                        s in str(e)
+                        for s in (
+                            "illegal memory access",
+                            "unspecified launch failure",
+                            "CUDA_ERROR_LAUNCH_FAILED",
+                        )
+                    ):
                         ctx_dead = True
             rows.append(row)
             if args.stream:

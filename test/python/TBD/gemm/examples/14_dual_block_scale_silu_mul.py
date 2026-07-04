@@ -1,17 +1,10 @@
-"""Example 14: block-scale multi-GEMM — DualBlockScaleMatmulSiluMul.
+"""Example 14: block-scale multi-GEMM — dual nvfp4 matmul + SwiGLU.
 
-Two parallel block-scaled (nvfp4) GEMMs share the dequantized A operand and feed
-one fused epilogue:
-
-    C0 = dequant(A) @ dequant(B0)
-    C1 = dequant(A) @ dequant(B1)
-    out = silu(C0) * C1                # SwiGLU-style gated FFN block
-
-The single ``block_scale_dequantize(A)`` node is matched into BOTH GEMMs, so the
-kernel carries ONE distinct A operand (+ its SFA) and loads it once. cta_n is
-capped at 128 because the dual accumulators plus the SF region must fit the 512
-TMEM columns (2 × 128 + SF ≤ 512). Multi-GEMM block-scale is implemented in the
-1-CTA-MMA templates, so this passes ``cta_group=1``.
+Two parallel block-scaled (nvfp4) GEMMs share the dequantized A operand:
+    out = silu(dequant(A) @ dequant(B0)) * (dequant(A) @ dequant(B1))
+The single block_scale_dequantize(A) is matched into BOTH GEMMs (one distinct A
+operand + SFA, loaded once). cta_n capped at 128: dual accumulators + SF region
+must fit 512 TMEM cols (2*128 + SF <= 512). 1-CTA-MMA template (cta_group=1).
 """
 
 from __future__ import annotations
@@ -36,7 +29,11 @@ def main(M: int = 256, N: int = 128, K: int = 512) -> None:
     fp4, e4m3 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
     rk = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
 
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=fp4)
     SFA = g.tensor(name="SFA", dim=[1, M, sf_k], stride=[M * sf_k, sf_k, 1], data_type=e4m3, **rk)
     B0 = g.tensor(name="B0", dim=[1, K, N], stride=[K * N, 1, K], data_type=fp4)
@@ -44,7 +41,7 @@ def main(M: int = 256, N: int = 128, K: int = 512) -> None:
     B1 = g.tensor(name="B1", dim=[1, K, N], stride=[K * N, 1, K], data_type=fp4)
     SFB1 = g.tensor(name="SFB1", dim=[1, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=e4m3, **rk)
 
-    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, bs])  # shared
+    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, bs])  # shared by both GEMMs
     B0d = g.block_scale_dequantize(input=B0, descale=SFB0, block_size=[bs, 1])
     B1d = g.block_scale_dequantize(input=B1, descale=SFB1, block_size=[bs, 1])
     C0 = g.matmul(A=Ad, B=B0d, name="mm0")
@@ -72,9 +69,17 @@ def main(M: int = 256, N: int = 128, K: int = 512) -> None:
     sfa_b = _to_blocked(sfa).view(1, M, sf_k)
 
     c = torch.zeros(1, M, N, dtype=torch.float32, device=dev)
-    # Block-scale multi-GEMM call: per-GEMM ((a, sfa), (b, sfb)) pairs. A + SFA
-    # are shared, so they appear in both pairs; the kernel loads each once.
-    compiled({A: a_rt, SFA: sfa_b, B0: b0_rt, SFB0: _to_blocked(sfb0).view(1, N, sf_k), B1: b1_rt, SFB1: _to_blocked(sfb1).view(1, N, sf_k), Y: c})
+    compiled(
+        {
+            A: a_rt,
+            SFA: sfa_b,
+            B0: b0_rt,
+            SFB0: _to_blocked(sfb0).view(1, N, sf_k),
+            B1: b1_rt,
+            SFB1: _to_blocked(sfb1).view(1, N, sf_k),
+            Y: c,
+        }
+    )
     torch.cuda.synchronize()
 
     a_s = a_deq * sfa.float().repeat_interleave(bs, 1)

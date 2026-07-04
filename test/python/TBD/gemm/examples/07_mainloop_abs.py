@@ -1,11 +1,9 @@
 """Example 07: mainloop fusion — unary ops on A and/or B before the MMA.
 
-A unary op feeding the matmul's A or B operand is detected as *mainloop
-fusion*: it runs on dedicated mainloop warps that transform the operand tile
-in SMEM before the MMA reads it, rather than in the epilogue. The compiler
-picks the 12-warp mainloop template automatically. This example runs three
-cases: A-only (`abs(A) @ B`), B-only (`A @ relu(B)`), and both
-(`abs(A) @ relu(B)`).
+A unary op feeding a matmul operand runs on dedicated mainloop warps that
+transform the operand tile in SMEM before the MMA (not in the epilogue); the
+12-warp mainloop template is picked automatically. Cases: A-only, B-only, both,
+plus scalar-aux binary (A*alpha) @ (B*beta).
 """
 
 from __future__ import annotations
@@ -25,8 +23,8 @@ def _run(aop: str, bop: str, M: int, N: int, K: int) -> None:
     )
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
-    Ai = getattr(g, aop)(input=A, name="aop") if aop != "none" else A
-    Bi = getattr(g, bop)(input=B, name="bop") if bop != "none" else B
+    Ai = getattr(g, aop)(input=A, name="aop").set_data_type(cudnn.data_type.BFLOAT16) if aop != "none" else A
+    Bi = getattr(g, bop)(input=B, name="bop").set_data_type(cudnn.data_type.BFLOAT16) if bop != "none" else B
     C = g.matmul(A=Ai, B=Bi, name="mm")
     C.set_output(True)
 
@@ -63,7 +61,9 @@ def _run_scaled(M: int, N: int, K: int, av: float = 2.0, bv: float = 0.5) -> Non
     alpha = g.tensor(name="alpha", dim=[1, 1, 1], stride=[1, 1, 1])
     beta = g.tensor(name="beta", dim=[1, 1, 1], stride=[1, 1, 1])
     As = g.mul(a=A, b=alpha, name="sA")
+    As.set_data_type(cudnn.data_type.BFLOAT16)
     Bs = g.mul(a=B, b=beta, name="sB")
+    Bs.set_data_type(cudnn.data_type.BFLOAT16)
     C = g.matmul(A=As, B=Bs, name="mm")
     C.set_output(True)
 
@@ -92,10 +92,10 @@ def _run_scaled(M: int, N: int, K: int, av: float = 2.0, bv: float = 0.5) -> Non
 
 
 def main(M: int = 512, N: int = 512, K: int = 256) -> None:
-    _run("abs", "none", M, N, K)  # mainloop fusion on A only
-    _run("none", "relu", M, N, K)  # mainloop fusion on B only
-    _run("abs", "relu", M, N, K)  # mainloop fusion on both A and B
-    _run_scaled(M, N, K)  # scalar-aux binary: (A*alpha) @ (B*beta)
+    _run("abs", "none", M, N, K)  # A only
+    _run("none", "relu", M, N, K)  # B only
+    _run("abs", "relu", M, N, K)  # both
+    _run_scaled(M, N, K)  # scalar-aux binary
 
 
 if __name__ == "__main__":

@@ -1,29 +1,8 @@
-"""Benchmark the fused block-scale multi-GEMM SwiGLU block
-(DualBlockScaleMatmulSiluMul) vs an unfused baseline.
+"""Benchmark the fused nvfp4 block-scale dual-matmul SwiGLU vs an unfused baseline.
 
-Graph (nvfp4 block-scale, shared dequantized A):
-
-    c0 = dequant(a) @ dequant(b0)        # mm0
-    c1 = dequant(a) @ dequant(b1)        # mm1   (shares a; b0/b1 distinct)
-    out = silu(c0) * c1                  # swish -> mul
-
-The single ``block_scale_dequantize(a)`` is matched into BOTH GEMMs, so our
-kernel carries ONE distinct A operand (+ SFA) and loads it once, runs two
-``tcgen05`` block-scale MMAs into two TMEM accumulators, and fuses the epilogue.
-The unfused baseline dequantizes to fp16 then runs two cuBLAS GEMMs + the
-pointwise chain — what you'd otherwise launch. We report the fused kernel's
-TFLOPS (counting both GEMMs) and its speedup over that baseline.
-
-Block-scale multi-GEMM runs on the 1-CTA-MMA templates (cta_group=1, clc +
-static); cta_n is capped at 128 (2 × cta_n + SF must fit 512 TMEM cols).
-
-``--shape`` is ``B,M,N,K`` (B = batch of independent same-shape blocks).
-Timing (CLAUDE.md rule: keep ``--iters`` <= 20): delayed (default) / events.
-
-Usage:
-    python cudnn.TBD.gemm/benchmarks/benchmark_block_scale_matmul_swiglu.py
-    python cudnn.TBD.gemm/benchmarks/benchmark_block_scale_matmul_swiglu.py --shape 1,4096,4096,4096
-    python cudnn.TBD.gemm/benchmarks/benchmark_block_scale_matmul_swiglu.py --iters 20
+The shared block_scale_dequantize(a) is matched into BOTH GEMMs → one distinct A
+operand (+ SFA), loaded once. Runs on 1-CTA-MMA templates; cta_n capped at 128
+(2×cta_n + SF must fit 512 TMEM cols). --iters <= 20 (CLAUDE.md).
 """
 
 from __future__ import annotations
@@ -44,15 +23,13 @@ from cudnn.TBD.gemm.kernel_registry import candidates as _registry_candidates
 
 
 def _build_plan(g, cfg, cta_group, sched):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile the recorded graph with a forced tile config."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
 
 
 def _vp_bs_mg(handles, gemm_pairs, outs, *aux):
-    """Block-scale multi-GEMM variant-pack dict keyed by the graph's tensors. Each
-    pair is ``((a, sfa), (b, sfb))``; dedup by packed-data identity into distinct
-    A/B slots (SF travels with its data), + outputs + aux."""
+    """Block-scale multi-GEMM variant-pack dict. Pairs ((a, sfa), (b, sfb)) dedup
+    by packed-data identity into distinct A/B slots (SF travels with its data)."""
     bd = handles
     a_seen, b_seen, sfa_seen, sfb_seen = [], [], [], []
     for (ag, sfag), (bg, sfbg) in gemm_pairs:
@@ -73,9 +50,25 @@ def _vp_bs_mg(handles, gemm_pairs, outs, *aux):
     return vp
 
 
-# nvfp4 packing/reorder helpers (kept inline; the sibling block-scale benches do
-# the same — matches test/python/TBD/gemm/test_block_scale.py).
-_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+# nvfp4 packing/reorder helpers (matches test/python/TBD/gemm/test_block_scale.py).
+_E2M1 = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
 
 
 def _ceil_div(a, b):
@@ -97,14 +90,16 @@ def _unpack_fp4(u8, lut):
     return torch.stack([lo, hi], dim=-1).flatten(-2)
 
 
-# ---------------------------------------------------------------------------
-# Graph + data (nvfp4)
-# ---------------------------------------------------------------------------
+# --- Graph + data (nvfp4) ---
 def _graph(B, M, N, K, bs=16):
     sf_k = K // bs
     fp4, e4m3 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
     rk = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.HALF,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
     A = g.tensor(name="A", dim=[B, M, K], stride=[M * K, K, 1], data_type=fp4)
     SFA = g.tensor(name="SFA", dim=[B, M, sf_k], stride=[M * sf_k, sf_k, 1], data_type=e4m3, **rk)
     B0 = g.tensor(name="B0", dim=[B, K, N], stride=[K * N, 1, K], data_type=fp4)
@@ -118,7 +113,14 @@ def _graph(B, M, N, K, bs=16):
     C1 = g.matmul(A=Ad, B=B1d, name="mm1")
     Y = g.mul(a=g.swish(input=C0), b=C1)
     Y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-    return g, SimpleNamespace(a_operands=[A], b_operands=[B0, B1], sfa_operands=[SFA], sfb_operands=[SFB0, SFB1], outputs=[Y], aux=[])
+    return g, SimpleNamespace(
+        a_operands=[A],
+        b_operands=[B0, B1],
+        sfa_operands=[SFA],
+        sfb_operands=[SFB0, SFB1],
+        outputs=[Y],
+        aux=[],
+    )
 
 
 def _mkdata(B, M, N, K, bs=16):
@@ -157,16 +159,14 @@ def _reference(a_s, b0_s, b1_s):
 
 
 def _unfused_launch(a_s, b0_s, b1_s, out):
-    """Dequantized fp16 operands → 2 cuBLAS GEMMs + pointwise (the baseline)."""
+    """Baseline: dequantized fp16 operands → 2 cuBLAS GEMMs + pointwise."""
     a, b0, b1 = a_s.half(), b0_s.half(), b1_s.half()
     c0 = torch.matmul(a, b0.transpose(-1, -2))
     c1 = torch.matmul(a, b1.transpose(-1, -2))
     out.copy_(torch.nn.functional.silu(c0.float()) * c1.float())
 
 
-# ---------------------------------------------------------------------------
-# Timing (delayed / events)
-# ---------------------------------------------------------------------------
+# --- Timing (delayed / events) ---
 def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> float:
     for _ in range(warmup):
         timed_fn()
@@ -185,13 +185,10 @@ def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> f
 
 
 def _build_spec_map():
-    """Legacy label ``CONFIG_..._Nctamma[_static]`` -> (geometry cfg, cta_group,
-    scheduler) for every multi-GEMM-capable sm100 block-scale strategy, via the
-    registry funnel — SAME convention as benchmark_matmul.py, so ``--configs`` takes
-    the full suffixed names. Block-scale pins cta_tile_n=128 (SF 128x4 swizzle +
-    dual-GEMM TMEM: 256 overflows, 64/32 break the swizzle), so only those
-    geometries appear."""
-    chain = analyze(_graph(1, 256, 128, 512)[0])  # a dual nvfp4 block-scale chain
+    """Label CONFIG_..._Nctamma[_static] -> (cfg, cta_group, scheduler) for every
+    multi-GEMM-capable sm100 block-scale strategy. Pins cta_tile_n=128 (SF 128x4
+    swizzle + dual-GEMM TMEM: 256 overflows, 64/32 break the swizzle)."""
+    chain = analyze(_graph(1, 256, 128, 512)[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
         if cfg.arch != "sm100" or cfg.cta_tile_m != 128 or cfg.cta_tile_n != 128:
@@ -231,7 +228,12 @@ def main() -> int:
     out = torch.zeros(B, M, N, dtype=torch.float32, device="cuda")
 
     out_bl = torch.empty_like(out)
-    bl_ms = _time_ms(lambda: _unfused_launch(a_s, b0_s, b1_s, out_bl), warmup=args.warmup, iters=args.iters, delayed=delayed)
+    bl_ms = _time_ms(
+        lambda: _unfused_launch(a_s, b0_s, b1_s, out_bl),
+        warmup=args.warmup,
+        iters=args.iters,
+        delayed=delayed,
+    )
     print(f"  {'unfused dequant+2xcuBLAS+pointwise':52s} " f"{flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  {bl_ms:8.3f} ms   {'1.00×':>8s}")
 
     config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
@@ -256,7 +258,12 @@ def main() -> int:
             continue
         ok = torch.allclose(out.float(), ref.float(), rtol=2e-2, atol=2e-1)  # swish: fast approx
         err = (out.float() - ref.float()).abs().max().item()
-        ms = _time_ms(lambda: plan(_vp_bs_mg(h, pairs, out)), warmup=args.warmup, iters=args.iters, delayed=delayed)
+        ms = _time_ms(
+            lambda: plan(_vp_bs_mg(h, pairs, out)),
+            warmup=args.warmup,
+            iters=args.iters,
+            delayed=delayed,
+        )
         ratio = bl_ms / ms if ms > 0 else 0.0
         flag = "" if ok else f"  !! maxerr={err:.3g}"
         print(f"  {name:62s} {flops / (ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{ms:8.3f} ms   {ratio:>7.2f}×{flag}")

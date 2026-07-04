@@ -1,17 +1,9 @@
-"""Fused dual MoE grouped **block-scale** matmul + SwiGLU — cuDNN
-``NVFP4_Dual_Block_Scale_Moe_Grouped_Matmul_Swiglu_KNone_Mode``:
+"""Fused dual MoE grouped block-scale matmul + SwiGLU:
+out = silu(moe(tok_d, w0_d)) * moe(tok_d, w1_d) * scale.
 
-    tok_d = dequant(token, SFA)                  # block_scale_dequantize
-    w0_d  = dequant(weight0, SFB0)
-    w1_d  = dequant(weight1, SFB1)
-    c0 = moe_grouped_matmul(tok_d, w0_d, fto)    # moe0
-    c1 = moe_grouped_matmul(tok_d, w1_d, fto)    # moe1  (shares token + fto)
-    out = silu(c0) * c1 * scaleFactor            # swish -> mul -> mul(scale)
-
-Two block-scaled grouped matmuls run in parallel sharing the token (A) + its SFA
-and the single ``first_token_offset``; the weights (B) and their SFB are distinct.
-Multi-GEMM extension of the MoE grouped block-scale pipeline (sm100 2ctamma),
-covering nvfp4 / mxfp4 / mxfp8. Checked vs a torch dequant + group-loop reference.
+Two block-scaled grouped matmuls share the token (A)+SFA and one
+first_token_offset; weights (B)+SFB distinct. Multi-GEMM MoE block-scale path,
+covering nvfp4 / mxfp4 / mxfp8, checked vs a torch dequant + group-loop reference.
 """
 
 from __future__ import annotations
@@ -27,10 +19,9 @@ from cudnn.TBD.gemm.tile_config import CATALOG
 
 
 class _Plan:
-    """Test handle that JIT-compiles a recorded graph with a forced tile config
-    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
-    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
-    aux_names and is callable with a variant pack."""
+    """JIT-compiles a recorded graph with a forced tile config (bypassing the
+    TBD engine's auto-select). Exposes chain / binding / block_scale / aux_names;
+    callable with a variant pack."""
 
     def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
         self.g = graph
@@ -52,9 +43,9 @@ def _plan(graph, config=None, cta_group=2, scheduler="clc"):
 
 
 def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
-    """MoE block-scale multi-GEMM variant-pack dict from the binding. Each pair
-    is ``((token, sfa), (weight, sfb))``; dedup by packed-data identity into
-    distinct A/B slots, + first_token_offset + outputs + aux."""
+    """MoE block-scale multi-GEMM variant-pack dict. Each pair is
+    ((token, sfa), (weight, sfb)); dedup by packed-data identity into distinct
+    A/B slots, + first_token_offset + outputs + aux."""
     bd = compiled.binding
     a_seen, b_seen, sfa_seen, sfb_seen = [], [], [], []
     for (ag, sfag), (bg, sfbg) in gemm_pairs:
@@ -75,14 +66,31 @@ def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
     return vp
 
 
-# cta_tile_n=128 (dual block-scale TMEM fits two accs + SF only at n<=128).
+# cta_tile_n=128: dual block-scale TMEM fits two accs + SF only at n<=128.
 # (config, cta_group): 2-CTA cluster2x1 (reference) + 1-CTA cluster1x1.
 _GEOMETRIES = [
     ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1", 2),
     ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
 ]
 
-_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+_E2M1 = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
 
 # combo -> (block_size, data dtype, SF dtype).
 _COMBOS = {
@@ -136,16 +144,58 @@ def _build_graph(
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
     w0 = g.tensor(name="weight0", dim=[E, K, N], stride=[K * N, 1, K], data_type=a_dt)
     w1 = g.tensor(name="weight1", dim=[E, K, N], stride=[K * N, 1, K], data_type=a_dt)
-    SFA = g.tensor(name="SFA", dim=[1, S, sf_k], stride=[S * sf_k, sf_k, 1], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
-    SFB0 = g.tensor(name="SFB0", dim=[E, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
-    SFB1 = g.tensor(name="SFB1", dim=[E, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
-    fto = g.tensor(name="first_token_offset", dim=[num_groups, 1, 1], stride=[1, 1, 1], data_type=offset_dt)
-    sf = g.tensor(name="scaleFactor", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    SFA = g.tensor(
+        name="SFA",
+        dim=[1, S, sf_k],
+        stride=[S * sf_k, sf_k, 1],
+        data_type=sf_dt,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    SFB0 = g.tensor(
+        name="SFB0",
+        dim=[E, sf_k, N],
+        stride=[sf_k * N, 1, sf_k],
+        data_type=sf_dt,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    SFB1 = g.tensor(
+        name="SFB1",
+        dim=[E, sf_k, N],
+        stride=[sf_k * N, 1, sf_k],
+        data_type=sf_dt,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[num_groups, 1, 1],
+        stride=[1, 1, 1],
+        data_type=offset_dt,
+    )
+    sf = g.tensor(
+        name="scaleFactor",
+        dim=[1, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.FLOAT,
+    )
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size])
     w0_d = g.block_scale_dequantize(input=w0, descale=SFB0, block_size=[block_size, 1])
     w1_d = g.block_scale_dequantize(input=w1, descale=SFB1, block_size=[block_size, 1])
-    c0 = g.moe_grouped_matmul(tok_d, w0_d, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe0")
-    c1 = g.moe_grouped_matmul(tok_d, w1_d, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe1")
+    c0 = g.moe_grouped_matmul(
+        tok_d,
+        w0_d,
+        fto,
+        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        compute_data_type=cudnn.data_type.FLOAT,
+        name="moe0",
+    )
+    c1 = g.moe_grouped_matmul(
+        tok_d,
+        w1_d,
+        fto,
+        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        compute_data_type=cudnn.data_type.FLOAT,
+        name="moe1",
+    )
     c0silu = g.swish(input=c0, name="silu0")
     mul = g.mul(a=c0silu, b=c1, name="mul0")
     dq = g.mul(a=mul, b=sf, name="dequant0")
@@ -218,8 +268,7 @@ def _mk_sf(combo, shape, dev):
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
 def test_dual_moe_block_scale_swiglu(combo, cfg_name, cta_group) -> None:
-    """The ``..._Dual_Block_Scale_Moe_Grouped_Matmul_Swiglu_KNone_Mode`` spec
-    case: S=1024, N=256, K=512, E=2, 4 groups (offsets [0,256,384,512])."""
+    """Spec case: S=1024, N=256, K=512, E=2, 4 groups (offsets [0,256,384,512])."""
     dev = "cuda"
     torch.manual_seed(0)
     E, S, N, K = 2, 1024, 256, 512
@@ -253,7 +302,10 @@ def test_dual_moe_block_scale_swiglu(combo, cfg_name, cta_group) -> None:
     compiled(
         _vp_moe_bs_mg(
             compiled,
-            [((tok_rt, sfa_blk), (w0_rt, sfb0_blk)), ((tok_rt, sfa_blk), (w1_rt, sfb1_blk))],
+            [
+                ((tok_rt, sfa_blk), (w0_rt, sfb0_blk)),
+                ((tok_rt, sfa_blk), (w1_rt, sfb1_blk)),
+            ],
             offsets,
             output,
             scale,
@@ -325,7 +377,10 @@ def test_dual_moe_block_scale_swiglu_reduction_scalar() -> None:
     compiled(
         _vp_moe_bs_mg(
             compiled,
-            [((tok_rt, sfa_blk), (w0_rt, sfb0_blk)), ((tok_rt, sfa_blk), (w1_rt, sfb1_blk))],
+            [
+                ((tok_rt, sfa_blk), (w0_rt, sfb0_blk)),
+                ((tok_rt, sfa_blk), (w1_rt, sfb1_blk)),
+            ],
             offsets,
             [output, red],
             scale,

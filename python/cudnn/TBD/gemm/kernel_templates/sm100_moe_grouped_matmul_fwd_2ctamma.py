@@ -198,10 +198,34 @@ def _kernel(
 
     sA_elems = cta_tile_mnk[0] * cgrp_tile_mnk[2]
     sB_elems = cta_tile_mnk[1] * cgrp_tile_mnk[2]
-    smem_a_list = [cutlass.Array(ab_dtype, sA_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024) for _ in range(num_a_operands)]
-    smem_b_list = [cutlass.Array(ab_dtype, sB_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024) for _ in range(num_b_operands)]
+    smem_a_list = [
+        cutlass.Array(
+            ab_dtype,
+            sA_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_a_operands)
+    ]
+    smem_b_list = [
+        cutlass.Array(
+            ab_dtype,
+            sB_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_b_operands)
+    ]
 
-    tma_a_desc_smem_list = [cutlass.Array(cutlass.Int64, _TENSOR_MAP_QWORDS, space=cutlass.AddressSpace.smem, alignment=128) for _ in range(num_a_operands)]
+    tma_a_desc_smem_list = [
+        cutlass.Array(
+            cutlass.Int64,
+            _TENSOR_MAP_QWORDS,
+            space=cutlass.AddressSpace.smem,
+            alignment=128,
+        )
+        for _ in range(num_a_operands)
+    ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
 
@@ -432,7 +456,11 @@ def _kernel(
                 coord_expert = group_idx % num_experts
                 linear_idx += grid_num_clusters
 
-            while not nvvm.mbarrier_try_wait_parity(sched_empty_mbar_ptr + sched_stage, sched_empty_phase, time_limit=10_000_000):
+            while not nvvm.mbarrier_try_wait_parity(
+                sched_empty_mbar_ptr + sched_stage,
+                sched_empty_phase,
+                time_limit=10_000_000,
+            ):
                 pass
             if lane == 0:
                 slot = sched_storage + sched_stage * SCHED_SLOT_WORDS
@@ -481,7 +509,11 @@ def _kernel(
         nvvm.bar_warp_sync(0xFFFFFFFF)
 
         while is_valid != 0:
-            while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr + sched_stage, sched_full_phase, time_limit=10_000_000):
+            while not nvvm.mbarrier_try_wait_parity(
+                sched_full_mbar_ptr + sched_stage,
+                sched_full_phase,
+                time_limit=10_000_000,
+            ):
                 pass
             slot = sched_storage + sched_stage * SCHED_SLOT_WORDS
             coord_expert = (slot + 0).load()
@@ -521,7 +553,11 @@ def _kernel(
                     if stage == 0 and ab_iter != 0:
                         ab_empty_phase_bit = ab_empty_phase_bit ^ 1
 
-                    while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr + stage, ab_empty_phase_bit, time_limit=10_000_000):
+                    while not nvvm.mbarrier_try_wait_parity(
+                        ab_empty_mbar_ptr + stage,
+                        ab_empty_phase_bit,
+                        time_limit=10_000_000,
+                    ):
                         pass
 
                     coord_k = k_tile_idx * cgrp_tile_mnk[2]
@@ -602,7 +638,11 @@ def _kernel(
             sched_full_phase = cutlass.Int32(0)
             acc_stage = cutlass.Int32(0)
             while is_valid != 0:
-                while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr + sched_stage, sched_full_phase, time_limit=10_000_000):
+                while not nvvm.mbarrier_try_wait_parity(
+                    sched_full_mbar_ptr + sched_stage,
+                    sched_full_phase,
+                    time_limit=10_000_000,
+                ):
                     pass
                 is_valid = (sched_storage + sched_stage * SCHED_SLOT_WORDS + 3).load()
                 if nvvm.elect_sync():
@@ -617,7 +657,11 @@ def _kernel(
                     if acc_stage == 0 and tile_iter != 0:
                         acc_empty_phase_bit = acc_empty_phase_bit ^ 1
 
-                    while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr + acc_stage, acc_empty_phase_bit, time_limit=10_000_000):
+                    while not nvvm.mbarrier_try_wait_parity(
+                        acc_empty_mbar_ptr + acc_stage,
+                        acc_empty_phase_bit,
+                        time_limit=10_000_000,
+                    ):
                         pass
 
                     acc_base_col = base_col_id_root + acc_stage * acc_region_cols
@@ -636,7 +680,11 @@ def _kernel(
                         if stage == 0 and ab_iter != 0:
                             ab_full_phase_bit = ab_full_phase_bit ^ 1
 
-                        while not nvvm.mbarrier_try_wait_parity(ab_full_mbar_ptr + stage, ab_full_phase_bit, time_limit=10_000_000):
+                        while not nvvm.mbarrier_try_wait_parity(
+                            ab_full_mbar_ptr + stage,
+                            ab_full_phase_bit,
+                            time_limit=10_000_000,
+                        ):
                             pass
 
                         for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -696,7 +744,11 @@ def _kernel(
                         if tail_stage == acc_stages:
                             tail_stage = cutlass.Int32(0)
                             tail_phase = tail_phase ^ 1
-                        while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr + tail_stage, tail_phase, time_limit=10_000_000):
+                        while not nvvm.mbarrier_try_wait_parity(
+                            acc_empty_mbar_ptr + tail_stage,
+                            tail_phase,
+                            time_limit=10_000_000,
+                        ):
                             pass
             nvvm.bar_warp_sync(0xFFFFFFFF)
 
@@ -712,7 +764,11 @@ def _kernel(
             sched_stage = cutlass.Int32(0)
             sched_full_phase = cutlass.Int32(0)
             while is_valid != 0:
-                while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr + sched_stage, sched_full_phase, time_limit=10_000_000):
+                while not nvvm.mbarrier_try_wait_parity(
+                    sched_full_mbar_ptr + sched_stage,
+                    sched_full_phase,
+                    time_limit=10_000_000,
+                ):
                     pass
                 is_valid = (sched_storage + sched_stage * SCHED_SLOT_WORDS + 3).load()
                 if nvvm.elect_sync():
@@ -763,7 +819,11 @@ def _kernel(
         # @@TMA_STORE_ONLY:END@@
 
         while is_valid != 0:
-            while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr + sched_stage, sched_full_phase, time_limit=10_000_000):
+            while not nvvm.mbarrier_try_wait_parity(
+                sched_full_mbar_ptr + sched_stage,
+                sched_full_phase,
+                time_limit=10_000_000,
+            ):
                 pass
             slot = sched_storage + sched_stage * SCHED_SLOT_WORDS
             tile_m = (slot + 1).load()
@@ -789,7 +849,11 @@ def _kernel(
                 if acc_stage == 0 and tile_iter != 0:
                     acc_full_phase_bit = acc_full_phase_bit ^ 1
 
-                while not nvvm.mbarrier_try_wait_parity(acc_full_mbar_ptr + acc_stage, acc_full_phase_bit, time_limit=10_000_000):
+                while not nvvm.mbarrier_try_wait_parity(
+                    acc_full_mbar_ptr + acc_stage,
+                    acc_full_phase_bit,
+                    time_limit=10_000_000,
+                ):
                     pass
 
                 acc_base_col = base_col_id_root + acc_stage * acc_region_cols
@@ -820,7 +884,11 @@ def _kernel(
                     if cutlass.const_expr(subtile_idx == subtile_cnt - 1):
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if nvvm.elect_sync():
-                            nvvm.mbarrier_arrive(nvvm.mapa(acc_empty_mbar_ptr + acc_stage, pair_leader_rank), scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                            nvvm.mbarrier_arrive(
+                                nvvm.mapa(acc_empty_mbar_ptr + acc_stage, pair_leader_rank),
+                                scope=nvvm.MemScope.CLUSTER,
+                                relaxed=True,
+                            )
 
                     col = coord_n_c + subtile_col_offset
                     if row_active and row < group_end:

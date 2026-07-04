@@ -312,9 +312,8 @@ def test_epilogue_reduction_accepts_int32_compute_dtype() -> None:
 
 
 def test_rejects_unsupported_reduction_mode() -> None:
-    # Unsupported modes are rejected in analyze() (not at g.reduction() time —
-    # the recorder must stay transparent so non-GEMM graphs using other reduction
-    # modes still build).
+    # Rejected in analyze(), not at g.reduction() time — the recorder stays
+    # transparent so non-GEMM graphs with other reduction modes still build.
     g = _mk_graph()
     A, B = _mk_inputs(g, 128, 128, 64)
     C = g.matmul(A=A, B=B, name="mm")
@@ -376,9 +375,8 @@ def test_rejects_zero_matmul() -> None:
 
 
 def test_two_independent_matmuls_are_no_epilogue_multi_gemm() -> None:
-    """Two same-shape matmuls with SEPARATE outputs and NO fusion op = the
-    no-epilogue multi-GEMM case (K parallel GEMMs, each materialized directly).
-    Each GEMM output must set_output(True); GEMM 0 = terminal, GEMMs >0 = taps."""
+    """Two same-shape matmuls, separate outputs, no fusion op = no-epilogue
+    multi-GEMM. GEMM 0 = terminal, GEMMs >0 = taps."""
     g = _mk_graph()
     A, B = _mk_inputs(g, 128, 128, 64)
     A2 = g.tensor(name="A2", dim=[1, 128, 64], stride=[128 * 64, 64, 1])
@@ -412,8 +410,7 @@ def test_two_matmuls_shared_epilogue_is_multi_gemm() -> None:
 
 
 def test_dag_fan_out_from_matmul() -> None:
-    """Phase 3: matmul output consumed by two branches, each producing its
-    own GMEM output. The LAST set_output'd tensor is the terminal."""
+    """Matmul output fans out to two branches; the LAST set_output'd is terminal."""
     g = _mk_graph()
     A, B = _mk_inputs(g, 128, 128, 64)
     C = g.matmul(A=A, B=B, name="mm")
@@ -422,7 +419,6 @@ def test_dag_fan_out_from_matmul() -> None:
     Y1.set_output(True)  # first → slot 1 tap
     Y2.set_output(True)  # last → slot 0 terminal
     chain = analyze(g)
-    # Two parallel ops, both rooted at the matmul output.
     assert [op.op for op in chain.ops] == ["relu", "gelu"]
     assert chain.ops[0].parent_idx == -1  # relu reads matmul output
     assert chain.ops[1].parent_idx == -1  # gelu reads matmul output
@@ -491,8 +487,8 @@ def test_rank1_aux_bcast_inference_scalar() -> None:
 
 
 def test_matmul_output_tap_recorded() -> None:
-    """C.set_output(True).set_data_type(BF16) on the matmul output should
-    surface as MatmulSpec.output_tap + out_dtype + a 2-slot chain.outputs."""
+    """set_output+set_data_type on the matmul output surfaces as
+    MatmulSpec.output_tap + out_dtype + a 2-slot chain.outputs."""
     g = _mk_graph()
     A, B = _mk_inputs(g, 128, 128, 64)
     C = g.matmul(A=A, B=B, name="mm")
@@ -510,9 +506,8 @@ def test_matmul_output_tap_recorded() -> None:
 
 
 def test_intermediate_op_tap_recorded() -> None:
-    """Phase 2: tapping a fusion-op output (here: after bias, before relu)
-    should attach the tap dtype to that FusionOp and add a slot to
-    chain.outputs."""
+    """Tapping a fusion-op output (after bias, before relu) attaches the tap
+    dtype to that FusionOp and adds a chain.outputs slot."""
     g = _mk_graph()
     A, B = _mk_inputs(g, 128, 128, 64)
     bias = g.tensor(name="bias", dim=[1, 1, 128], stride=[128, 128, 1])
@@ -522,7 +517,7 @@ def test_intermediate_op_tap_recorded() -> None:
     Y = g.relu(input=Cb, name="r")
     Y.set_output(True)  # terminal
     chain = analyze(g)
-    # 2 ops (bias=add + relu); the first should be tapped to fp16.
+    # first op (bias=add) tapped to fp16.
     assert [op.op for op in chain.ops] == ["add", "relu"]
     assert chain.ops[0].output_tap is True and chain.ops[0].out_dtype == "fp16"
     assert chain.ops[1].output_tap is False
@@ -533,8 +528,7 @@ def test_intermediate_op_tap_recorded() -> None:
 
 
 def test_no_tap_when_matmul_is_terminal() -> None:
-    """If matmul.set_output(True) but there are no fusion ops, the matmul
-    output IS the terminal — no tap should be emitted."""
+    """matmul.set_output(True) with no fusion ops = terminal, no tap emitted."""
     g = _mk_graph()
     A, B = _mk_inputs(g, 128, 128, 64)
     C = g.matmul(A=A, B=B, name="mm")
@@ -546,8 +540,7 @@ def test_no_tap_when_matmul_is_terminal() -> None:
 
 
 def test_analyze_raises_when_no_recording() -> None:
-    """If a graph was somehow not recorded, analyze should produce a clear error."""
-    # Hard to simulate without un-installing — synthesize the missing-state case.
+    """An unrecorded graph gives a clear error (synthesize the missing-state case)."""
     from cudnn.TBD.gemm.graph_analyzer import _GRAPH_STATES
 
     g = _mk_graph()
@@ -556,9 +549,7 @@ def test_analyze_raises_when_no_recording() -> None:
         analyze(g)
 
 
-# ---------------------------------------------------------------------------
 # Compute / output dtype semantics (input -> compute -> output, per op)
-# ---------------------------------------------------------------------------
 
 
 def test_rejects_non_fp32_matmul_graph_compute_dtype() -> None:
@@ -600,9 +591,8 @@ def test_epilogue_op_accepts_int32_compute_dtype() -> None:
 
 
 def test_virtual_intermediate_dtype_is_honored() -> None:
-    """Req 3: even a pure-virtual intermediate rounds to its dtype. With a
-    bf16 intermediate_data_type, the matmul output C and the mid op both carry
-    out_dtype=bf16, so the running value is rounded at each step."""
+    """A pure-virtual intermediate still rounds to its dtype: bf16
+    intermediate_data_type rounds C and the mid op at each step."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.BFLOAT16,  # narrow virtuals

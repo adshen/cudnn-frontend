@@ -1,17 +1,6 @@
-"""Frontend integration for the TBD engine as a named plan-list entry.
-
-TBD is not a heuristics mode: the GEMM engine ``TBD_eng0`` is appended to the
-plan list produced by the native cuDNN heuristics (e.g. ``heur_mode.A``). These
-tests exercise:
-
-  * ``create_execution_plans([A]) + select_engines(["TBD_eng0"])`` → the TBD
-    engine runs and matches torch,
-  * the default (no select) and ``deselect_engines(["TBD_eng0"])`` → native
-    cuDNN runs,
-  * the plan-count grows by one when TBD is eligible,
-  * a TBD-ineligible graph (fp32 matmul) does not list ``TBD_eng0``,
-  * the ``cudnn.wrapper.Graph`` path with ``heuristics=[A]`` + engine select.
-"""
+"""Frontend integration: the GEMM engine ``TBD_eng0`` is appended to the plan
+list from native cuDNN heuristics (not a heuristics mode). Exercises engine
+select/deselect, plan-count growth, ineligible graphs, and the wrapper.Graph path."""
 
 from __future__ import annotations
 
@@ -30,15 +19,24 @@ _TBD = "TBD_eng0"
 
 
 def _build_matmul_bias_relu():
-    """A bf16 matmul + per-col bias + relu graph (recorded). Returns
-    ``(g, A, B, bias, Y)``."""
+    """A recorded bf16 matmul + per-col bias + relu graph → (g, A, B, bias, Y)."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    A = g.tensor(
+        name="A",
+        dim=[1, M, K],
+        stride=[M * K, K, 1],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    B = g.tensor(
+        name="B",
+        dim=[1, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
     bias = g.tensor(name="bias", dim=[1, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.BFLOAT16)
     C = g.matmul(A=A, B=B, name="mm")
     Cb = g.bias(input=C, bias=bias, name="bs")
@@ -80,7 +78,7 @@ def test_select_tbd_engine_runs_tbd():
     g.select_engines([_TBD])
     g.check_support()
     g.build_plans()
-    assert g.get_workspace_size() == 0  # TBD owns its workspace
+    assert g.get_workspace_size() == 0  # TBD owns its own workspace
     ws = torch.empty(1, device="cuda", dtype=torch.uint8)
     y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
@@ -90,7 +88,7 @@ def test_select_tbd_engine_runs_tbd():
 
 @_GPU
 def test_default_and_deselect_run_native():
-    """With no select (default) and with TBD deselected, native cuDNN runs."""
+    """No select (default) and TBD deselected both run native cuDNN."""
     a, b, bias_t, ref = _operands()
     for deselect in (False, True):
         g, A, B, bias, Y = _build_matmul_bias_relu()
@@ -133,14 +131,24 @@ def test_build_convenience_then_select():
 
 
 def test_ineligible_graph_not_listed():
-    """A fp32 matmul (no fp32 MMA path) is not eligible → TBD_eng0 not listed."""
+    """fp32 matmul (no fp32 MMA path) is not eligible → TBD_eng0 not listed."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.FLOAT,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    A = g.tensor(name="A", dim=[1, 64, 64], stride=[64 * 64, 64, 1], data_type=cudnn.data_type.FLOAT)
-    B = g.tensor(name="B", dim=[1, 64, 64], stride=[64 * 64, 1, 64], data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(
+        name="A",
+        dim=[1, 64, 64],
+        stride=[64 * 64, 64, 1],
+        data_type=cudnn.data_type.FLOAT,
+    )
+    B = g.tensor(
+        name="B",
+        dim=[1, 64, 64],
+        stride=[64 * 64, 1, 64],
+        data_type=cudnn.data_type.FLOAT,
+    )
     C = g.matmul(A=A, B=B, name="mm", compute_data_type=cudnn.data_type.FLOAT)
     C.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
@@ -148,16 +156,46 @@ def test_ineligible_graph_not_listed():
     g.create_execution_plans([cudnn.heur_mode.A])
     state = _get_plan_state(g)
     assert _TBD not in state["eligible"]
-    # Selecting an ineligible engine is a no-op — no TBD entry was added, so the
-    # plan count is just cuDNN's (selecting doesn't make an ineligible engine live).
+    # Selecting an ineligible engine is a no-op — plan count stays cuDNN's.
     count_before = g.get_execution_plan_count()
     g.select_engines([_TBD])
     assert g.get_execution_plan_count() == count_before
 
 
+def test_probe_exception_marks_ineligible(monkeypatch, caplog):
+    """A TBD engine whose probe() raises is treated as ineligible without
+    aborting eligibility for the others — a probe must never break the native
+    path."""
+    import logging
+
+    from cudnn.TBD import heuristics as _h
+
+    def _raising_probe(_g):
+        raise RuntimeError("probe boom")
+
+    fake_engines = {
+        "TBD_probe_raise": (_raising_probe, lambda _g: None),
+        "TBD_probe_ok": (lambda _g: True, lambda _g: None),
+    }
+    monkeypatch.setattr(_h, "_ENGINES", fake_engines)
+
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    with caplog.at_level(logging.DEBUG, logger="cudnn.TBD.heuristics"):
+        _h._probe_and_append(g)  # must not raise despite one probe throwing
+
+    state = _h._get_plan_state(g)
+    assert "TBD_probe_raise" not in state["eligible"]  # raising probe → ineligible
+    assert "TBD_probe_ok" in state["eligible"]  # loop still evaluated the rest
+    assert any("raised" in r.getMessage() for r in caplog.records)
+
+
 @_GPU
 def test_wrapper_graph_path():
-    """cudnn.wrapper.Graph(heuristics=[A]) builds cuDNN + TBD_eng0; select TBD."""
+    """wrapper.Graph(heuristics=[A]) builds cuDNN + TBD_eng0; select TBD."""
     from cudnn.wrapper import Graph
 
     a, b, bias_t, ref = _operands()
@@ -168,9 +206,24 @@ def test_wrapper_graph_path():
         heuristics=[cudnn.heur_mode.A],
         handle="auto",
     ) as g:
-        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-        bias = g.tensor(name="bias", dim=[1, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.BFLOAT16)
+        A = g.tensor(
+            name="A",
+            dim=[1, M, K],
+            stride=[M * K, K, 1],
+            data_type=cudnn.data_type.BFLOAT16,
+        )
+        B = g.tensor(
+            name="B",
+            dim=[1, K, N],
+            stride=[K * N, 1, K],
+            data_type=cudnn.data_type.BFLOAT16,
+        )
+        bias = g.tensor(
+            name="bias",
+            dim=[1, 1, N],
+            stride=[N, N, 1],
+            data_type=cudnn.data_type.BFLOAT16,
+        )
         C = g.matmul(A=A, B=B, name="mm")
         Cb = g.bias(input=C, bias=bias, name="bs")
         Y = g.relu(input=Cb, name="r")

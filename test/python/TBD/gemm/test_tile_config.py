@@ -1,9 +1,6 @@
-"""Unit tests for TileConfig (pure geometry) + guard rails.
-
-cta_group / static_sched / ab_stages are NOT on the config anymore (they're the
-template's strategy — see test_kernel_registry); the cta_group-dependent views
-take cta_group as an argument.
-"""
+"""Unit tests for TileConfig (pure geometry) + guard rails. cta_group /
+static_sched / ab_stages are template strategy, not config; cta_group-dependent
+views take cta_group as an argument."""
 
 from __future__ import annotations
 
@@ -15,7 +12,7 @@ from cudnn.TBD.gemm.tile_config import CATALOG, DEFAULT_CONFIG, TileConfig, by_n
 
 
 def _mk(N: int) -> TileConfig:
-    """A pure-geometry TileConfig with the requested tile N (other dims fixed)."""
+    """A pure-geometry TileConfig with the requested tile N."""
     return TileConfig(
         cta_tile_m=128,
         cta_tile_n=N,
@@ -44,7 +41,7 @@ def test_unknown_name_raises() -> None:
         by_name("does-not-exist")
 
 
-# -- tile N guard ----------------------------------------------------------
+# --- tile N guard ---
 
 
 @pytest.mark.parametrize("bad_n", [1, 8, 16, 24, 48, 80])
@@ -64,7 +61,7 @@ def test_all_catalog_configs_pass_guard() -> None:
         assert n >= 32 and n % 32 == 0, (cfg.name, n)
 
 
-# -- K-in-bytes ⇒ K-in-elements, with the template's cta_group -------------
+# --- K-in-bytes ⇒ K-in-elements, with the template's cta_group ---
 
 
 def test_k_elements_for_bf16() -> None:
@@ -72,7 +69,7 @@ def test_k_elements_for_bf16() -> None:
     assert cfg.cta_tile_k_bytes == 128
     assert cfg.cta_tile_k(elem_bytes=2) == 64
     assert cfg.cta_tile_mnk(elem_bytes=2) == (128, 128, 64)
-    # cta_group=1: hardware MMA M == cta_tile_m; SMEM N == cta_tile_n.
+    # cta_group=1: hardware MMA M == cta_tile_m; SMEM N == cta_tile_n
     assert cfg.mma_inst_mnk(elem_bytes=2, cta_group=1) == (128, 128, 16)
     assert cfg.cta_smem_tile_mnk(elem_bytes=2, cta_group=1) == (128, 128, 64)
 
@@ -85,7 +82,7 @@ def test_k_elements_for_fp8() -> None:
 
 def test_cta_group2_doubles_mma_m_and_halves_smem_n() -> None:
     cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1")
-    # cta_group=2: hardware MMA spans the pair (M ×2), each CTA holds ½ B's N.
+    # cta_group=2: hardware MMA spans the pair (M ×2), each CTA holds ½ B's N
     assert cfg.mma_inst_mnk(elem_bytes=2, cta_group=2) == (256, 256, 16)
     assert cfg.cta_smem_tile_mnk(elem_bytes=2, cta_group=2) == (128, 128, 64)
     assert cfg.cta_smem_tile_mnk(elem_bytes=2, cta_group=1) == (128, 256, 64)
@@ -97,12 +94,11 @@ def test_max_ab_stages_more_under_cta_group2() -> None:
     assert cfg.max_ab_stages(2) >= cfg.max_ab_stages(1)
 
 
-# -- name pattern ----------------------------------------------------------
+# --- name pattern ---
 
 
 def test_name_matches_canonical_pattern() -> None:
-    """Pure-geometry name: CONFIG_<arch>_<CTA>_<MMA>_cluster<cm>x<cn>.
-    No _Nctamma / _static tokens (those are the template's)."""
+    """Pure-geometry name pattern; no _Nctamma / _static tokens (those are the template's)."""
     pat = re.compile(r"^CONFIG_sm100_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+$")
     for cfg in CATALOG:
         assert pat.match(cfg.name), cfg.name
@@ -111,7 +107,7 @@ def test_name_matches_canonical_pattern() -> None:
         assert cfg.mma_inst_k_bytes == 32  # sm100 s128b MMA K-inst
 
 
-# -- derived geometry ------------------------------------------------------
+# --- derived geometry ---
 
 
 def test_cgrp_tile_mn() -> None:
@@ -123,7 +119,7 @@ def test_multicast_model() -> None:
     cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster4x2")
     assert cfg.multicast_a_factor == 2  # cgrp_size_n
     assert cfg.multicast_a is True
-    # B-multicast depends on cta_group: cgrp_size_m // cta_group.
+    # B-multicast depends on cta_group: cgrp_size_m // cta_group
     assert cfg.multicast_b_factor(cta_group=1) == 4
     assert cfg.multicast_b_factor(cta_group=2) == 2
     assert cfg.multicast_b(cta_group=2) is True

@@ -1,8 +1,5 @@
-"""Snapshot-style tests for epilogue_codegen output strings.
-
-The exact rendered text is the contract between codegen and the kernel
-template; pinning it here makes drift visible.
-"""
+"""Snapshot-style tests for epilogue_codegen output strings — the rendered text
+is the codegen↔template contract, so pinning it makes drift visible."""
 
 from __future__ import annotations
 
@@ -27,8 +24,7 @@ def _mm() -> MatmulSpec:
 def test_identity_chain() -> None:
     out = generate(FusionChain(matmul=_mm(), output_dtype="bf16"))
     assert out.aux_views == "pass"
-    # matmul out_dtype defaults to bf16, so the accumulator is rounded to bf16
-    # (_r_mm) before the terminal cast.
+    # matmul out_dtype defaults to bf16 → accumulator rounded to bf16 (_r_mm) before terminal cast.
     assert out.epilogue == ("_r_mm = (vec_f32).to(cutlass.BFloat16)\n" "vec_out = (_r_mm).to(cutlass.BFloat16)")
     assert out.kernel_params == []
     assert out.host_args == []
@@ -234,13 +230,11 @@ def test_bias_per_row_then_gelu_tanh() -> None:
     assert "row = tidx + coord_m" not in out.aux_views
     assert "_aux_bias_ptr = bias.iterator.raw_ptr()" in out.aux_views
     assert "_aux_bias_pre = (_aux_bias_ptr + row).load()" in out.aux_views
-    # Op chain (matmul accumulator rounded to bf16 first → _r_mm)
     assert "_r_mm = (vec_f32).to(cutlass.BFloat16)" in out.epilogue
     assert "_c_0_a = (_r_mm).to(cutlass.Float32)" in out.epilogue
     assert "_op_0 = _c_0_a + (cutlass.full_like(_c_0_a, _aux_bias_pre.to(cutlass.Float32)))" in out.epilogue
     assert "_c_1_a = (_op_0).to(cutlass.Float32)" in out.epilogue
-    # gelu_tanh is whole-vector now (tanh via vector exp2/rcp with fastmath),
-    # no per-lane scalar repack.
+    # gelu_tanh is whole-vector (tanh via vector exp2/rcp fastmath), no scalar repack.
     assert "cute.math.exp2(" in out.epilogue and "cute.math.rcp(" in out.epilogue
     assert "fastmath=True" in out.epilogue
     assert "vector_from_scalars(" not in out.epilogue
@@ -258,9 +252,8 @@ def test_bias_per_col_uses_per_vector_load() -> None:
         output_dtype="bf16",
     )
     out = generate(chain)
-    # Per-col bias is NOT prefetched — loaded inside the loop.
+    # Per-col bias is NOT prefetched — loaded inside the loop (references col_j).
     assert "_aux_bias_pre" not in out.aux_views
-    # Inner-loop load expression references col_j.
     assert "(_aux_bias_ptr + col_j).load(count=vsize" in out.epilogue
 
 
@@ -290,8 +283,7 @@ def test_rank1_scalar_uses_zero_offset() -> None:
 
 
 def test_swish_chain() -> None:
-    # swish/SiLU = x * sigmoid(x) = x / (1 + exp(-x)) — emitted as WHOLE-VECTOR
-    # ops (vector exp2/rcp with fastmath), no per-lane scalar repack.
+    # swish = x * sigmoid(x), emitted as whole-vector exp2/rcp fastmath, no scalar repack.
     out = generate(FusionChain(matmul=_mm(), ops=[FusionOp("swish")], output_dtype="bf16"))
     assert "cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True)" in out.epilogue
     assert "cute.math.rcp(" in out.epilogue
@@ -318,9 +310,18 @@ def test_additional_unary_codegen(op: str, needle: str) -> None:
 @pytest.mark.parametrize(
     "op,needle",
     (
-        ("max", "_op_0 = cute.math.max(_c_0_a, (cutlass.full_like(_c_0_a, _aux_aux_pre.to(cutlass.Float32))))"),
-        ("min", "_op_0 = cute.math.min(_c_0_a, (cutlass.full_like(_c_0_a, _aux_aux_pre.to(cutlass.Float32))))"),
-        ("pow", "_op_0 = cute.math.pow(_c_0_a, (cutlass.full_like(_c_0_a, _aux_aux_pre.to(cutlass.Float32))))"),
+        (
+            "max",
+            "_op_0 = cute.math.max(_c_0_a, (cutlass.full_like(_c_0_a, _aux_aux_pre.to(cutlass.Float32))))",
+        ),
+        (
+            "min",
+            "_op_0 = cute.math.min(_c_0_a, (cutlass.full_like(_c_0_a, _aux_aux_pre.to(cutlass.Float32))))",
+        ),
+        (
+            "pow",
+            "_op_0 = cute.math.pow(_c_0_a, (cutlass.full_like(_c_0_a, _aux_aux_pre.to(cutlass.Float32))))",
+        ),
         ("add_square", "_op_0 = _c_0_a + _sq_aux_0 * _sq_aux_0"),
     ),
 )
@@ -352,7 +353,7 @@ def test_add_square_aux_on_lhs_codegen() -> None:
 
 
 def test_sub_with_aux_on_lhs() -> None:
-    """Verify aux_on_rhs=False puts the aux on the left of the binary op."""
+    """aux_on_rhs=False puts the aux on the left of the binary op."""
     aux = TensorRef(name="c", dim=(1,), stride=(1,), dtype="bf16", bcast_mode="scalar")
     chain = FusionChain(
         matmul=_mm(),
@@ -361,7 +362,6 @@ def test_sub_with_aux_on_lhs() -> None:
         output_dtype="bf16",
     )
     out = generate(chain)
-    # aux_on_rhs=False => "aux - acc"
     assert "_op_0 = (cutlass.full_like(_c_0_a, _aux_c_pre.to(cutlass.Float32))) - _c_0_a" in out.epilogue
 
 
@@ -380,8 +380,7 @@ def test_extra_kernel_params_for_multiple_aux() -> None:
 
 
 def test_epilogue_dtype_casts_for_integer_and_e8m0_outputs() -> None:
-    # matmul out_dtype defaults to bf16 → accumulator rounded to bf16 (_r_mm)
-    # before the terminal cast to each output dtype.
+    # matmul out_dtype defaults to bf16 → accumulator rounded to bf16 (_r_mm) before terminal cast.
     for dtype, cast_expr in (
         ("fp8_e8m0", "(_r_mm).to(cutlass.Float8E8M0FNU)"),
         ("int8", "(_r_mm).to(cutlass.Int8)"),
@@ -424,13 +423,48 @@ def test_int32_compute_casts_parent_and_aux() -> None:
     "dim,stride,bcast,needle",
     (
         ((1, 1, 1), (1, 1, 1), "scalar", "_aux_aux_pre = (_aux_aux_ptr + 0).load()"),
-        ((2, 1, 1), (1, 1, 1), "scalar", "_aux_aux_pre = (_aux_aux_ptr + tile_l).load()"),
-        ((1, 128, 1), (128, 1, 1), "per_row", "_aux_aux_pre = (_aux_aux_ptr + row).load()"),
-        ((2, 128, 1), (128, 1, 1), "per_row", "_aux_aux_pre = (_aux_aux_ptr + tile_l * 128 + row).load()"),
-        ((1, 1, 128), (128, 128, 1), "per_col", "(_aux_aux_ptr + col_j).load(count=vsize"),
-        ((2, 1, 128), (128, 128, 1), "per_col", "(_aux_aux_ptr + tile_l * 128 + col_j).load(count=vsize"),
-        ((1, 128, 128), (16384, 128, 1), "per_elem", "(_aux_aux_ptr + row * 128 + col_j).load(count=vsize"),
-        ((2, 128, 128), (16384, 128, 1), "per_elem", "(_aux_aux_ptr + tile_l * 16384 + row * 128 + col_j).load(count=vsize"),
+        (
+            (2, 1, 1),
+            (1, 1, 1),
+            "scalar",
+            "_aux_aux_pre = (_aux_aux_ptr + tile_l).load()",
+        ),
+        (
+            (1, 128, 1),
+            (128, 1, 1),
+            "per_row",
+            "_aux_aux_pre = (_aux_aux_ptr + row).load()",
+        ),
+        (
+            (2, 128, 1),
+            (128, 1, 1),
+            "per_row",
+            "_aux_aux_pre = (_aux_aux_ptr + tile_l * 128 + row).load()",
+        ),
+        (
+            (1, 1, 128),
+            (128, 128, 1),
+            "per_col",
+            "(_aux_aux_ptr + col_j).load(count=vsize",
+        ),
+        (
+            (2, 1, 128),
+            (128, 128, 1),
+            "per_col",
+            "(_aux_aux_ptr + tile_l * 128 + col_j).load(count=vsize",
+        ),
+        (
+            (1, 128, 128),
+            (16384, 128, 1),
+            "per_elem",
+            "(_aux_aux_ptr + row * 128 + col_j).load(count=vsize",
+        ),
+        (
+            (2, 128, 128),
+            (16384, 128, 1),
+            "per_elem",
+            "(_aux_aux_ptr + tile_l * 16384 + row * 128 + col_j).load(count=vsize",
+        ),
     ),
 )
 def test_rank3_broadcast_indexing_uses_only_non_broadcast_axes(

@@ -1,10 +1,6 @@
-"""Tests for the MoE grouped **block-scale** matmul forward (NVFP4, mode=NONE).
-
-Covers the analyzer (combined dequant + moe_grouped_matmul detection → both
-`moe` and `block_scale` set) and end-to-end correctness vs a torch
-dequant + group-loop reference. Group boundaries are multiples of 128 (SF block
-alignment) and include the BxE > E case (num_groups > num_experts).
-"""
+"""MoE grouped block-scale matmul forward (NVFP4, mode=NONE): analyzer detection
+(dequant + moe folded → both `moe` and `block_scale` set) + end-to-end vs a torch
+dequant + group-loop reference. Covers the BxE > E case."""
 
 from __future__ import annotations
 
@@ -19,10 +15,9 @@ from cudnn.TBD.gemm.tile_config import CATALOG
 
 
 class _Plan:
-    """Test handle that JIT-compiles a recorded graph with a forced tile config
-    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
-    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
-    aux_names and is callable with a variant pack."""
+    """JIT-compiles a recorded graph with a forced tile config (bypassing the
+    TBD engine's auto-select). Exposes chain / binding / block_scale / aux_names;
+    callable with a variant pack."""
 
     def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
         self.g = graph
@@ -61,7 +56,24 @@ def _vp_moe_bs(compiled, token, weight, sfa, sfb, fto, output):
 _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
 _CFG_1CTA = "CONFIG_sm100_128x256x128_128x256x32_cluster1x1"
 
-_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+_E2M1 = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -102,13 +114,12 @@ def _block_quant_ref(x, block_size, out_dtype, scale_dtype):
 
 
 def _block_quant_q_atol(scale_dtype) -> float:
-    # Non-power-of-two E4M3 scales use the kernel's approximate reciprocal and
-    # can differ from the torch reference by one smallest E4M3 output step.
+    # Non-pow2 E4M3 scales use the kernel's approximate reciprocal → up to one
+    # smallest E4M3 output step off the torch reference.
     return 1.0 / 512.0 if scale_dtype is torch.float8_e4m3fn else 0.0
 
 
-# combo -> (block_size, data dtype, SF dtype). nvfp4 = FP4+E4M3 block16;
-# mxfp4 = FP4+E8M0 block32; mxfp8 = FP8E4M3+E8M0 block32.
+# combo -> (block_size, data dtype, SF dtype).
 _COMBOS = {
     "nvfp4": (16, cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3),
     "mxfp4": (32, cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E8M0),
@@ -238,12 +249,36 @@ def _build_graph(
     )
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
     w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=a_dt)
-    SFA = g.tensor(name="SFA", dim=[1, S, sf_k], stride=[S * sf_k, sf_k, 1], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
-    SFB = g.tensor(name="SFB", dim=[E, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
-    fto = g.tensor(name="first_token_offset", dim=[num_groups, 1, 1], stride=[1, 1, 1], data_type=offset_dt)
+    SFA = g.tensor(
+        name="SFA",
+        dim=[1, S, sf_k],
+        stride=[S * sf_k, sf_k, 1],
+        data_type=sf_dt,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    SFB = g.tensor(
+        name="SFB",
+        dim=[E, sf_k, N],
+        stride=[sf_k * N, 1, sf_k],
+        data_type=sf_dt,
+        reordering_type=cudnn.tensor_reordering.F8_128x4,
+    )
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[num_groups, 1, 1],
+        stride=[1, 1, 1],
+        data_type=offset_dt,
+    )
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size])
     w_d = g.block_scale_dequantize(input=w, descale=SFB, block_size=[block_size, 1])
-    out = g.moe_grouped_matmul(tok_d, w_d, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
+    out = g.moe_grouped_matmul(
+        tok_d,
+        w_d,
+        fto,
+        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        compute_data_type=cudnn.data_type.FLOAT,
+        name="moe",
+    )
     if reduction_mode is not None:
         red_kwargs = {}
         if reduction_compute_dt is not None:
@@ -419,9 +454,8 @@ def _run_e2e(
     )
     assert compiled.chain.block_scale.combo == combo
 
-    # SFA is reordered + padded to 128 rows PER GROUP, then concatenated (this is
-    # the general layout; for 128-aligned groups it equals a single global
-    # _to_blocked(sfa_log)). SFB is per-expert (N fixed, no token padding).
+    # SFA reordered + padded to 128 rows PER GROUP, then concatenated (for
+    # 128-aligned groups this equals a single global _to_blocked). SFB per-expert.
     sfa_parts = []
     for gi in range(num_groups):
         b = offsets_list[gi]
@@ -547,7 +581,7 @@ def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
     )
 
     sfa_blk = torch.cat(
-        [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1] if gi + 1 < len(offsets_list) else S]) for gi in range(len(offsets_list))]
+        [_to_blocked(sfa_log[offsets_list[gi] : (offsets_list[gi + 1] if gi + 1 < len(offsets_list) else S)]) for gi in range(len(offsets_list))]
     ).view(1, -1, 1)
     sfb_blk = torch.cat([_to_blocked(sfb_log[e]) for e in range(E)]).view(E, sf_k, N)
     offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
@@ -592,7 +626,16 @@ def test_e2e_mx_combos(combo) -> None:
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
 def test_e2e_1ctamma(combo) -> None:
     # 1-CTA MMA path (cluster1x1), all three block-scale combos. BxE>E groups.
-    _run_e2e(E=2, S=512, N=256, K=512, offsets_list=[0, 256, 384], combo=combo, config_name=_CFG_1CTA, cta_group=1)
+    _run_e2e(
+        E=2,
+        S=512,
+        N=256,
+        K=512,
+        offsets_list=[0, 256, 384],
+        combo=combo,
+        config_name=_CFG_1CTA,
+        cta_group=1,
+    )
 
 
 @pytest.mark.parametrize(
@@ -700,9 +743,9 @@ def test_moe_block_scale_reduction_rejects_int32() -> None:
         jit_from_cudnn_graph(g, config=cfg, cta_group=1)
 
 
-# Group boundaries that are NOT multiples of 128: SFA is padded to 128 rows PER
-# GROUP, so the kernel must track each group's start SF-block (scheduler cumsum)
-# rather than group_begin//128. These would silently miscompute before the fix.
+# Group boundaries NOT multiples of 128: SFA is padded to 128 rows PER GROUP, so
+# the kernel must track each group's start SF-block (scheduler cumsum), not
+# group_begin//128 — else silent miscompute.
 @pytest.mark.parametrize(
     "cta_group,config_name",
     [
@@ -711,11 +754,28 @@ def test_moe_block_scale_reduction_rejects_int32() -> None:
     ],
 )
 def test_e2e_unaligned_groups(cta_group, config_name) -> None:
-    _run_e2e(E=2, S=512, N=256, K=512, offsets_list=[0, 100, 300], combo="nvfp4", config_name=config_name, cta_group=cta_group)
+    _run_e2e(
+        E=2,
+        S=512,
+        N=256,
+        K=512,
+        offsets_list=[0, 100, 300],
+        combo="nvfp4",
+        config_name=config_name,
+        cta_group=cta_group,
+    )
 
 
 def test_e2e_nvfp4_offset_int64() -> None:
-    _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=[0, 256, 384, 512], offset_dt=cudnn.data_type.INT64, offset_torch_dt=torch.int64)
+    _run_e2e(
+        E=2,
+        S=1024,
+        N=256,
+        K=512,
+        offsets_list=[0, 256, 384, 512],
+        offset_dt=cudnn.data_type.INT64,
+        offset_torch_dt=torch.int64,
+    )
 
 
 def test_e2e_nvfp4_empty_group() -> None:

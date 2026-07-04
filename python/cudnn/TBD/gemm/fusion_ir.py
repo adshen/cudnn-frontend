@@ -1,40 +1,21 @@
-"""Tiny IR describing a matmul + linear pointwise-epilogue fusion.
+"""Tiny IR describing a matmul + pointwise-epilogue fusion — the contract
+between `graph_analyzer.py` (builds it from a cuDNN graph) and
+`epilogue_codegen.py` (lowers it to a cute DSL epilogue snippet).
 
-This is the only contract between `graph_analyzer.py` (which builds it from a
-cuDNN frontend graph) and `epilogue_codegen.py` (which lowers it into a cute DSL
-snippet that lives inside the generated kernel's epilogue warps).
-
-POC scope: one matmul + a DAG of pointwise ops with both fan-out and fan-in.
-Each binary op has one of two shapes:
-  - ``aux=<name>`` + ``parent_idx`` set → one in-chain operand + one
-    graph-input aux tensor (the original form).
-  - ``parent_idx_b=<i>`` + ``parent_idx`` set, ``aux=None`` → two in-chain
-    operands (fan-in: both inputs are prior op results / matmul output).
-``aux`` and ``parent_idx_b`` are mutually exclusive.
-
-Multi-output: the **terminal** of the chain is always materialized; any
-intermediate point (the raw matmul output and / or any fusion-op output) can
-be tapped as an extra GMEM output by calling
-``.set_output(True).set_data_type(<tap_dtype>)`` on the cuDNN graph side.
-Pointwise taps are full `(batch, M, N)` rank-3 tensors; reduction taps keep
-rank 3 with the reduced dimensions set to 1; block-quant scale taps use
-`(batch, M, ceil_div(N, block_size))`. ``FusionChain.outputs`` lists
-every materialized slot in canonical order (terminal first, then taps in chain
-order); callers of ``CompiledFusedGemm`` pass runtime output tensors in this
-same order.
-"""
+A binary op is either ``aux`` + ``parent_idx`` (one in-chain operand + a
+graph-input aux) or ``parent_idx_b`` + ``parent_idx`` (two in-chain operands,
+fan-in); ``aux`` and ``parent_idx_b`` are mutually exclusive. The terminal is
+always materialized; any intermediate can be tapped as an extra GMEM output via
+``.set_output(True).set_data_type(...)``. ``FusionChain.outputs`` lists slots in
+canonical order (terminal first, then taps) — the same order callers pass."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Literal
 
-# ---------------------------------------------------------------------------
-# Dtype sets are split by role:
-#   * SUPPORTED_DTYPES: epilogue aux/output storage dtypes.
-#   * COMPUTE_DTYPES: pointwise compute dtypes accepted from cuDNN graph attrs.
-# ---------------------------------------------------------------------------
-
+# SUPPORTED_DTYPES = aux/output storage dtypes; COMPUTE_DTYPES = pointwise
+# compute dtypes accepted from cuDNN graph attrs.
 Dtype = Literal[
     "bf16",
     "fp16",
@@ -65,22 +46,17 @@ AMajor = Literal["k", "m"]
 BMajor = Literal["k", "n"]
 OutMajor = Literal["n", "m"]
 
-# Block-scaled-matmul scale-factor dtypes (the descale tensors SFA/SFB):
-#   * nvfp4  : FP4 (e2m1) data, FP8 E4M3 scale, block_size 16
-#   * mxfp4  : FP4 (e2m1) data, FP8 E8M0 scale, block_size 32
-#   * mxfp8  : FP8 (e4m3/e5m2) data, FP8 E8M0 scale, block_size 32
+# Block-scaled-matmul scale-factor dtypes (SFA/SFB): nvfp4 = FP4 data + E4M3
+# scale block16; mxfp4 = FP4 + E8M0 block32; mxfp8 = FP8 + E8M0 block32.
 BLOCK_SCALE_SF_DTYPES: tuple[Dtype, ...] = ("fp8_e4m3", "fp8_e8m0")
 
-# How an aux tensor broadcasts onto the (M, N) output tile.
-#   scalar    — single value
-#   per_row   — vector of length M (broadcast across N)
-#   per_col   — vector of length N (broadcast across M)
-#   per_elem  — full (M, N) matrix
+# Aux broadcast onto the (M, N) tile: scalar / per_row (len M) / per_col
+# (len N) / per_elem (full M×N).
 BroadcastMode = Literal["scalar", "per_row", "per_col", "per_elem"]
 ReductionMode = Literal["add", "amax", "max", "min"]
 REDUCTION_DTYPES: tuple[Dtype, ...] = ("fp32", "int32")
 
-# Unary pointwise ops: take only the running accumulator.
+# Unary pointwise ops (take only the running accumulator).
 UNARY_OPS: tuple[str, ...] = (
     "identity",
     "relu",
@@ -103,9 +79,8 @@ UNARY_OPS: tuple[str, ...] = (
     "sqrt",
 )
 
-# Binary pointwise ops: take running accumulator + one aux tensor.
-# `aux_on_rhs=True` means op(acc, aux); False means op(aux, acc) — matters for
-# non-commutative ops (sub, div).
+# Binary pointwise ops (running accumulator + one aux). `aux_on_rhs=True` means
+# op(acc, aux); False means op(aux, acc) — matters for sub/div.
 BINARY_OPS: tuple[str, ...] = (
     "add",
     "mul",
@@ -119,23 +94,13 @@ BINARY_OPS: tuple[str, ...] = (
 
 ALL_OPS: tuple[str, ...] = UNARY_OPS + BINARY_OPS
 
-# Ops that map 0 -> 0 regardless of any other operand, i.e. the output is 0
-# whenever the *in-chain* input is 0, for ALL possible aux values. This is the
-# single source of truth for the mainloop K-OOB fix: when a fused operand's
-# whole op chain is zero-preserving, the TMA K-tail zero-fill stays 0 through
-# the transform, so it contributes 0 to the MMA and no OOB masking is needed.
-#
-# An op qualifies ONLY if `f(0, *) == 0` unconditionally:
-#   unary : identity/relu/abs/neg/tanh/sin/gelu/gelu_tanh/swish plus
-#           ceil/floor/erf/sqrt  (f(0)=0)
-#   binary: mul only  (0*aux == aux*0 == 0)
-# Everything else is NON-zero-preserving (sigmoid/exp/cos: f(0)!=0; add/sub:
-# 0+aux=aux; div: aux/0=inf so it's not unconditionally safe).
-#
-# IMPORTANT: a newly-added pointwise op defaults to NON-zero-preserving unless
-# it is added here. That default is the safe one — forgetting to register a
-# genuinely zero-preserving op only costs an unnecessary (still correct) OOB
-# mask; the reverse (wrongly assuming zero-preserving) would silently miscompute.
+# Ops with `f(0, *) == 0` unconditionally. Single source of truth for the
+# mainloop K-OOB fix: a fully zero-preserving fused chain keeps the TMA K-tail
+# zero-fill at 0, so no OOB masking is needed. Qualifies only if unconditional:
+# unary f(0)=0 ops + binary `mul`. sigmoid/exp/cos (f(0)!=0), add/sub, div
+# (aux/0=inf) do NOT. A new op defaults to NON-zero-preserving unless listed
+# here — the safe default (forgetting only costs an unneeded mask; wrongly
+# assuming it would silently miscompute).
 ZERO_PRESERVING_OPS: frozenset[str] = frozenset(
     {
         "identity",
@@ -156,27 +121,14 @@ ZERO_PRESERVING_OPS: frozenset[str] = frozenset(
 )
 
 
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class ChainOutput:
-    """One materialized GMEM output produced by the kernel.
+    """One materialized GMEM output. ``source`` = where the value is taken from:
+    "matmul" (fp32 accumulator) / "op_<i>" / "terminal" / "reduction_<i>" /
+    "block_quant_scale". ``dtype`` is the on-disk dtype (each output casts from
+    the running fp32 value)."""
 
-    ``source`` describes which point in the chain the value is taken from:
-      - ``"matmul"``    — fp32 accumulator before any fusion op
-      - ``"op_<i>"``    — the i'th fusion op's result (0-indexed)
-      - ``"terminal"``  — final value after the full epilogue chain (always present)
-      - ``"reduction_<i>"`` — the i'th epilogue reduction output
-      - ``"block_quant_scale"`` — scale side-output from block-scale quantize
-
-    ``dtype`` is the on-disk dtype: each output gets its own cast from the
-    running fp32 value to its declared dtype.
-    """
-
-    source: str  # "matmul" | "terminal" | "op_<i>" | "reduction_<i>"
+    source: str  # "matmul" | "terminal" | "op_<i>" | "reduction_<i>" | "block_quant_scale"
     dtype: Dtype
     dim: "tuple[int, int, int] | None" = None
     is_reduction: bool = False
@@ -186,14 +138,9 @@ class ChainOutput:
 
 @dataclass(frozen=True)
 class ReductionSpec:
-    """A materialized reduction side-output from the epilogue.
-
-    ``source_ref`` names the producer being reduced using the same reference
-    scheme as :class:`FusionOp` parents: a GEMM output is negative, a pointwise
-    op output is non-negative. ``dim`` is the public `(B, M, N)` output shape;
-    each dimension is either the full matmul extent or 1, and dimensions with
-    1 are reduced.
-    """
+    """A materialized reduction side-output. ``source_ref`` names the reduced
+    producer (FusionOp parent scheme: GEMM output negative, op output >=0).
+    ``dim`` is public `(B, M, N)`; extent-1 dims are the reduced ones."""
 
     mode: ReductionMode
     source_ref: int
@@ -217,16 +164,11 @@ class ReductionSpec:
 
 @dataclass(frozen=True)
 class BlockQuantizeSpec:
-    """Terminal block-scale quantize in the epilogue.
-
-    This models cuDNN ``block_scale_quantize(input, block_size, axis)`` for the
-    row/N-axis case used by GEMM epilogues: every contiguous N-block produces
-    one scale value and one block of quantized output elements. The quantized
-    output is the terminal chain output; ``scale_dim`` describes the scale
-    side-output in public `(B, scale_M, scale_N)` order. For compact scale
-    output this is `(B, M, N / block_size)`. F8_128x4 scale output may be
-    padded to the layout's 128-row x 4-column block.
-    """
+    """Terminal block-scale quantize (cuDNN ``block_scale_quantize`` for the
+    row/N-axis case): each contiguous N-block yields one scale + one block of
+    quantized output. Quantized output is the terminal; ``scale_dim`` is the
+    scale side-output in `(B, scale_M, scale_N)` order (compact =
+    `(B, M, N/block_size)`; F8_128x4 may pad to 128-row × 4-col blocks)."""
 
     source_ref: int
     block_size: int
@@ -269,26 +211,17 @@ class TensorRef:
             raise ValueError(f"dim {self.dim} and stride {self.stride} length mismatch")
 
 
-# ---------------------------------------------------------------------------
-# Producing-operation references (the "where does this op's input come from?"
-# encoding). A pointwise op's input is a reference to the operation that
-# produced it — uniformly, whether that operation is a GEMM (an MMA) or a prior
-# pointwise op. The op reads that operation's output register. This mirrors
-# cuDNN, which tracks each pointwise input back to its producing op rather than
-# trying to attribute a (possibly already-mixed) value to one GEMM.
-#
-# A reference is a single int (``FusionOp.parent_idx`` / ``parent_idx_b``):
-#   * ``>= 0``  → a pointwise op result, ``ops[ref]``.
-#   * ``< 0``   → a GEMM output; the GEMM index is ``gemm_index(ref) = -1 - ref``
-#                 (so -1 = GEMM 0, -2 = GEMM 1, ...). For a single-GEMM chain
-#                 the only GEMM ref is -1, identical to the legacy "matmul
-#                 output" sentinel.
-#   * ``None``  → (parent_idx only) "auto": the previous op, or GEMM 0 for op 0.
-#                 (parent_idx_b only) → no second in-chain operand.
-# This is why there is no separate "which GEMM" field: a reference names exactly
-# one producing operation, GEMM or pointwise. Once two GEMMs are merged by an
-# op, downstream inputs reference that op (>=0) — they neither can nor need to
-# attribute the value back to an individual GEMM.
+# Producing-operation references — "where does this op's input come from?".
+# A reference (``FusionOp.parent_idx`` / ``parent_idx_b``) is one int:
+#   * ``>= 0`` → a pointwise op result, ``ops[ref]``.
+#   * ``< 0``  → a GEMM output; ``gemm_index(ref) = -1 - ref`` (-1 = GEMM 0,
+#                -2 = GEMM 1, ...). Single-GEMM's only ref is -1 (the legacy
+#                "matmul output" sentinel).
+#   * ``None`` → parent_idx: auto (prev op, or GEMM 0 for op 0); parent_idx_b:
+#                no second in-chain operand.
+# No separate "which GEMM" field: a ref names one producing op (GEMM or
+# pointwise), mirroring cuDNN. Once two GEMMs merge in an op, downstream refs
+# point at that op (>=0).
 
 
 def gemm_source(g: int) -> int:
@@ -308,23 +241,13 @@ def gemm_index(ref: int) -> int:
 
 @dataclass(frozen=True)
 class FusionOp:
-    """A single pointwise op in the epilogue chain.
-
-    For unary ops, `aux` is None. For binary ops, `aux` references one of the
-    `aux_tensors` in the enclosing FusionChain by name.
-
-    ``output_tap``, if True, materializes this op's result to a separate GMEM
-    buffer (at the op's ``out_dtype``) *before* the next op runs.
-
-    ``parent_idx`` / ``parent_idx_b`` are **producing-operation references** (see
-    the module-level note above): ``>= 0`` names a prior pointwise op
-    (``ops[ref]``); ``< 0`` names a GEMM output (``gemm_index(ref)``); ``None``
-    means "auto" for ``parent_idx`` (previous op, or GEMM 0 for op 0) and "no
-    second operand" for ``parent_idx_b``. Fan-out = several ops sharing one
-    parent ref; fan-in = a binary op whose ``parent_idx`` AND ``parent_idx_b``
-    are both in-chain (``aux`` must be None then — they are mutually exclusive).
-    ``aux_on_rhs`` controls which side the second operand sits on.
-    """
+    """A single pointwise op in the epilogue chain. Unary → ``aux`` None; binary
+    → ``aux`` names an enclosing-chain aux tensor. ``output_tap`` materializes
+    this op's result (at ``out_dtype``) before the next op runs.
+    ``parent_idx`` / ``parent_idx_b`` are producing-operation references (see the
+    module note). Fan-out = ops sharing one parent ref; fan-in = a binary op
+    with both parent refs in-chain (``aux`` must be None — mutually exclusive).
+    ``aux_on_rhs`` picks the second operand's side."""
 
     op: str
     aux: str | None = None  # TensorRef.name, or None for unary / fan-in
@@ -332,17 +255,13 @@ class FusionOp:
     output_tap: bool = False  # materialize this op's result (at out_dtype)
     parent_idx: int | None = None  # producing-op ref (None = auto)
     parent_idx_b: int | None = None  # fan-in: second producing-op ref (None = absent)
-    # ``compute_dtype`` is the precision the op's math runs in (cuDNN's per-op
-    # ``compute_data_type``). POC accepts fp32 and int32 as requested, but does
-    # not enforce a per-op semantic matrix: transcendental ops such as exp,
-    # log, sqrt, rsqrt, sigmoid, gelu, and swish should use fp32 unless the
-    # caller intentionally wants GEMM/codegen-defined integer behavior.
+    # Op math precision (cuDNN per-op ``compute_data_type``); fp32 or int32.
+    # Transcendentals (exp/log/sqrt/rsqrt/sigmoid/gelu/swish) should use fp32.
     compute_dtype: Dtype = "fp32"
-    # ``out_dtype`` is the declared data_type of this op's output (virtual or
-    # materialized) tensor. The running value is rounded to this dtype before
-    # the next op consumes it — so a narrow ``out_dtype`` loses precision on
-    # purpose, matching cuDNN's tensor-dtype semantics even for virtual
-    # tensors. ``fp32`` (default) means "no rounding" (the legacy behavior).
+    # Declared output dtype of this op's (virtual or materialized) tensor. The
+    # running value is rounded to it before the next op — a narrow dtype loses
+    # precision on purpose (matching cuDNN even for virtual tensors). fp32
+    # (default) = no rounding.
     out_dtype: Dtype = "fp32"
 
     def __post_init__(self) -> None:
@@ -362,10 +281,8 @@ class FusionOp:
             raise ValueError(f"binary op {self.op!r}: aux and parent_idx_b are mutually exclusive")
 
     def resolved_parent_idx(self, position: int) -> int:
-        """Resolve the ``None`` ("auto") ``parent_idx`` to a concrete producing-op
-        reference given this op's position in ``ops``: the previous op
-        (``position - 1``) for ``position > 0``, else GEMM 0 (``gemm_source(0)``,
-        i.e. -1). A non-None ``parent_idx`` is returned as-is."""
+        """Resolve an auto (``None``) ``parent_idx`` given the op's position:
+        previous op for position > 0, else GEMM 0 (-1). Non-None returned as-is."""
         if self.parent_idx is not None:
             return self.parent_idx
         return position - 1 if position > 0 else gemm_source(0)
@@ -373,14 +290,11 @@ class FusionOp:
 
 @dataclass(frozen=True)
 class MatmulSpec:
-    """Shape + dtype of the anchor matmul. All matmuls are rank-3:
-    A=(batch_A, M, K), B=(batch_B, K, N), out=(batch, M, N), where
-    batch=max(batch_A, batch_B) and each operand batch is either the
-    output batch or 1 (broadcast).
-
-    ``output_tap``, if True, requests an extra GMEM output that materializes the
-    matmul result (the accumulator rounded to ``out_dtype``) *before* any fusion
-    op runs. The compiler emits a parallel STG path in the epilogue."""
+    """Shape + dtype of the anchor matmul. Rank-3: A=(batch_A, M, K),
+    B=(batch_B, K, N), out=(batch, M, N), batch=max(batch_A, batch_B); each
+    operand batch is the output batch or 1 (broadcast). ``output_tap`` requests
+    an extra GMEM output of the matmul result (accumulator rounded to
+    ``out_dtype``) before any fusion op runs."""
 
     M: int
     N: int
@@ -414,95 +328,67 @@ class MatmulSpec:
             )
         if max(self.a_batch, self.b_batch) != self.batch:
             raise ValueError(f"output batch must be max(a_batch, b_batch); got " f"batch={self.batch}, a_batch={self.a_batch}, " f"b_batch={self.b_batch}")
-        # NOTE: which (a_dtype, b_dtype, accum_dtype) MMA combinations are
-        # actually runnable is NOT validated here — it depends on the target GPU
-        # architecture and the kernel pipeline, neither of which the IR knows.
-        # That check lives in the compiler (`_check_supported` against the
-        # arch-aware `_PIPELINE_DTYPE_ARCH` table), the single source of truth.
-        # The IR only validates structural invariants (above) and output-storage
-        # dtype well-formedness (below), which the combo table doesn't cover.
+        # MMA (a, b, accum) runnability is NOT validated here (depends on arch +
+        # pipeline, which the IR doesn't know) — the compiler checks it against
+        # the arch-aware table. IR only validates structural + output-storage dtype.
         if self.out_dtype not in SUPPORTED_DTYPES:
             raise ValueError(f"unsupported matmul out_dtype {self.out_dtype!r}; " f"expected one of {SUPPORTED_DTYPES}")
 
 
 @dataclass(frozen=True)
 class BlockScaleSpec:
-    """A block-scaled matmul: ``C = (descale_a ⊙ A) @ (descale_b ⊙ B)`` where A
-    and B are narrow (FP4 / FP8) and each is dequantized by a per-block scale
-    factor along K *inside* the MMA (``tcgen05.mma.kind::mx*.block_scale``).
+    """A block-scaled matmul: ``C = (descale_a ⊙ A) @ (descale_b ⊙ B)`` — narrow
+    (FP4/FP8) A/B each dequantized by a per-block K scale inside the MMA
+    (``tcgen05.mma.kind::mx*.block_scale``).
 
-    Detected by the analyzer (``graph_analyzer``) by a purely STRUCTURAL match:
-    if the matmul's A and/or B operand is the output of a
-    ``block_scale_dequantize`` node, the dequant(s) + matmul are folded into one
-    block-scale matmul. Three shapes are matched — ``dequant(A) @ B``,
-    ``A @ dequant(B)``, ``dequant(A) @ dequant(B)`` — so ``sfa`` / ``sfb`` are
-    each present only for the side(s) that were dequantized (``None`` otherwise).
-    The analyzer applies NO dtype/block-size/arch rules; which combinations are
-    actually runnable is decided at compile time.
+    Detected by a purely STRUCTURAL match in the analyzer: if A and/or B is the
+    output of a ``block_scale_dequantize`` node, dequant(s) + matmul fold into
+    one block-scale matmul (three shapes: dequant(A)@B, A@dequant(B),
+    dequant(A)@dequant(B); ``sfa``/``sfb`` present only for the scaled side(s)).
+    No dtype/block/arch rules here — runnability is decided at compile time.
+    Currently runs (both sides): nvfp4 (fp4+e4m3, block16), mxfp4 (fp4+e8m0,
+    block32), mxfp8 (fp8+e8m0, block32).
 
-    Combinations the compiler currently runs (both sides scaled):
-      * nvfp4 : data=fp4_e2m1, scale=fp8_e4m3, block_size=16
-      * mxfp4 : data=fp4_e2m1, scale=fp8_e8m0, block_size=32
-      * mxfp8 : data=fp8_e4m3/e5m2, scale=fp8_e8m0, block_size=32
-
-    Like the A/B data operands (described by :class:`MatmulSpec` + passed
-    positionally), the SF tensors are NOT stored as ``TensorRef``s — they're
-    runtime-positional (``compiled(a, b, c, (M,N,K), sfa, sfb)``) and fully
-    described here by per-side scalars: ``sf_dtype_*`` (dtype), ``block_size_*``
-    (block dims), ``sfa/sfb_reorder`` (layout). Their logical dims are derivable
-    from M/N/K/block_size, and the kernel's SF TMA descriptors encode the
-    blocked layout directly. SFA / SFB are passed at runtime in the
-    ``CUDNN_TENSOR_REORDERING_F8_128x4`` swizzled layout (128-row × 4-K blocked)
-    — see the example's ``to_blocked`` helper.
-    """
+    SF tensors are runtime-positional (not ``TensorRef``s), fully described here
+    by per-side scalars; their logical dims derive from M/N/K/block_size. Passed
+    at runtime in the ``F8_128x4`` swizzled layout (128-row × 4-K blocked)."""
 
     a_dtype: Dtype  # packed data dtype of A (mirror of matmul.a_dtype)
     b_dtype: Dtype  # packed data dtype of B
-    # ---- Per-side scale info (A and B kept SEPARATE so an asymmetric block-
-    # scale matmul — different block size / SF dtype / layout per operand —
-    # can be represented in future). A side that was NOT block-scale-dequantized
-    # has all of its fields None.
-    # `block_size_*` is stored 2D (A=[non_K, K], B=[K, non_K]). Only 1D scaling
-    # along K is supported today; the 2D form leaves room for 2D block scaling.
+    # Per-side scale info, kept SEPARATE for future asymmetric block-scale. A
+    # non-dequantized side has all None fields. `block_size_*` is 2D (A=[non_K,
+    # K], B=[K, non_K]); only 1D K-scaling used today (2D form is headroom).
     block_size_a: "tuple[int, ...] | None" = None
     block_size_b: "tuple[int, ...] | None" = None
     sf_dtype_a: "Dtype | None" = None  # A's scale-factor dtype (None if A not scaled)
     sf_dtype_b: "Dtype | None" = None
-    # SF reorder layout per side (cuDNN reordering name, e.g. "F8_128x4"); None
-    # = default/NONE. Recorded for the compile-stage support check.
+    # SF reorder layout per side (cuDNN name, e.g. "F8_128x4"; None = NONE).
     sfa_reorder: "str | None" = None
     sfb_reorder: "str | None" = None
-    # Each block_scale_dequantize op's compute (math) dtype and output dtype.
-    # The dequant OUTPUT dtype is the MMA's logical input type for that operand.
-    # None for a side that wasn't dequantized. Recorded for the compile-stage
-    # support check (cuDNN requires the dequant math precision to be FLOAT).
+    # Each dequant op's compute + output dtype (dequant OUTPUT = the MMA's input
+    # type for that operand). None for a non-dequantized side. Recorded for the
+    # compile-stage check (cuDNN requires dequant math precision = FLOAT).
     dequant_compute_a: "Dtype | None" = None
     dequant_compute_b: "Dtype | None" = None
     dequant_out_a: "Dtype | None" = None  # = MMA input type for A
     dequant_out_b: "Dtype | None" = None  # = MMA input type for B
-    # NOTE: matmul-level dtypes (accumulate, output, output-tap) are NOT
-    # duplicated here — read them from chain.matmul / chain.output_dtype. Only
-    # input-side info (packed a/b dtype, SF, block, reorder, dequant) lives here,
-    # since block-scale has both a real packed dtype and a virtual dequant-output
-    # dtype that a single shared field couldn't disambiguate.
+    # matmul-level dtypes (accum/output/tap) are NOT duplicated here — read
+    # chain.matmul / chain.output_dtype. Only input-side info lives here.
 
     def __post_init__(self) -> None:
-        # Structural sanity ONLY. No dtype / block-size / family / arch
-        # runnability rules here — the analyzer pattern-matches structurally and
-        # the compile stage decides which combos actually run.
+        # Structural sanity ONLY — no dtype/block/family/arch rules (analyzer is
+        # structural; the compile stage decides which combos run).
         if self.sf_dtype_a is None and self.sf_dtype_b is None:
             raise ValueError("block_scale spec has neither operand dequantized " "(at least one of A / B must be block-scaled)")
 
     @property
     def both_sided(self) -> bool:
-        """True iff BOTH operands were dequantized (the runnable case today).
-        A side is dequantized iff its scale-factor dtype is set."""
+        """True iff BOTH operands were dequantized (a side is dequantized iff
+        its scale-factor dtype is set) — the runnable case today."""
         return self.sf_dtype_a is not None and self.sf_dtype_b is not None
 
-    # --- Convenience scalars for the symmetric both-sided path the compiler
-    # currently runs. (For a future asymmetric matmul these collapse the per-
-    # side info to a single value — only valid when the two sides agree, which
-    # the compile-stage support check enforces.)
+    # Convenience scalars for the symmetric both-sided path (only valid when the
+    # two sides agree, which the compile-stage check enforces).
     @property
     def block_size(self) -> int:
         """K-block size as a single int. A is [non_K, K] (K = last dim); B is
@@ -548,29 +434,19 @@ class BlockScaleSpec:
 
 @dataclass(frozen=True)
 class MoeSpec:
-    """A MoE grouped matmul forward pass.
-
-    ``out[first_token_offset[g] : first_token_offset[g+1]] =
-        token[that range] @ weight[g % num_experts].T`` for each routed group g.
-
-    It is a batched matmul where every expert owns a variable, runtime-determined
-    M-range of the flat token tensor (the boundaries live in an INT32
-    ``first_token_offset`` tensor passed at runtime, NOT baked here). The anchor
-    :class:`MatmulSpec` carries the dims: ``M`` = total tokens (S), ``K`` = hidden
-    size (H), ``N`` = weight size; ``a_batch=1`` (one flat token plane),
-    ``b_batch=num_experts`` (the weight tensor is indexed per group).
-
-    Set by the analyzer when the graph's single op is ``moe_grouped_matmul``.
-    When non-None the compiler routes to the ``sm100_moe_grouped_matmul_fwd_*``
-    template, which runs a grouped persistent scheduler + per-group A TMA
-    descriptor replacement. POC scope: ``mode == "none"`` only (gather / scatter
-    are rejected at analysis time)."""
+    """A MoE grouped matmul forward pass: per routed group g,
+    ``out[fto[g]:fto[g+1]] = token[range] @ weight[g % num_experts].T``. A
+    batched matmul where each expert owns a runtime M-range of the flat token
+    tensor (boundaries in a runtime ``first_token_offset``, not baked). Anchor
+    MatmulSpec dims: M=total tokens, K=hidden, N=weight; a_batch=1,
+    b_batch=num_experts. Compiler routes to ``sm100_moe_grouped_matmul_fwd_*``
+    (grouped persistent scheduler + per-group A TMA descriptor replacement).
+    POC scope: ``mode == "none"`` only (gather/scatter rejected)."""
 
     num_experts: int  # E — also the number of routed groups
     mode: str = "none"  # "none" only in the POC
-    # dtype of the first_token_offset tensor — INT32 or INT64 (cuDNN accepts
-    # both). Baked into the kernel at JIT time; the scheduler casts reads to
-    # Int32 internally (token counts fit in i32), so the math is dtype-agnostic.
+    # first_token_offset dtype (INT32 or INT64; cuDNN accepts both). Baked at JIT
+    # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
 
     def __post_init__(self) -> None:
@@ -591,76 +467,48 @@ class FusionChain:
     aux_tensors: list[TensorRef] = field(default_factory=list)
     ops: list[FusionOp] = field(default_factory=list)
     output_dtype: Dtype = "bf16"
-    # ---- Multi-GEMM (parallel matmuls sharing one epilogue) ----------------
-    # K parallel GEMMs (K = num_gemms) all share the SAME shape / layout / dtype
-    # (described by ``matmul``) but may use different A / B operands, and their
-    # outputs feed the same pointwise-epilogue DAG (e.g. silu(A@B0)*(A@B1)).
-    # Operands are deduplicated: ``num_a_operands`` / ``num_b_operands`` are the
-    # counts of DISTINCT A / B tensors; ``gemm_operands[g] = (a_idx, b_idx)``
-    # picks GEMM g's operands from those distinct pools. A pointwise op names
-    # which GEMM output it reads via a negative ``parent_idx`` (``gemm_source(g)``
-    # = -1 - g); see the producing-operation-reference note on FusionOp.
-    # Single-GEMM default (1 distinct A, 1 distinct B, one (0,0) GEMM) is the
-    # legacy path (the only GEMM ref is -1).
+    # Multi-GEMM: num_gemms parallel GEMMs share the SAME shape/layout/dtype
+    # (``matmul``) but may use different A/B operands, all feeding one epilogue
+    # DAG (e.g. silu(A@B0)*(A@B1)). Operands are deduped: num_a/b_operands count
+    # DISTINCT tensors; ``gemm_operands[g] = (a_idx, b_idx)`` picks from them. An
+    # op names which GEMM output it reads via a negative parent_idx (gemm_source).
+    # Single-GEMM default (1 A, 1 B, one (0,0) GEMM) is the legacy path (ref -1).
     num_a_operands: int = 1
     num_b_operands: int = 1
     gemm_operands: list[tuple[int, int]] = field(default_factory=lambda: [(0, 0)])
-    # ---- Mainloop fusion (Phase 6) ----------------------------------------
-    # Unary pointwise ops applied to the **A** operand *before* the MMA reads
-    # it — i.e. ``A' = op_k(... op_0(A))`` and ``C = A' @ B``. These run on the
-    # dedicated mainloop-fusion warps (warps 8..11 in the 12-warp template),
-    # which read the freshly-TMA'd A tile out of SMEM, transform it in
-    # registers (fp32 compute), and write it back in place before the MMA
-    # consumes it. POC scope: a *linear chain of unary ops on A only* (no aux,
-    # no binary, no B-side fusion). Empty list ⇒ no mainloop fusion ⇒ the
-    # compiler picks the ordinary 8-warp template.
+    # Mainloop fusion: unary ops on A applied BEFORE the MMA (``C = op(A) @ B``),
+    # run on the dedicated mainloop warps (8..11 in the 12-warp template) that
+    # transform the TMA'd A SMEM tile in place. POC scope: linear unary chain on
+    # A only. Empty ⇒ no fusion ⇒ ordinary 8-warp template.
     mainloop_a_ops: list[FusionOp] = field(default_factory=list)
-    # Same as ``mainloop_a_ops`` but for the **B** operand: ``B' = op(B)`` and
-    # ``C = A @ B'`` (or both A and B transformed). Each CTA's mainloop warps
-    # transform their own B SMEM tile in place.
+    # Same for B (``C = A @ op(B)``); each CTA transforms its own B tile in place.
     mainloop_b_ops: list[FusionOp] = field(default_factory=list)
-    # Mixed-input mainloop: when the fused operand is LOADED at a narrower dtype
-    # than the MMA reads (e.g. int8 A -> identity -> bf16 MMA), this holds the
-    # narrow LOAD dtype while ``matmul.a_dtype`` / ``matmul.b_dtype`` hold the
-    # (wider) MMA dtype. ``None`` ⇒ no cast (load dtype == MMA dtype, the
-    # ordinary dtype-preserving mainloop). The mainloop warps stage the cast:
-    # TMA loads the narrow tile, the warps widen it into the MMA SMEM tile.
+    # Mixed-input mainloop: narrow LOAD dtype when the fused operand is loaded
+    # narrower than the MMA reads (e.g. int8 A -> bf16 MMA); ``matmul.a/b_dtype``
+    # hold the wider MMA dtype. None ⇒ no cast (load == MMA). The mainloop warps
+    # stage the cast (TMA loads narrow, warps widen into the MMA SMEM tile).
     mainloop_a_load_dtype: Dtype | None = None
     mainloop_b_load_dtype: Dtype | None = None
-    # Position of the terminal op in `ops`. Sentinel ``-2`` (default) means
-    # "auto": for linear chains it resolves to ``len(ops) - 1``; for the
-    # matmul-only case (no ops) it resolves to ``-1`` (matmul itself is the
-    # terminal). The analyzer sets it explicitly when the DAG has multiple
-    # branches and the terminal is not simply the last op in the list.
+    # Terminal op position in `ops`. Sentinel -2 = auto (len(ops)-1, or -1 =
+    # matmul when no ops). The analyzer sets it explicitly for multi-branch DAGs.
     terminal_op_idx: int = -2
-    # ---- No-epilogue multi-GEMM (parallel matmuls, each materialized) -------
-    # When set (length == num_gemms), there are NO fusion ops: every GEMM's
-    # accumulator is stored DIRECTLY to its own GMEM output (cast to the dtype
-    # here). GEMM 0 is the terminal (slot 0); GEMMs >0 are taps (slots 1..).
-    # This is the "K parallel GEMMs, same shape, no shared epilogue" case
-    # (e.g. the DualBlockScaleMatmul benchmark). None ⇒ a fused epilogue (ops).
+    # No-epilogue multi-GEMM: when set (len == num_gemms), NO fusion ops — each
+    # GEMM's accumulator stores directly to its own output (cast to this dtype).
+    # GEMM 0 = terminal (slot 0); GEMMs >0 = taps. None ⇒ fused epilogue.
     per_gemm_outputs: "list[Dtype] | None" = None
-    # ---- Block-scaled matmul (FP4 / FP8 + per-block scale factors) ---------
-    # Set by the analyzer when the matmul's A and B operands are produced by
-    # ``block_scale_dequantize`` nodes. When non-None the compiler routes to the
-    # ``sm100_block_scale_matmul_*`` template, which loads the
-    # scale factors via TMA, copies them SMEM→TMEM (utccp), and runs the
-    # block-scaled MMA. The epilogue DAG (``ops``) still runs on the fp32
-    # accumulator as usual. None ⇒ ordinary (non-scaled) matmul.
+    # Block-scaled matmul: set when A/B are produced by block_scale_dequantize
+    # nodes. Routes to ``sm100_block_scale_matmul_*`` (TMA-loads SF, SMEM→TMEM
+    # utccp, block-scaled MMA); the epilogue DAG still runs on the fp32
+    # accumulator. None ⇒ ordinary matmul.
     block_scale: "BlockScaleSpec | None" = None
-    # ---- MoE grouped matmul (per-group variable M-range) -------------------
-    # Set by the analyzer when the graph's single op is ``moe_grouped_matmul``.
-    # When non-None the compiler routes to the ``sm100_moe_grouped_matmul_fwd_*``
-    # template. None ⇒ ordinary matmul.
+    # MoE grouped matmul: set when the graph's single op is moe_grouped_matmul.
+    # Routes to ``sm100_moe_grouped_matmul_fwd_*``. None ⇒ ordinary matmul.
     moe: "MoeSpec | None" = None
-    # ---- Epilogue reductions ----------------------------------------------
-    # Materialized reduction side-outputs. The terminal full-size output is
-    # still slot 0; reductions are extra output slots, initialized by the
-    # runtime wrapper and updated atomically from the epilogue loop.
+    # Materialized reduction side-outputs (extra slots after the terminal),
+    # initialized by the runtime wrapper and updated atomically in the epilogue.
     reductions: list[ReductionSpec] = field(default_factory=list)
-    # ---- Terminal block-scale quantize -------------------------------------
-    # When set, the terminal full-size output is the quantized tensor and an
-    # extra scale-factor output is materialized from the epilogue.
+    # Terminal block-scale quantize: terminal output is the quantized tensor +
+    # an extra scale-factor output materialized from the epilogue.
     block_quant: "BlockQuantizeSpec | None" = None
 
     def __post_init__(self) -> None:
@@ -697,13 +545,14 @@ class FusionChain:
                 raise ValueError(f"block quantize source op index {q.source_ref} out of range " f"for {len(self.ops)} op(s)")
             if self.output_dtype not in ("fp8_e4m3", "fp8_e5m2"):
                 raise ValueError(f"block quantize output dtype {self.output_dtype!r} is not " "supported; expected fp8_e4m3 or fp8_e5m2")
-        # Mainloop fusion (POC): a straight chain applied to the operand (op i
-        # reads op i-1's result; op 0 reads the raw A / B tile). Unary ops, or
-        # binary ops with a single SCALAR graph-input aux (e.g. A * alpha) —
-        # scalar so the transform stays element-wise / swizzle-agnostic. No
-        # fan-in (parent_idx_b); per-row / per-col / per-elem aux is out of
-        # scope (would need swizzle-aware SMEM indexing).
-        for label, oplist in (("mainloop_a_ops", self.mainloop_a_ops), ("mainloop_b_ops", self.mainloop_b_ops)):
+        # Mainloop fusion (POC): a straight op chain. Unary, or binary with a
+        # single SCALAR aux (e.g. A*alpha) — scalar keeps it swizzle-agnostic.
+        # No fan-in; per-row/col/elem aux is out of scope (needs swizzle-aware
+        # SMEM indexing).
+        for label, oplist in (
+            ("mainloop_a_ops", self.mainloop_a_ops),
+            ("mainloop_b_ops", self.mainloop_b_ops),
+        ):
             for op in oplist:
                 if op.parent_idx_b is not None:
                     raise ValueError(f"{label} op {op.op!r} cannot have parent_idx_b (no fan-in)")
@@ -767,9 +616,8 @@ class FusionChain:
 
     @property
     def resolved_terminal_idx(self) -> int:
-        """Resolve the ``terminal_op_idx`` sentinel. Returns -1 when the
-        matmul itself is the terminal, otherwise a concrete index in
-        ``self.ops``."""
+        """Resolve the ``terminal_op_idx`` sentinel: -1 = matmul is the
+        terminal, else a concrete index in ``self.ops``."""
         if self.terminal_op_idx == -2:
             return len(self.ops) - 1 if self.ops else -1
         return self.terminal_op_idx
@@ -782,12 +630,9 @@ class FusionChain:
 
     @property
     def outputs(self) -> list["ChainOutput"]:
-        """GMEM outputs the kernel materializes, in canonical slot order:
-        slot 0 is always the terminal output; subsequent slots are taps in
-        chain order — matmul first (if tapped), each fusion op with
-        ``output_tap``, then reduction side-outputs. A pointwise tap's dtype is
-        the producer's ``out_dtype``. Callers of :class:`CompiledFusedGemm`
-        must pass runtime output tensors in this order."""
+        """GMEM outputs in canonical slot order: slot 0 = terminal; then taps in
+        chain order (matmul first if tapped, each output_tap op, then
+        reductions). Callers must pass runtime output tensors in this order."""
         if self.per_gemm_outputs is not None:
             # No-epilogue multi-GEMM: GEMM 0 = terminal, GEMMs >0 = taps.
             outs = [ChainOutput(source="terminal", dtype=self.per_gemm_outputs[0])]
@@ -829,7 +674,7 @@ class FusionChain:
         return self.outputs[1:]
 
     def summary(self) -> str:
-        """One-line human-readable summary, useful in logs and error messages."""
+        """One-line human-readable summary for logs / error messages."""
         m = self.matmul
         batch = f"batch={m.batch}"
         if m.a_batch != m.batch or m.b_batch != m.batch:

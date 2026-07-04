@@ -1,8 +1,5 @@
-"""End-to-end tests for Phase-2 multi-output (matmul tap + per-op tap).
-
-Each test builds a cudnn graph with one or more set_output(True) intermediates,
-JITs it, runs, and checks every output buffer against a torch reference.
-"""
+"""End-to-end multi-output tests: graphs with set_output(True) intermediates
+(matmul tap + per-op taps), checked against a torch reference."""
 
 from __future__ import annotations
 
@@ -24,10 +21,9 @@ def _mkdata(M: int, N: int, K: int, B: int = 1):
 
 
 def _vp(g, a, b, outs, *aux):
-    """Variant-pack dict {cuDNN tensor: buffer} keyed by the graph's tensors
-    (role->tensor recovered from the public analyzer binding). ``outs`` fills
-    chain.outputs slot order (terminal, then taps); ``aux`` the epilogue aux
-    tensors in order."""
+    """Variant-pack dict keyed by the graph's tensors (via the analyzer binding).
+    ``outs`` fills chain.outputs slot order (terminal, then taps); ``aux`` the
+    epilogue aux tensors in order."""
     bd = analyze_with_binding(g)[1]
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     vp = {bd.a_operands[0]: a, bd.b_operands[0]: b}
@@ -37,14 +33,12 @@ def _vp(g, a, b, outs, *aux):
 
 
 def _plan(g, **kw):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile the recorded graph; returns the compiled kernel."""
     return jit_from_cudnn_graph(g, **kw)
 
 
 def test_matmul_tap_only() -> None:
-    """Tap the raw matmul output (Phase-1 path). Terminal: relu (BF16).
-    Tap: matmul (BF16)."""
+    """Tap the raw matmul output. Terminal: relu (BF16); tap: matmul (BF16)."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -74,7 +68,10 @@ def test_matmul_tap_only() -> None:
     "mode,ref_fn",
     (
         (cudnn.reduction_mode.ADD, lambda x: x.sum(dim=(0, 1, 2), keepdim=True)),
-        (cudnn.reduction_mode.AMAX, lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True)),
+        (
+            cudnn.reduction_mode.AMAX,
+            lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True),
+        ),
         (cudnn.reduction_mode.MAX, lambda x: x.amax(dim=(0, 1, 2), keepdim=True)),
         (cudnn.reduction_mode.MIN, lambda x: x.amin(dim=(0, 1, 2), keepdim=True)),
     ),
@@ -114,7 +111,10 @@ def test_epilogue_reduction_tap_scalar(mode, ref_fn) -> None:
     "mode,ref_fn",
     (
         (cudnn.reduction_mode.ADD, lambda x: x.sum(dim=(0, 1, 2), keepdim=True)),
-        (cudnn.reduction_mode.AMAX, lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True)),
+        (
+            cudnn.reduction_mode.AMAX,
+            lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True),
+        ),
         (cudnn.reduction_mode.MAX, lambda x: x.amax(dim=(0, 1, 2), keepdim=True)),
         (cudnn.reduction_mode.MIN, lambda x: x.amin(dim=(0, 1, 2), keepdim=True)),
     ),
@@ -269,7 +269,10 @@ def test_epilogue_reduction_tap_strided_output(mode, red_shape: str, ref_dims: t
     "mode,ref_fn",
     (
         (cudnn.reduction_mode.ADD, lambda x: x.sum(dim=(0, 1, 2), keepdim=True)),
-        (cudnn.reduction_mode.AMAX, lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True)),
+        (
+            cudnn.reduction_mode.AMAX,
+            lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True),
+        ),
         (cudnn.reduction_mode.MAX, lambda x: x.amax(dim=(0, 1, 2), keepdim=True)),
         (cudnn.reduction_mode.MIN, lambda x: x.amin(dim=(0, 1, 2), keepdim=True)),
     ),
@@ -308,7 +311,10 @@ def test_epilogue_reduction_tap_scalar_big_cgrp_multi_cta(mode, ref_fn) -> None:
     "mode,ref_fn",
     (
         (cudnn.reduction_mode.ADD, lambda x: x.sum(dim=(0, 1, 2), keepdim=True)),
-        (cudnn.reduction_mode.AMAX, lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True)),
+        (
+            cudnn.reduction_mode.AMAX,
+            lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True),
+        ),
         (cudnn.reduction_mode.MAX, lambda x: x.amax(dim=(0, 1, 2), keepdim=True)),
         (cudnn.reduction_mode.MIN, lambda x: x.amin(dim=(0, 1, 2), keepdim=True)),
     ),
@@ -349,11 +355,8 @@ def test_epilogue_reduction_tap_scalar_int32_big_cgrp_multi_cta(mode, ref_fn) ->
 
 
 def test_mid_op_tap() -> None:
-    """Tap an intermediate fusion-op result (Phase-2 path).
-
-    Chain: matmul -> bias -> relu.
-    Tap: after bias (FP32). Terminal: after relu (BF16).
-    """
+    """Tap an intermediate fusion-op result. Chain: matmul -> bias -> relu;
+    tap after bias (FP32), terminal after relu (BF16)."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -384,12 +387,8 @@ def test_mid_op_tap() -> None:
 
 
 def test_dag_two_branches_from_matmul() -> None:
-    """Phase 3: matmul fan-out to two parallel branches, each ending at its
-    own GMEM output.
-
-    Chain: matmul → {relu, gelu}.
-    Last set_output is gelu → slot 0 = terminal (BF16); relu → slot 1 tap (BF16).
-    """
+    """Matmul fan-out to two branches (relu, gelu). Last set_output (gelu) is
+    the terminal (slot 0); relu is slot 1 tap."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -419,7 +418,7 @@ def test_dag_two_branches_from_matmul() -> None:
 
 
 def test_dag_two_branches_with_per_branch_ops() -> None:
-    """Phase 3: each branch has its own pointwise ops (bias + activation)."""
+    """Fan-out where each branch has its own pointwise ops (bias + activation)."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -431,11 +430,11 @@ def test_dag_two_branches_with_per_branch_ops() -> None:
     bias1 = g.tensor(name="bias1", dim=[1, 1, N], stride=[N, N, 1])
     bias2 = g.tensor(name="bias2", dim=[1, 1, N], stride=[N, N, 1])
     C = g.matmul(A=A, B=B, name="mm")
-    # Branch 1: C → bias1 → relu  (set_output first → tap)
+    # Branch 1: set_output first → tap
     Cb1 = g.bias(input=C, bias=bias1, name="b1")
     Y1 = g.relu(input=Cb1, name="r")
     Y1.set_output(True)
-    # Branch 2: C → bias2 → gelu  (set_output last → terminal)
+    # Branch 2: set_output last → terminal
     Cb2 = g.bias(input=C, bias=bias2, name="b2")
     Y2 = g.gelu_approx_tanh(input=Cb2, name="g")
     Y2.set_output(True)
@@ -457,9 +456,7 @@ def test_dag_two_branches_with_per_branch_ops() -> None:
 
 
 def test_fan_in_relu_plus_gelu() -> None:
-    """Phase 4 fan-in: Y = add(relu(C), gelu(C)).
-    Two op-results re-merged into one binary op; Y is the only output.
-    """
+    """Fan-in: Y = add(relu(C), gelu(C)) — two op-results re-merged, Y is the only output."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -486,8 +483,7 @@ def test_fan_in_relu_plus_gelu() -> None:
 
 
 def test_fan_in_with_intermediate_tap() -> None:
-    """Phase 4 fan-in + intermediate tap: relu and gelu are both consumed by
-    `add`, and one of them (relu) is also set_output as a tap."""
+    """Fan-in + tap: relu and gelu both feed `add`, and relu is also set_output as a tap."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -518,59 +514,10 @@ def test_fan_in_with_intermediate_tap() -> None:
 
 
 def test_complex_fusion_dag() -> None:
-    """End-to-end functionality test that exercises every Phase 1–4 feature
-    in a single graph:
-
-      Phase 1 — matmul output tap (`C` materialized as FP16)
-      Phase 2 — intermediate op taps (after bias as BF16, after relu as FP32,
-                after the fan-in add as FP16)
-      Phase 3 — fan-out from the matmul output into two parallel branches
-                (bias-relu vs. scale-gelu)
-      Phase 4 — fan-in via `add(R1, G1)` re-merging the two branches' results
-      Plus    — three aux tensors with different broadcast modes
-                (per-row, per-col, scalar) and a variety of pointwise ops
-                (bias/add, mul, relu, gelu_tanh, tanh)
-
-    Topology (every node is a fp32 vec in registers; `*` marks set_output):
-
-                       C = matmul(A, B)              *  (FP16 tap, slot 1)
-                        ├─────────────┐
-                        ▼             ▼
-              T1 = C + bias_row    T2 = C * scale_col     ← fan-out
-                        │             │
-                  *(BF16 tap,         │
-                    slot 2)           │
-                        ▼             ▼
-                   R1 = relu(T1)   G1 = gelu_tanh(T2)
-                        │             │
-                  *(FP32 tap,         │
-                    slot 3)           │
-                        └──── add ────┘                    ← fan-in
-                              │
-                          S = R1 + G1                     *(FP16 tap, slot 4)
-                              │
-                              ▼
-                       SC = S * alpha (scalar)
-                              │
-                              ▼
-                       Y = tanh(SC)                       * (terminal, BF16, slot 0)
-
-    Expected `chain.outputs` slot order (terminal first, taps in chain order):
-       slot 0  terminal  Y     BF16
-       slot 1  matmul    C     FP16
-       slot 2  op_0      T1    BF16  (bias result)
-       slot 3  op_1      R1    FP32  (relu result)
-       slot 4  op_4      S     FP16  (fan-in add result)
-
-    Expected `chain.ops` (Kahn topo from analyzer, with recorder-order tie-break):
-       op 0: bias    parent=-1     (C → T1)
-       op 1: relu    parent=0      (T1 → R1)
-       op 2: mul     parent=-1     (C → T2)
-       op 3: gelu    parent=2      (T2 → G1)
-       op 4: add     parent=1, parent_idx_b=3   (R1+G1 → S)   ← Phase-4 fan-in
-       op 5: mul     parent=4      (S → SC)
-       op 6: tanh    parent=5      (SC → Y)                   ← terminal
-    """
+    """Everything at once: matmul tap + intermediate taps (varied dtypes),
+    fan-out into two branches (bias-relu, scale-gelu), fan-in via add, three aux
+    broadcast modes (per-row/per-col/scalar). Asserts encode the exact op topo
+    and output slot order."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -607,22 +554,28 @@ def test_complex_fusion_dag() -> None:
 
     plan = _plan(g)
 
-    # ---- Validate IR structure ---------------------------------------------
+    # Validate IR structure
     chain = analyze(g)
     assert len(chain.ops) == 7
-    assert [op.op for op in chain.ops] == ["add", "relu", "mul", "gelu_tanh", "add", "mul", "tanh"]
-    # parent_idx + parent_idx_b layout
+    assert [op.op for op in chain.ops] == [
+        "add",
+        "relu",
+        "mul",
+        "gelu_tanh",
+        "add",
+        "mul",
+        "tanh",
+    ]
     assert chain.ops[0].parent_idx == -1 and chain.ops[0].aux == "bias_row"  # bias on C
     assert chain.ops[1].parent_idx == 0  # relu on T1
     assert chain.ops[2].parent_idx == -1 and chain.ops[2].aux == "scale_col"  # mul on C
     assert chain.ops[3].parent_idx == 2  # gelu on T2
-    assert chain.ops[4].parent_idx == 1 and chain.ops[4].parent_idx_b == 3  # add(R1, G1)  ← fan-in
+    assert chain.ops[4].parent_idx == 1 and chain.ops[4].parent_idx_b == 3  # add(R1, G1) fan-in
     assert chain.ops[4].aux is None  # fan-in has no aux
     assert chain.ops[5].parent_idx == 4 and chain.ops[5].aux == "alpha"  # mul by scalar
     assert chain.ops[6].parent_idx == 5  # tanh on SC
     assert chain.resolved_terminal_idx == 6
 
-    # chain.outputs slot order
     outs = chain.outputs
     assert [(o.source, o.dtype) for o in outs] == [
         ("terminal", "bf16"),
@@ -632,7 +585,7 @@ def test_complex_fusion_dag() -> None:
         ("op_4", "fp16"),
     ]
 
-    # ---- Run + verify against torch reference ------------------------------
+    # Run + verify against torch reference
     a, b = _mkdata(M, N, K)
     bias_row_t = torch.randn(1, M, 1, device="cuda", dtype=torch.bfloat16)
     scale_col_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
@@ -657,17 +610,13 @@ def test_complex_fusion_dag() -> None:
     )
     torch.cuda.synchronize()
 
-    # Reference. Compute runs in fp32, but every tensor with a declared (narrow)
-    # data_type rounds the running value to that dtype before the next op reads
-    # it — matching cuDNN tensor semantics, including for downstream consumers:
-    #   C=fp16 (feeds BOTH branches), T1=bf16 (feeds relu), R1=fp32 (feeds add),
-    #   T2/G1/SC are virtual fp32 (intermediate_data_type=FLOAT), S=fp16 (feeds
-    #   the final mul). The kernel rounds at exactly these points.
+    # Reference: compute in fp32, but round at each tensor's declared narrow
+    # dtype before the next op reads it (matches cuDNN tensor semantics).
     def _round(x, dt):
         return x.to(dt).float()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
-    c = _round(mm, torch.float16)  # C: fp16
+    c = _round(mm, torch.float16)  # C: fp16 (feeds both branches)
     t1 = _round(c + bias_row_t.float(), torch.bfloat16)  # T1: bf16
     r1 = torch.relu(t1)  # R1: fp32 (no round)
     t2 = c * scale_col_t.float()  # T2: virtual fp32
@@ -684,11 +633,8 @@ def test_complex_fusion_dag() -> None:
 
 
 def test_two_taps_matmul_and_mid_op() -> None:
-    """Both Phase-1 (matmul) AND Phase-2 (mid-op) taps in the same chain.
-
-    Chain: matmul -> bias -> gelu_tanh.
-    Outputs (in slot order): terminal (BF16), matmul tap (FP32), bias tap (BF16).
-    """
+    """Both a matmul tap AND a mid-op tap in one chain (matmul -> bias -> gelu_tanh).
+    Outputs in slot order: terminal (BF16), matmul tap (FP32), bias tap (BF16)."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -724,12 +670,9 @@ def test_two_taps_matmul_and_mid_op() -> None:
 
 
 def test_virtual_bf16_intermediate_loses_precision() -> None:
-    """Req 3: a pure-virtual intermediate declared bf16 (via a bf16
-    intermediate_data_type) rounds the running value, so the kernel matches a
-    reference that rounds at that point — and visibly differs from a reference
-    that keeps fp32 throughout. Chain: matmul -> mul(scale) -> gelu_tanh, with
-    a fractional scale so the post-mul value isn't bf16-exact.
-    """
+    """A pure-virtual bf16 intermediate (via bf16 intermediate_data_type) rounds
+    the running value, so the kernel matches a rounded reference and differs from
+    an fp32-throughout one. Fractional scale so the post-mul value isn't bf16-exact."""
     M, N, K = 256, 256, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -739,10 +682,10 @@ def test_virtual_bf16_intermediate_loses_precision() -> None:
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
     scale = g.tensor(name="scale", dim=[1, 1, N], stride=[N, N, 1])
-    C = g.matmul(A=A, B=B, name="mm")  # virtual bf16
-    T = g.mul(a=C, b=scale, name="m")  # virtual bf16  ← rounding bites here
+    C = g.matmul(A=A, B=B, name="mm")
+    T = g.mul(a=C, b=scale, name="m")  # rounding bites here
     Y = g.gelu_approx_tanh(input=T, name="g")  # terminal
-    Y.set_data_type(cudnn.data_type.FLOAT)  # fp32 output so we can compare tightly
+    Y.set_data_type(cudnn.data_type.FLOAT)  # fp32 output for tight compare
     Y.set_output(True)
 
     chain = analyze(g)
@@ -758,27 +701,30 @@ def test_virtual_bf16_intermediate_loses_precision() -> None:
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
 
-    # Reference WITH rounding at the bf16 virtuals (what the kernel should do):
+    # Reference WITH rounding at the bf16 virtuals (what the kernel should do)
     c_r = mm.to(torch.bfloat16).float()
     t_r = (c_r * scale_t.float()).to(torch.bfloat16).float()
     y_rounded = torch.nn.functional.gelu(t_r, approximate="tanh")
 
-    # Reference WITHOUT any intermediate rounding (the old/wrong behavior):
+    # Reference WITHOUT intermediate rounding (the old/wrong behavior)
     y_fp32 = torch.nn.functional.gelu(mm * scale_t.float(), approximate="tanh")
 
-    # Kernel matches the rounded reference...
     torch.testing.assert_close(c_out, y_rounded, atol=1e-1, rtol=1e-2)
-    # ...and the rounding actually mattered (otherwise this test proves nothing).
+    # ...and the rounding actually mattered (else the test proves nothing)
     assert (y_rounded - y_fp32).abs().max().item() > 0.1, "intermediate rounding had no measurable effect — pick data that exercises it"
 
 
 def test_m_major_op_tap() -> None:
-    """M-major op tap + tanh terminal with 2CTA. The BF16 terminal uses the
-    TMA path (TMEM-load -> stmatrix -> TMA-store); the FP32 op tap stores by scalar STG."""
+    """M-major op tap + tanh terminal (2CTA). BF16 terminal uses the TMA path;
+    the FP32 op tap stores by scalar STG."""
     M, N, K = 256, 256, 128
     tap_dt = cudnn.data_type.FLOAT
     tap_tdt = torch.float32
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
     C = g.matmul(A=A, B=B, name="mm")

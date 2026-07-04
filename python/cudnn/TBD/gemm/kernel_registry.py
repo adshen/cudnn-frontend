@@ -1,41 +1,21 @@
 """Kernel-template registry — six-dimension support funnel.
 
-Whether a kernel can run is a function of SIX dimensions:
+Whether a kernel runs depends on: gpu arch · kernel template · tile config
+(geometry) · graph type · mma type · other graph info. Tile configs are PURE
+GEOMETRY; the template supplies execution strategy (cta_group, static_sched,
+arch, graph type, mainloop), so one geometry runs on several templates.
 
-    gpu architecture · kernel template · tile config (geometry) · graph type ·
-    mma type · other graph info
+:meth:`KernelTemplate.accepts` funnels cheapest-first:
+  1. graph type + arch-family + mainloop axis
+  2. mma type × arch (unified :data:`MMA_TYPE_SUPPORT`; drops every template of
+     the graph type on failure)
+  3. tile config — accepted geometries by PREDICATE over CATALOG (cta_group
+     constraints + known-bad exclusions), never a hand-maintained list
+  4. other graph info — mainloop op scope + TMA alignment
 
-Tile configs are PURE GEOMETRY (see ``tile_config``); the **template** supplies
-the execution strategy — ``cta_group`` (1-CTA vs 2-CTA MMA), ``static_sched``
-(CLC vs static scheduler), arch family, and which graph type / mainloop it
-handles. A single geometry config is therefore run by several templates; the
-registry expands each geometry across the accepting templates.
-
-Judging every combination directly is a combinatorial explosion. Instead we run
-a **funnel** — cheapest, coarsest dimension first (mirrored by the layers of
-:meth:`KernelTemplate.accepts`):
-
-  1. **graph type** — matmul / block_scale_matmul / moe / convolution. Each
-     template declares exactly one (``graph_type`` field). Plus arch-family
-     match (``sm100`` templates only accept ``sm100`` configs) and the
-     mainloop-fusion axis.
-  2. **mma type × arch** — the MMA-instruction input shape vs the target GPU's
-     SM, via the unified :data:`MMA_TYPE_SUPPORT` table (matmul + block-scale
-     merged into one structure here). Graph-type-level: a failure drops every
-     template of that graph type.
-  3. **tile config** — which catalog geometries a template accepts, by
-     PREDICATE (``candidate_configs`` filtering CATALOG) — incl. the template's
-     cta_group constraints (2-CTA MMA needs ``cgrp_size_m % 2 == 0`` etc.) and an
-     explicit known-bad exclusion (cluster-m=128). Never a hand-maintained list.
-  4. **other graph info** — mainloop-fusion op scope + TMA alignment.
-
-Capability checks are **reused** from ``compiler._check_*`` / its tables (lazy
-import; ``compiler`` does not import this module) — single source of truth.
-
-This registry DRIVES the compiler's template-file selection via
-:func:`select_template`; the compiler passes the chosen template's ``cta_group``
-into the geometry's cta_group-taking methods at render time.
-"""
+Capability checks are reused from ``compiler._check_*`` (lazy import; compiler
+doesn't import this module). :func:`select_template` drives the compiler's
+template-file selection."""
 
 from __future__ import annotations
 
@@ -45,25 +25,21 @@ from enum import Enum
 from .fusion_ir import BINARY_OPS, UNARY_OPS, FusionChain
 from .tile_config import CATALOG, TileConfig
 
-# Single source of truth for which pointwise ops a mainloop-fusion template can
-# transform in SMEM (the canonical op names FusionOp.op uses).
+# Pointwise ops a mainloop-fusion template can transform in SMEM.
 _SUPPORTED_MAINLOOP_OPS: frozenset[str] = frozenset(UNARY_OPS) | frozenset(BINARY_OPS)
 
 
-# ---------------------------------------------------------------------------
 # Dimension 1: graph type
-# ---------------------------------------------------------------------------
 
 
 class GraphType(Enum):
-    """The kind of computation the graph expresses. Each kernel template
-    supports exactly one. ``MOE`` / ``CONVOLUTION`` are placeholders — no
-    template implements them yet."""
+    """The kind of computation the graph expresses; each template supports
+    exactly one. ``CONVOLUTION`` is a placeholder (no template yet)."""
 
     MATMUL = "matmul"
     BLOCK_SCALE_MATMUL = "block_scale_matmul"
     MOE = "moe"
-    MOE_BLOCK_SCALE = "moe_block_scale"  # MoE grouped matmul with block-scaled inputs
+    MOE_BLOCK_SCALE = "moe_block_scale"  # MoE grouped matmul, block-scaled inputs
     CONVOLUTION = "convolution"  # placeholder — no template yet
 
 
@@ -78,29 +54,18 @@ def classify_graph_type(chain: FusionChain) -> GraphType:
     return GraphType.MATMUL
 
 
-# ---------------------------------------------------------------------------
 # Scheduler axis (template strategy, supplied at compile/traversal time)
-# ---------------------------------------------------------------------------
-
 CLC = "clc"
 STATIC = "static"
 SCHEDULERS: tuple[str, ...] = (CLC, STATIC)
 
 
-# ---------------------------------------------------------------------------
-# Dimension 2: mma type × arch (graph-type-level, config/template independent)
-# ---------------------------------------------------------------------------
-
-
-# ===========================================================================
-# Unified MMA-type × arch support — the SINGLE source of truth (the old
-# compiler `_PIPELINE_DTYPE_ARCH` matmul table and `_BLOCK_SCALE_SUPPORTED`
-# per-side case list were merged into this one structure). Indexed by graph
-# type; value is `{mma_type_key -> supported arch ranges}`. The key shape
-# differs per graph type — matmul = (a, b, accum) dtype combo; block-scale =
-# the full 13-field per-side (data, SF dtype, block size, reorder, dequant
-# compute/out) + accum — but the lookup is one code path.
-# ===========================================================================
+# Dimension 2: mma type × arch (graph-type-level, config/template independent).
+# Unified MMA-type × arch support — SINGLE source of truth (merges the old
+# compiler matmul table + block-scale per-side case list). Indexed by graph
+# type; value = {mma_type_key -> supported arch ranges}. Key shape differs per
+# graph type (matmul = (a, b, accum); block-scale = full per-side spec) but the
+# lookup is one code path.
 
 
 def _matmul_mma_type(chain: FusionChain) -> tuple:
@@ -130,10 +95,24 @@ def _block_scale_mma_type(chain: FusionChain) -> tuple:
 
 
 def _bs_key(a: str, sfa: str, b: str, sfb: str, kblk: int) -> tuple:
-    """Construct a block-scale mma-type key from the parts that vary (data + SF
-    dtypes, K-block). All current cases share reorder F8_128x4, fp32 dequant
-    compute/out, fp32 accumulate, A block=(1,kblk) / B block=(kblk,1)."""
-    return (a, sfa, (1, kblk), "F8_128x4", "fp32", "fp32", b, sfb, (kblk, 1), "F8_128x4", "fp32", "fp32", "fp32")
+    """Block-scale mma-type key from the varying parts (data + SF dtypes,
+    K-block). All cases share reorder F8_128x4, fp32 dequant compute/out, fp32
+    accumulate, A block=(1,kblk) / B block=(kblk,1)."""
+    return (
+        a,
+        sfa,
+        (1, kblk),
+        "F8_128x4",
+        "fp32",
+        "fp32",
+        b,
+        sfb,
+        (kblk, 1),
+        "F8_128x4",
+        "fp32",
+        "fp32",
+        "fp32",
+    )
 
 
 _ARCH_SM100 = ((100, 120),)  # sm100 family (Blackwell): 100..119
@@ -149,7 +128,7 @@ _BLOCK_SCALE_CASES = {
     _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32): _ARCH_SM100,  # mxfp8 e5m2×e5m2
 }
 
-# {GraphType: (mma-type-key-fn, {mma_type_key: arch_ranges})}
+# {GraphType: (key_fn, {mma_type_key: arch_ranges})}
 MMA_TYPE_SUPPORT: dict[GraphType, tuple] = {
     GraphType.MATMUL: (
         _matmul_mma_type,
@@ -163,8 +142,8 @@ MMA_TYPE_SUPPORT: dict[GraphType, tuple] = {
             ("fp8_e5m2", "fp8_e5m2", "fp32"): _ARCH_SM100,
         },
     ),
-    # MoE grouped matmul shares the plain-matmul (a, b, accum) dtype key shape.
-    # BF16 is the validated path; fp16 / fp8 fall out of the same machinery.
+    # MoE shares the plain-matmul (a, b, accum) key. BF16 validated; fp16/fp8
+    # fall out of the same machinery.
     GraphType.MOE: (
         _matmul_mma_type,
         {
@@ -177,17 +156,15 @@ MMA_TYPE_SUPPORT: dict[GraphType, tuple] = {
         },
     ),
     GraphType.BLOCK_SCALE_MATMUL: (_block_scale_mma_type, _BLOCK_SCALE_CASES),
-    # MoE grouped matmul with block-scaled inputs shares the same block-scale
-    # mma-type key + supported cases.
+    # Block-scaled MoE shares the block-scale key + cases.
     GraphType.MOE_BLOCK_SCALE: (_block_scale_mma_type, _BLOCK_SCALE_CASES),
 }
 
 
 def mma_arch_reject(chain: FusionChain, graph_type: GraphType) -> str | None:
     """Stage 2: is this graph's MMA type supported on the active GPU arch?
-    ``None`` = yes. ONE lookup over :data:`MMA_TYPE_SUPPORT` for every graph
-    type. Independent of tile config / cta_group — a failure drops every
-    template of this graph type (e.g. int8 on a non-sm100/110 GPU)."""
+    ``None`` = yes. One lookup over :data:`MMA_TYPE_SUPPORT`; independent of tile
+    config / cta_group, so a failure drops every template of this graph type."""
     from . import compiler as C
 
     entry = MMA_TYPE_SUPPORT.get(graph_type)
@@ -208,17 +185,14 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
 # Kernel template — owns the execution-strategy axes (cta_group / static / arch)
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class KernelTemplate:
     """One kernel template. Carries the execution-strategy axes the pure-geometry
-    config does NOT: ``arch`` family, ``cta_group`` (1/2), ``static_sched``,
-    plus ``graph_type`` and the ``mainloop`` axis. ``accepts`` runs the funnel,
-    using ``self.cta_group`` for the geometry's cta_group-dependent gates."""
+    config does NOT (arch, cta_group, static_sched, graph_type, mainloop).
+    ``accepts`` runs the funnel using ``self.cta_group`` for cta_group gates."""
 
     file: str  # template filename under kernel_templates/
     arch: str  # arch family ("sm100"); matched to config.arch
@@ -226,30 +200,29 @@ class KernelTemplate:
     static_sched: bool  # no-CLC static scheduler
     graph_type: GraphType  # the single graph type this template supports
     mainloop: bool  # mainloop-fusion variant (transform A/B before MMA)
-    # Active-GPU SM range [sm_lo, sm_hi) this template runs on. sm100 templates
-    # cover the whole Blackwell family (100..119).
+    # Active-GPU SM range [sm_lo, sm_hi); sm100 covers the Blackwell family.
     sm_lo: int = 100
     sm_hi: int = 120
-    # Multi-GEMM (parallel matmuls sharing one epilogue): only the 1ctamma CLC
-    # template implements it this pass. Other templates reject multi-GEMM chains.
+    # Multi-GEMM support (templates without it reject multi-GEMM chains).
     supports_multi_gemm: bool = False
 
     @property
     def block_scale(self) -> bool:
-        """True iff this template consumes block-scaled (FP4/FP8 + SF) inputs —
-        plain block-scale matmul OR block-scaled MoE grouped matmul."""
-        return self.graph_type in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE)
+        """True iff this template consumes block-scaled (FP4/FP8 + SF) inputs."""
+        return self.graph_type in (
+            GraphType.BLOCK_SCALE_MATMUL,
+            GraphType.MOE_BLOCK_SCALE,
+        )
 
     @property
     def scheduler(self) -> str:
         return STATIC if self.static_sched else CLC
 
-    # -- stage 0: active-GPU SM range (template runs only on [sm_lo, sm_hi)) --
+    # stage 0: active-GPU SM range (template runs only on [sm_lo, sm_hi))
 
     def arch_active_reject(self) -> str | None:
-        """``None`` if the active GPU's SM is in this template's [sm_lo, sm_hi)
-        range (or no GPU is visible — render-only / CI). This is the per-TEMPLATE
-        arch gate (vs the graph-type-level :func:`mma_arch_reject`)."""
+        """``None`` if the active GPU's SM is in [sm_lo, sm_hi) (or no GPU —
+        render-only / CI). Per-TEMPLATE arch gate (vs :func:`mma_arch_reject`)."""
         from . import compiler as C
 
         sm = C._current_sm()
@@ -257,7 +230,7 @@ class KernelTemplate:
             return f"template {self.file} runs only on {self.sm_lo} <= SM < " f"{self.sm_hi}, but the active GPU is sm_{sm}"
         return None
 
-    # -- stage 1: arch / graph-type / mainloop axes --------------------------
+    # stage 1: arch / graph-type / mainloop axes
 
     def _axis_reject(self, chain: FusionChain, config: TileConfig, graph_type: GraphType) -> str | None:
         if config.arch != self.arch:
@@ -270,19 +243,18 @@ class KernelTemplate:
             return f"template {self.file} does not support multi-GEMM " f"({chain.num_gemms} parallel GEMMs); only the 1ctamma CLC " "template does this pass"
         return None
 
-    # -- stage 3: tile-config gates (this template's cta_group on the geometry)
+    # stage 3: tile-config gates (this template's cta_group on the geometry)
 
     def _config_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
-        # cta_group constraints (moved off TileConfig — they are the template's).
+        # cta_group constraints (the template's, not the config's).
         if self.cta_group == 2:
             if config.cgrp_size_m % 2 != 0:
                 return f"2-CTA MMA needs cgrp_size_m % 2 == 0; " f"config has cgrp_size_m={config.cgrp_size_m}"
             if config.cta_tile_n % 2 != 0:
                 return f"2-CTA MMA needs cta_tile_n even (pair splits B's N); " f"config has cta_tile_n={config.cta_tile_n}"
             # known-bad: cluster-m=128 (cta_tile_m=64 under 2-CTA MMA) is in
-            # CATALOG but miscomputes (~87% wrong) until a working reference
-            # lands — excluded from traversal. (select_template still renders it
-            # for deliberate single-point probing.)
+            # CATALOG but miscomputes (~87% wrong); excluded from traversal
+            # (select_template still renders it for single-point probing).
             if config.cta_tile_m == 64:
                 return "cluster-m=128 (cta_tile_m=64 under cta_group=2) not yet " "correctly implemented — excluded from traversal"
         from . import compiler as C
@@ -302,15 +274,14 @@ class KernelTemplate:
             return str(e)
         return None
 
-    # -- stage 4a: per-template capability hook ------------------------------
+    # stage 4a: per-template capability hook
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
-        """Template-SPECIFIC constraints beyond the shared gates. Base = none;
-        subclasses (mainloop) override. The hook that makes capability truly
-        per-template — future variable-MMA / per-template caps attach here."""
+        """Template-SPECIFIC constraints beyond the shared gates (base = none;
+        mainloop overrides). Future variable-MMA / per-template caps attach here."""
         return None
 
-    # -- stage 4: other graph info -------------------------------------------
+    # stage 4: other graph info
 
     def _other_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         extra = self._extra_reject(chain, config)
@@ -327,11 +298,11 @@ class KernelTemplate:
             return str(e)
         return None
 
-    # -- full accept/reject: the four-stage funnel --------------------------
+    # full accept/reject: the four-stage funnel
 
     def accepts(self, chain: FusionChain, config: TileConfig) -> str | None:
         """``None`` if this template can compile (chain, config); else the first
-        stage's rejection reason. Stages cheapest-first (``or`` short-circuits):
+        stage's rejection reason. Cheapest-first (short-circuits):
         arch/graph-type/mainloop → mma-type×arch → tile-config → other."""
         gt = classify_graph_type(chain)
         return (
@@ -343,16 +314,15 @@ class KernelTemplate:
         )
 
     def candidate_configs(self, chain: FusionChain) -> tuple[TileConfig, ...]:
-        """The catalog geometries this template accepts for ``chain`` — derived
-        by filtering (predicate), never hand-maintained."""
+        """Catalog geometries this template accepts for ``chain`` — by
+        predicate filter, never hand-maintained."""
         return tuple(c for c in CATALOG if self.accepts(chain, c) is None)
 
 
 class MainloopKernelTemplate(KernelTemplate):
-    """A mainloop-fusion template. Owns the supported-mainloop-op contract: every
-    pre-MMA pointwise op must be in :data:`_SUPPORTED_MAINLOOP_OPS`. (Can't be
-    tripped by constructible input today — FusionOp restricts op to that set —
-    but makes the contract live on the template; proven to fire via monkeypatch.)"""
+    """A mainloop-fusion template. Every pre-MMA op must be in
+    :data:`_SUPPORTED_MAINLOOP_OPS` (can't be tripped by constructible input
+    today, but keeps the contract on the template)."""
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         for side, ops in (("A", chain.mainloop_a_ops), ("B", chain.mainloop_b_ops)):
@@ -362,11 +332,8 @@ class MainloopKernelTemplate(KernelTemplate):
         return None
 
 
-# ---------------------------------------------------------------------------
-# Registry — one entry per template file (14 today). A single geometry config
-# is expanded across these by `candidates`. cta_group / static_sched / mainloop
-# live HERE, not on the config.
-# ---------------------------------------------------------------------------
+# Registry — one entry per template file (14 today). A geometry config expands
+# across these via `candidates`. cta_group / static_sched / mainloop live HERE.
 
 
 def _mm(
@@ -398,24 +365,82 @@ def _mm(
 TEMPLATES: tuple[KernelTemplate, ...] = (
     # plain matmul
     _mm("sm100_matmul_1ctamma.py", cta_group=1, static=False, supports_multi_gemm=True),
-    _mm("sm100_matmul_1ctamma_static.py", cta_group=1, static=True, supports_multi_gemm=True),
+    _mm(
+        "sm100_matmul_1ctamma_static.py",
+        cta_group=1,
+        static=True,
+        supports_multi_gemm=True,
+    ),
     _mm("sm100_matmul_2ctamma.py", cta_group=2, static=False, supports_multi_gemm=True),
-    _mm("sm100_matmul_2ctamma_static.py", cta_group=2, static=True, supports_multi_gemm=True),
+    _mm(
+        "sm100_matmul_2ctamma_static.py",
+        cta_group=2,
+        static=True,
+        supports_multi_gemm=True,
+    ),
     # block-scaled matmul
-    _mm("sm100_block_scale_matmul_1ctamma.py", cta_group=1, static=False, graph_type=GraphType.BLOCK_SCALE_MATMUL, supports_multi_gemm=True),
-    _mm("sm100_block_scale_matmul_1ctamma_static.py", cta_group=1, static=True, graph_type=GraphType.BLOCK_SCALE_MATMUL, supports_multi_gemm=True),
-    _mm("sm100_block_scale_matmul_2ctamma.py", cta_group=2, static=False, graph_type=GraphType.BLOCK_SCALE_MATMUL, supports_multi_gemm=True),
-    _mm("sm100_block_scale_matmul_2ctamma_static.py", cta_group=2, static=True, graph_type=GraphType.BLOCK_SCALE_MATMUL, supports_multi_gemm=True),
+    _mm(
+        "sm100_block_scale_matmul_1ctamma.py",
+        cta_group=1,
+        static=False,
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=True,
+    ),
+    _mm(
+        "sm100_block_scale_matmul_1ctamma_static.py",
+        cta_group=1,
+        static=True,
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=True,
+    ),
+    _mm(
+        "sm100_block_scale_matmul_2ctamma.py",
+        cta_group=2,
+        static=False,
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=True,
+    ),
+    _mm(
+        "sm100_block_scale_matmul_2ctamma_static.py",
+        cta_group=2,
+        static=True,
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=True,
+    ),
     # mainloop-fusion matmul (CLC only — no static / block-scale variant yet)
     _mm("sm100_matmul_mainloop_1ctamma.py", cta_group=1, static=False, mainloop=True),
     _mm("sm100_matmul_mainloop_2ctamma.py", cta_group=2, static=False, mainloop=True),
-    # MoE grouped matmul fwd (own grouped persistent scheduler — the static_sched
-    # axis is irrelevant here, registered False so default scheduler="clc" selects).
-    _mm("sm100_moe_grouped_matmul_fwd_1ctamma.py", cta_group=1, static=False, graph_type=GraphType.MOE, supports_multi_gemm=True),
-    _mm("sm100_moe_grouped_matmul_fwd_2ctamma.py", cta_group=2, static=False, graph_type=GraphType.MOE, supports_multi_gemm=True),
+    # MoE grouped matmul fwd (own grouped persistent scheduler; static_sched
+    # irrelevant, registered False so default scheduler="clc" selects).
+    _mm(
+        "sm100_moe_grouped_matmul_fwd_1ctamma.py",
+        cta_group=1,
+        static=False,
+        graph_type=GraphType.MOE,
+        supports_multi_gemm=True,
+    ),
+    _mm(
+        "sm100_moe_grouped_matmul_fwd_2ctamma.py",
+        cta_group=2,
+        static=False,
+        graph_type=GraphType.MOE,
+        supports_multi_gemm=True,
+    ),
     # MoE grouped matmul with block-scaled (FP4/FP8 + SF) inputs.
-    _mm("sm100_moe_grouped_block_scale_matmul_fwd_1ctamma.py", cta_group=1, static=False, graph_type=GraphType.MOE_BLOCK_SCALE, supports_multi_gemm=True),
-    _mm("sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py", cta_group=2, static=False, graph_type=GraphType.MOE_BLOCK_SCALE, supports_multi_gemm=True),
+    _mm(
+        "sm100_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
+        cta_group=1,
+        static=False,
+        graph_type=GraphType.MOE_BLOCK_SCALE,
+        supports_multi_gemm=True,
+    ),
+    _mm(
+        "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
+        cta_group=2,
+        static=False,
+        graph_type=GraphType.MOE_BLOCK_SCALE,
+        supports_multi_gemm=True,
+    ),
 )
 
 
@@ -426,10 +451,9 @@ def select_template(
     scheduler: str = CLC,
 ) -> KernelTemplate:
     """The single template that renders (chain, config) under the requested
-    execution strategy. ``cta_group`` and ``scheduler`` are the strategy knobs
-    the pure-geometry config no longer carries; ``mainloop`` and ``graph_type``
-    are derived from the chain. Capability/known-bad gates are NOT applied here —
-    single-point JIT renders even known-bad configs for deliberate probing."""
+    execution strategy (``cta_group`` / ``scheduler``; mainloop + graph_type
+    derived from the chain). Capability/known-bad gates are NOT applied — this
+    renders even known-bad configs for deliberate single-point probing."""
     if scheduler not in SCHEDULERS:
         raise ValueError(f"scheduler must be one of {SCHEDULERS}; got {scheduler!r}")
     gt = classify_graph_type(chain)
@@ -455,9 +479,9 @@ def select_template(
 
 
 def candidates(chain: FusionChain) -> list[tuple[KernelTemplate, TileConfig]]:
-    """Traversal-mode candidate set for ``chain``, via the support funnel.
-    Each accepted (template, geometry) is a JIT-able point; one geometry expands
-    across the templates that accept it ({1,2}ctamma × {clc,static}, etc.)."""
+    """Traversal-mode candidate set for ``chain`` via the funnel. Each accepted
+    (template, geometry) is a JIT-able point; one geometry expands across the
+    templates that accept it ({1,2}ctamma × {clc,static}, etc.)."""
     gt = classify_graph_type(chain)
     tmpls = [t for t in TEMPLATES if t.graph_type is gt]  # stage 1
     if not tmpls:

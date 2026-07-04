@@ -24,7 +24,7 @@ from cudnn.TBD.gemm.fusion_ir import (
 )
 from cudnn.TBD.gemm.kernel_registry import MMA_TYPE_SUPPORT, GraphType
 
-# Plain-matmul mma-type table (the dict half of the unified support entry).
+# Plain-matmul mma-type table (dict half of the unified support entry).
 _MATMUL_MMA_TABLE = MMA_TYPE_SUPPORT[GraphType.MATMUL][1]
 from cudnn.TBD.gemm.tile_config import DEFAULT_CONFIG, by_name
 
@@ -126,14 +126,14 @@ def test_template_arch_family_parses_sm_token() -> None:
 
 
 def test_gate_accepts_sm100_family(monkeypatch) -> None:
-    # A supported combo (bf16) runs on every SM in the sm100 family (100..119).
+    # bf16 runs on every SM in the sm100 family (100..119).
     for sm in (100, 103, 119):
         monkeypatch.setattr(compiler, "_current_sm", lambda v=sm: v)
-        _check_supported(_chain(dtype="bf16"), DEFAULT_CONFIG)  # must not raise
+        _check_supported(_chain(dtype="bf16"), DEFAULT_CONFIG)
 
 
 def test_gate_rejects_out_of_range_sm(monkeypatch) -> None:
-    # Hopper (sm_90) and post-Blackwell (sm_120+) are out of the sm100 range.
+    # Hopper (sm_90) and post-Blackwell (sm_120+) are out of range.
     for sm in (90, 120, 121):
         monkeypatch.setattr(compiler, "_current_sm", lambda v=sm: v)
         with pytest.raises(NotImplementedError, match=rf"sm_{sm}"):
@@ -141,10 +141,9 @@ def test_gate_rejects_out_of_range_sm(monkeypatch) -> None:
 
 
 def test_gate_dtype_check_runs_without_gpu(monkeypatch) -> None:
-    # No device: the arch half is skipped, but the (pipeline, dtype-combo) half
-    # is a static property and still runs.
+    # No device: arch half skipped, but the (pipeline, dtype-combo) half still runs.
     monkeypatch.setattr(compiler, "_current_sm", lambda: None)
-    _check_supported(_chain(dtype="bf16"), DEFAULT_CONFIG)  # supported combo -> OK
+    _check_supported(_chain(dtype="bf16"), DEFAULT_CONFIG)
     bad = FusionChain(
         matmul=MatmulSpec(M=128, N=128, K=128, a_dtype="bf16", b_dtype="fp16"),
         output_dtype="bf16",
@@ -241,7 +240,7 @@ def test_block_quant_gate_rejects_unaligned_f8_128x4_scale_output() -> None:
 
 def test_gate_rejects_mismatched_family() -> None:
     # bf16 × fp16 slips past MatmulSpec.__post_init__ (both non-FP8) — the
-    # pipeline×dtype table is what rejects it.
+    # pipeline×dtype table rejects it.
     chain = FusionChain(
         matmul=MatmulSpec(M=128, N=128, K=128, a_dtype="bf16", b_dtype="fp16"),
         output_dtype="bf16",
@@ -251,7 +250,7 @@ def test_gate_rejects_mismatched_family() -> None:
 
 
 def test_gate_supports_disjoint_arch_ranges_per_combo(monkeypatch) -> None:
-    # A (pipeline, combo) may run on disjoint SM ranges; accept if SM is in ANY.
+    # A (pipeline, combo) may run on disjoint SM ranges; accept if SM in ANY.
     monkeypatch.setitem(
         _MATMUL_MMA_TABLE,
         ("bf16", "bf16", "fp32"),
@@ -259,7 +258,7 @@ def test_gate_supports_disjoint_arch_ranges_per_combo(monkeypatch) -> None:
     )
     for sm in (100, 109, 120, 129):
         monkeypatch.setattr(compiler, "_current_sm", lambda v=sm: v)
-        _check_supported(_chain(dtype="bf16"), DEFAULT_CONFIG)  # in one range -> OK
+        _check_supported(_chain(dtype="bf16"), DEFAULT_CONFIG)
     for sm in (90, 110, 115, 130):
         monkeypatch.setattr(compiler, "_current_sm", lambda v=sm: v)
         with pytest.raises(NotImplementedError, match="100 <= SM < 110 or 120 <= SM < 130"):
@@ -268,13 +267,11 @@ def test_gate_supports_disjoint_arch_ranges_per_combo(monkeypatch) -> None:
 
 def test_pipeline_dtype_table_covers_all_fp8_pairs() -> None:
     # The plain-matmul gate admits every {E4M3, E5M2} A/B pair (incl. mixed).
-    # (Block-scale is judged separately — not in this table.)
     fp8 = ("fp8_e4m3", "fp8_e5m2")
     for a in fp8:
         for b in fp8:
             assert (a, b, "fp32") in _MATMUL_MMA_TABLE
-    # block-scale is a separate graph type in the unified table, with its own
-    # (much wider) per-side key shape — not a plain (a,b,accum) combo.
+    # Block-scale is a separate graph type with its own per-side key shape.
     assert GraphType.BLOCK_SCALE_MATMUL in MMA_TYPE_SUPPORT
     assert all(len(k) == 3 for k in _MATMUL_MMA_TABLE)
 

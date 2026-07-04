@@ -1,23 +1,12 @@
-"""Codegen: FusionChain -> snippets that fill the kernel template's hook slots.
-
-Two output snippets:
-
-  - `aux_views`: inserted at the top of the epilogue (between the existing
-    `gC_ptr` setup and the subtile loop). Binds raw pointers for each aux
-    tensor and pre-loads row-invariant / scalar values.
-
-  - `epilogue`: inserted inside the per-vector inner loop. Computes the
-    chain of pointwise ops on `vec_f32` and defines `vec_out` (cast to the
-    output dtype) that the existing store call below the hook consumes.
-
-Both snippets are pure strings. The caller (compiler.py) merges them into
-the kernel template via string replacement at the `# FUSION_HOOK:*` markers.
-"""
+"""Codegen: FusionChain -> string snippets that fill the kernel template's
+hook slots (aux_views + per-vector epilogue). compiler.py merges them via
+string replacement at the `# FUSION_HOOK:*` markers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from .fusion_ir import (
     BlockQuantizeSpec,
     Dtype,
@@ -32,13 +21,12 @@ from .fusion_ir import (
 
 @dataclass(frozen=True)
 class EpilogueSnippets:
-    aux_views: str  # multi-line; inserted at INJECT_AUX_VIEWS
-    epilogue: str  # multi-line; inserted at INJECT_EPILOGUE
-    kernel_params: list[str]  # extra parameter decls for the kernel signature
-    host_args: list[str]  # extra host-side arg names to pass through to .launch
-    # Tap plumbing (Phase 2 multi-output). One entry per non-terminal output
-    # in `chain.taps` order. Numbered 0..N-1; the templates reference
-    # `mC_tap_<i>` / `c_tap_<i>` / `fake_c_tap_<i>` / `gC_tap_<i>_ptr` etc.
+    aux_views: str  # inserted at INJECT_AUX_VIEWS
+    epilogue: str  # inserted at INJECT_EPILOGUE
+    kernel_params: list[str]  # extra kernel-signature param decls
+    host_args: list[str]  # extra host-side arg names for .launch
+    # Tap plumbing: one entry per non-terminal output in `chain.taps` order,
+    # numbered 0..N-1 (templates reference mC_tap_<i> / c_tap_<i> / etc.).
     tap_kernel_params: list[str] = field(default_factory=list)
     tap_host_params: list[str] = field(default_factory=list)
     tap_host_pass: list[str] = field(default_factory=list)
@@ -46,62 +34,11 @@ class EpilogueSnippets:
     tap_compile_pass: list[str] = field(default_factory=list)
     tap_ptr_binds: list[str] = field(default_factory=list)
     tap_constants: list[str] = field(default_factory=list)  # vec_bytes_tap_<i> assignments
-    # Mainloop-fusion transforms (Phase 6). Inserted at INJECT_MAINLOOP_A /
-    # INJECT_MAINLOOP_B in the 12-warp templates: given a register vector
-    # ``ml_vec_<a|b>`` (operand dtype) loaded from the A/B SMEM tile, compute
-    # the unary op chain in fp32 and define ``ml_out_<a|b>`` (cast back) which
-    # the template stores in place. "pass" when that operand has no fusion.
+    # Mainloop-fusion transforms (INJECT_MAINLOOP_A/B in the 12-warp templates):
+    # given ml_vec_<a|b>, compute the op chain in fp32 and define ml_out_<a|b>
+    # (cast back) which the template stores in place. "pass" = no fusion.
     mainloop_transform_a: str = "pass"
     mainloop_transform_b: str = "pass"
-
-
-# ---------------------------------------------------------------------------
-# Dtype -> GEMM dtype reference (for parameter type annotations / casts)
-# ---------------------------------------------------------------------------
-
-_DSL_DTYPE: dict[Dtype, str] = {
-    "bf16": "cutlass.BFloat16",
-    "fp16": "cutlass.Float16",
-    "fp32": "cutlass.Float32",
-    "fp8_e4m3": "cutlass.Float8E4M3FN",
-    "fp8_e5m2": "cutlass.Float8E5M2",
-    "fp8_e8m0": "cutlass.Float8E8M0FNU",
-    "fp4_e2m1": "cutlass.Float4E2M1FNx2",
-    "int8": "cutlass.Int8",
-    "uint8": "cutlass.Uint8",
-    "int32": "cutlass.Int32",
-}
-
-
-# cutlass dtype names — needed for tap fake-tensor element types.
-_CUTLASS_DTYPE: dict[Dtype, str] = {
-    "bf16": "cutlass.BFloat16",
-    "fp16": "cutlass.Float16",
-    "fp32": "cutlass.Float32",
-    "fp8_e4m3": "cutlass.Float8E4M3FN",
-    "fp8_e5m2": "cutlass.Float8E5M2",
-    "fp8_e8m0": "cutlass.Float8E8M0FNU",
-    "fp4_e2m1": "cutlass.Float4E2M1FNx2",
-    "int8": "cutlass.Int8",
-    "uint8": "cutlass.Uint8",
-    "int32": "cutlass.Int32",
-}
-
-
-# Byte width per element — used to compute `vec_bytes_tap_<i>` so each tap's
-# store has the right alignment hint regardless of dtype.
-_DTYPE_BYTES: dict[Dtype, int] = {
-    "bf16": 2,
-    "fp16": 2,
-    "fp32": 4,
-    "int8": 1,
-    "fp8_e4m3": 1,
-    "fp8_e5m2": 1,
-    "fp8_e8m0": 1,
-    "fp4_e2m1": 1,
-    "uint8": 1,
-    "int32": 4,
-}
 
 
 def _aux_ptr_var(name: str) -> str:
@@ -115,7 +52,7 @@ def _aux_prefetch_var(name: str) -> str:
 def _compute_cast(var: str, dtype: Dtype, tag: str) -> tuple[list[str], str]:
     """Cast a running vector/scalar to the op's compute dtype."""
     new = f"_c_{tag}"
-    return [f"{new} = ({var}).to({_DSL_DTYPE[dtype]})"], new
+    return [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[dtype]})"], new
 
 
 def _compute_literal(dtype: Dtype, value: float | int) -> str:
@@ -124,9 +61,7 @@ def _compute_literal(dtype: Dtype, value: float | int) -> str:
     return f"cutlass.Float32({float(value)})"
 
 
-# ---------------------------------------------------------------------------
 # Aux load expressions (string forms used inside the inner loop)
-# ---------------------------------------------------------------------------
 
 
 def _index_term(var: str, stride: int) -> str:
@@ -136,12 +71,8 @@ def _index_term(var: str, stride: int) -> str:
 
 
 def _aux_index_expr(aux: TensorRef) -> str:
-    """Linear element offset for the current epilogue location.
-
-    Aux tensors can be rank-2 (shared across all batches) or rank-3
-    (batch-specific or batch-broadcast). Dimensions with extent 1 are
-    broadcast and therefore do not contribute to the pointer offset.
-    """
+    """Linear element offset for the current epilogue location. Extent-1
+    dims are broadcast and don't contribute to the offset."""
     if len(aux.dim) == 1:
         axes = ((aux.dim[0], aux.stride[0], "col_j"),)
     elif len(aux.dim) == 2:
@@ -163,31 +94,26 @@ def _aux_index_expr(aux: TensorRef) -> str:
 
 
 def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str) -> str:
-    """Expression that yields aux value(s) in the current op's compute dtype.
-
-    Result must be a vector of length `vsize`, matching ``like_var``'s dtype.
-    """
+    """Expression yielding aux value(s) as a length-`vsize` vector in the op's
+    compute dtype, matching ``like_var``'s dtype."""
     idx = _aux_index_expr(aux)
-    cast = _DSL_DTYPE[compute_dtype]
+    cast = DTYPE_TO_CUTLASS[compute_dtype]
     if aux.bcast_mode == "scalar":
-        # Loaded once (in aux_views). Broadcast scalar to a vector matching the op input.
+        # scalar prefetched in aux_views, broadcast to vec
         return f"cutlass.full_like({like_var}, {_aux_prefetch_var(aux.name)}.to({cast}))"
     if aux.bcast_mode == "per_row":
-        # Per-row scalar prefetched (in aux_views). Broadcast to vec.
+        # per-row scalar prefetched in aux_views, broadcast to vec
         return f"cutlass.full_like({like_var}, {_aux_prefetch_var(aux.name)}.to({cast}))"
     if aux.bcast_mode == "per_col":
-        # Vector load of `vsize` elements starting at aux_ptr[col_j].
+        # vector load of vsize elements from aux_ptr[col_j]
         return f"({_aux_ptr_var(aux.name)} + {idx}).load(count=vsize, " f"alignment=VEC_BYTES).to({cast})"
     if aux.bcast_mode == "per_elem":
-        # Vector load of `vsize` elements starting at aux_ptr[row*N + col_j].
+        # vector load of vsize elements from aux_ptr[row*N + col_j]
         return f"({_aux_ptr_var(aux.name)} + {idx}).load(count=vsize, " f"alignment=VEC_BYTES).to({cast})"
     raise AssertionError(f"unknown bcast_mode {aux.bcast_mode!r}")
 
 
-# ---------------------------------------------------------------------------
 # Per-op emitter
-# ---------------------------------------------------------------------------
-
 
 # exp(y) = exp2(y * LOG2E); tanh(x) = 1 - 2/(exp2(2x*LOG2E) + 1).
 _LOG2E = "cutlass.Float32(1.4426950408889634)"
@@ -195,10 +121,9 @@ _TWO_LOG2E = "cutlass.Float32(2.8853900817779268)"
 
 
 def _tanh_expr(v: str) -> str:
-    """Vector tanh via exp2/rcp: 1 - 2/(exp2(2x*log2e) + 1). The DSL's native
-    ``cute.math.tanh`` aborts under vector lowering, but vector ``exp2``/``rcp``
-    with ``fastmath=True`` lower fine (and saturate cleanly: exp2→inf ⇒ rcp→0 ⇒
-    tanh→1; exp2→0 ⇒ tanh→-1)."""
+    """Vector tanh via exp2/rcp: 1 - 2/(exp2(2x*log2e) + 1). Native
+    ``cute.math.tanh`` aborts under vector lowering; exp2/rcp with fastmath
+    lower fine and saturate cleanly (exp2→inf ⇒ tanh→1; exp2→0 ⇒ tanh→-1)."""
     one = f"cutlass.full_like({v}, cutlass.Float32(1.0))"
     two = f"cutlass.full_like({v}, cutlass.Float32(2.0))"
     e2 = f"cute.math.exp2({v} * cutlass.full_like({v}, {_TWO_LOG2E}), fastmath=True)"
@@ -212,13 +137,9 @@ def _emit_op(
     aux_loads: dict[str, str],
     other_in_chain: str | None = None,
 ) -> tuple[list[str], str]:
-    """Emit lines that compute this op, given the previous-step var name.
-
-    ``other_in_chain`` is the var name of the second operand for fan-in
-    binary ops (``op.parent_idx_b is not None``). Otherwise None.
-
-    Returns (new_lines, new_var_name).
-    """
+    """Emit lines computing this op, given the previous-step var name.
+    ``other_in_chain`` = second operand var for fan-in binary ops (else None).
+    Returns (new_lines, new_var_name)."""
     new = f"_op_{idx}"
 
     if op.op == "identity":
@@ -303,7 +224,7 @@ def _emit_op(
     if op.op in {"add", "mul", "sub", "div", "max", "min", "pow", "add_square"}:
         py_op = {"add": "+", "mul": "*", "sub": "-", "div": "/"}.get(op.op)
         if op.parent_idx_b is not None:
-            # Phase-4 fan-in: second operand is another in-chain op result.
+            # fan-in: second operand is another in-chain op result
             assert other_in_chain is not None
             if op.op == "max":
                 return [f"{new} = cute.math.max({prev}, {other_in_chain})"], new
@@ -349,36 +270,27 @@ def _emit_op(
     raise AssertionError(f"unhandled op {op.op!r}")
 
 
-# ---------------------------------------------------------------------------
 # Top-level codegen
-# ---------------------------------------------------------------------------
 
 
 def _emit_round(var: str, out_dtype: Dtype, tag: str) -> tuple[list[str], str]:
-    """Round a register value to a tensor's declared dtype.
-
-    The next op casts this rounded value to its own compute dtype before doing
-    math, which supports both fp32 and int32 pointwise compute.
-    """
+    """Round a register value to a tensor's declared dtype (no-op for fp32)."""
     if out_dtype == "fp32":
         return [], var
     new = f"_r_{tag}"
-    return [f"{new} = ({var}).to({_DSL_DTYPE[out_dtype]})"], new
+    return [f"{new} = ({var}).to({DTYPE_TO_CUTLASS[out_dtype]})"], new
 
 
 def _store_cast_expr(var: str, dtype: Dtype) -> str:
     if dtype == "uint8":
         # GEMM exposes uint8 tensor raw pointers as Int8; bitcast preserves the byte payload.
         return f"({var}).to(cutlass.Uint8).bitcast(cutlass.Int8)"
-    return f"({var}).to({_DSL_DTYPE[dtype]})"
+    return f"({var}).to({DTYPE_TO_CUTLASS[dtype]})"
 
 
 def _emit_tap_store(tap_idx: int, source_var: str, tap_dtype: Dtype) -> list[str]:
-    """Store one tap vector.
-
-    M-major TMA taps scatter the 16x256b fragment; all other paths use the
-    regular `linear_idx` vector store.
-    """
+    """Store one tap vector. M-major TMA taps scatter the 16x256b fragment;
+    all other paths use the regular `linear_idx` vector store."""
     tap_var = f"_tap_{tap_idx}"
     return [
         f"{tap_var} = {_store_cast_expr(source_var, tap_dtype)}",
@@ -396,12 +308,8 @@ def _emit_tap_store(tap_idx: int, source_var: str, tap_dtype: Dtype) -> list[str
 
 
 def _reduction_output_offset_expr(red_idx: int, red: ReductionSpec, value_idx: str) -> str:
-    """Runtime-stride offset for a reduction output.
-
-    Templates receive outputs permuted to internal `(M, N, B)` order, so the
-    runtime wrapper passes the corresponding `(m, n, l)` strides for each
-    reduction tap.
-    """
+    """Runtime-stride offset for a reduction output. Outputs are permuted to
+    internal `(M, N, B)` order; the runtime wrapper passes matching strides."""
     b_extent, m_extent, n_extent = red.dim
     if red.grouped_by_moe:
         l = "cutlass.Int64(group_idx)"
@@ -419,10 +327,9 @@ def _emit_reduction_atomic(
     source_var: str,
 ) -> list[str]:
     src = f"_red_{red_idx}_src"
-    lines = [f"{src} = ({source_var}).to({_DSL_DTYPE[red.compute_dtype]})"]
+    lines = [f"{src} = ({source_var}).to({DTYPE_TO_CUTLASS[red.compute_dtype]})"]
     for i in range(32):
-        # `if cutlass.const_expr(i < vsize)` keeps the emitted code valid for
-        # every compile-time vsize while avoiding a dynamic vector index.
+        # const_expr(i < vsize) keeps emitted code valid for every vsize, no dynamic index
         lines.append(f"if cutlass.const_expr({i} < vsize):")
         val = f"{src}[{i}]"
         offset = _reduction_output_offset_expr(red_idx, red, str(i))
@@ -485,11 +392,8 @@ def _emit_block_quant(
     tap_idx: int,
     batch_index_expr: str = "tile_l",
 ) -> list[str]:
-    """Emit row/N-axis block quantize for one epilogue vector.
-
-    The compiler gates this path so `vsize == block_size`; therefore each
-    vector chunk maps to exactly one scale value.
-    """
+    """Emit row/N-axis block quantize for one epilogue vector. The compiler
+    gates this so `vsize == block_size` — one scale value per vector chunk."""
     lines: list[str] = [
         f"_q_src = ({source_var}).to(cutlass.Float32)",
         "_q_abs = cute.math.abs(_q_src)",
@@ -498,7 +402,7 @@ def _emit_block_quant(
     for i in range(1, 32):
         lines.append(f"if cutlass.const_expr({i} < vsize):")
         lines.append(f"    _q_amax = cute.math.max(_q_amax, _q_abs[{i}])")
-    scale_dtype = _DSL_DTYPE[quant.scale_dtype]
+    scale_dtype = DTYPE_TO_CUTLASS[quant.scale_dtype]
     lines.extend(
         [
             f"_q_scale_f32 = _q_amax * cute.arch.rcp_approx({_quant_output_max(output_dtype)})",
@@ -513,7 +417,7 @@ def _emit_block_quant(
                 f"cutlass.full_like(_q_scaled, {_quant_output_min(output_dtype)})), "
                 f"cutlass.full_like(_q_scaled, {_quant_output_max(output_dtype)}))"
             ),
-            f"vec_out = _q_clamped.to({_DSL_DTYPE[output_dtype]})",
+            f"vec_out = _q_clamped.to({DTYPE_TO_CUTLASS[output_dtype]})",
         ]
     )
     lines.append(f"_q_scale_col = col_j // {quant.block_size}")
@@ -539,7 +443,11 @@ def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
         if chain is None or chain.block_quant is None:
             raise AssertionError("quant scale tap requires FusionChain context")
         q = chain.block_quant
-        b, m, n = q.scale_dim or (chain.matmul.batch, chain.matmul.M, chain.matmul.N // q.block_size)
+        b, m, n = q.scale_dim or (
+            chain.matmul.batch,
+            chain.matmul.M,
+            chain.matmul.N // q.block_size,
+        )
         logical_n = chain.matmul.N // q.block_size
         m_expr = "1" if m == 1 else ("sym_m" if m == chain.matmul.M else str(m))
         n_expr = "1" if n == 1 else (f"(sym_n // {q.block_size})" if n == logical_n else str(n))
@@ -558,15 +466,13 @@ def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
     return f"({m_expr}, {n_expr}, {l_expr})"
 
 
-# Per-op temp-var index base for the mainloop transform, kept far from the
-# epilogue's 0-based indices (and distinct per operand) so snippets that live
-# in the same JIT function never share a variable name — cute type-checks the
-# whole function body. A uses base 900, B uses base 800.
+# Per-op temp-var index base for mainloop transforms, kept distinct per operand
+# and far from the epilogue's 0-based indices so snippets sharing one JIT
+# function never collide on a var name (cute type-checks the whole body).
 _MAINLOOP_IDX_BASE = {"a": 900, "b": 800}
 
 
-# Mainloop identity-cast fast paths
-# more intrinsics can be added here
+# Mainloop identity-cast fast paths (more intrinsics can be added).
 _MAINLOOP_IDENTITY_CAST_INTRINSICS: dict[tuple[Dtype, Dtype], str] = {
     ("int8", "bf16"): "cute.arch.cvt_i8_bf16_intrinsic",
 }
@@ -574,26 +480,15 @@ _MAINLOOP_IDENTITY_CAST_INTRINSICS: dict[tuple[Dtype, Dtype], str] = {
 
 def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
     """Emit the mainloop-fusion transform snippet for one operand
-    (INJECT_MAINLOOP_A / INJECT_MAINLOOP_B).
-
-    Contract with the template, for ``operand in {"a", "b"}``:
-      * the template has already loaded a register vector ``ml_vec_<operand>``
-        of ``ml_vec_elems`` elements (operand dtype) from that operand's SMEM
-        tile;
-      * this snippet defines ``ml_out_<operand>`` — the same vector after the
-        unary op chain, cast back to the operand dtype — which the template
-        stores in place.
-
-    Compute is fp32 throughout (matching the epilogue's semantics); only the
-    final result is rounded back to the matmul input dtype.
-    """
+    (INJECT_MAINLOOP_A/B). Contract: the template loaded ``ml_vec_<operand>``
+    from SMEM; this defines ``ml_out_<operand>`` = the op chain applied in fp32,
+    cast back to the operand dtype, which the template stores in place."""
     ops = chain.mainloop_a_ops if operand == "a" else chain.mainloop_b_ops
     if not ops:
         return "pass"
-    # Mainloop transforms are dtype-preserving (no implicit cast): the result is
-    # rounded back to the operand's own dtype and stored in place.
+    # dtype-preserving: result rounded back to the operand's own dtype in place
     src_dtype = chain.matmul.a_dtype if operand == "a" else chain.matmul.b_dtype
-    ab_dtype = _DSL_DTYPE[src_dtype]
+    ab_dtype = DTYPE_TO_CUTLASS[src_dtype]
     vec_var = f"ml_vec_{operand}"
     out_var = f"ml_out_{operand}"
     f32_var = f"ml_f32_{operand}"
@@ -606,8 +501,7 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         cvt = f"{identity_cast_intrinsic}({vec_var}.ir_value(), ml_vec_elems)"
         return f"{out_var} = cutlass.Vector({cvt}, dtype={ab_dtype})"
     # Scalar-aux loads for binary mainloop ops: broadcast the scalar (loaded
-    # straight from its GMEM pointer — it's a kernel param) to a fp32 vector
-    # matching the operand tile. Scalar only, so no row/col indexing needed.
+    # from its GMEM ptr — a kernel param) to a fp32 vector. Scalar only.
     aux_loads: dict[str, str] = {}
     for op in ops:
         if op.aux is not None:
@@ -622,11 +516,10 @@ def generate_mainloop(chain: FusionChain, operand: str = "a") -> str:
         lines.extend(emit_lines)
         result_var[i] = cur
     terminal_var = result_var[len(ops) - 1]
-    # int -> fp8 fold workaround (foot-gun #3): when the operand is LOADED as an
-    # integer and the MMA reads fp8, the int->fp32 (sitofp) folds into the
-    # fp32->fp8 narrowing and emits an invalid direct int->fp8 cast (NaN). Break
-    # the def-use chain with `+ 0.0` so the fp32 materializes in a register
-    # first. (A two-step .to() does NOT help — must be an arithmetic op.)
+    # int -> fp8 fold workaround (foot-gun #3): int-loaded + fp8 MMA folds the
+    # int->fp32 into the fp32->fp8 narrowing → invalid direct int->fp8 cast
+    # (NaN). Break the def-use chain with `+ 0.0` (a two-step .to() does NOT
+    # help — must be an arithmetic op).
     if load_dtype in ("int8", "uint8") and src_dtype in ("fp8_e4m3", "fp8_e5m2"):
         terminal_var = f"({terminal_var} + cutlass.full_like({terminal_var}, 0.0))"
     lines.append(f"{out_var} = ({terminal_var}).to({ab_dtype})")
@@ -640,16 +533,11 @@ def generate(
     output_elem_bytes: int = 2,
 ) -> EpilogueSnippets:
     """Produce the two hook-site snippets, the extra kernel param list, and
-    all per-tap plumbing the kernel template needs.
-
-    ``vec_bytes_epi`` / ``output_elem_bytes`` come from the compiler — they
-    fix the inner-loop chunk size. Each tap stores ``vsize`` elements per
-    chunk (``vsize = vec_bytes_epi // output_elem_bytes``), so the tap's
-    store alignment is ``vsize * tap_elem_bytes``.
-    """
-    # ---- aux_views snippet ------------------------------------------------
-    # `row` is defined by the kernel template just before this hook
-    # (M-aware: differs for MMA_M=64 vs MMA_M>=128). We just consume it here.
+    all per-tap plumbing. ``vec_bytes_epi`` / ``output_elem_bytes`` (from the
+    compiler) fix the inner-loop chunk size: each tap stores
+    ``vsize = vec_bytes_epi // output_elem_bytes`` elements per chunk."""
+    # aux_views snippet. `row` is defined by the template just before this hook
+    # (M-aware: differs for MMA_M=64 vs MMA_M>=128) — we just consume it.
     aux_lines: list[str] = []
     for aux in chain.aux_tensors:
         aux_lines.append(f"{_aux_ptr_var(aux.name)} = {aux.name}.iterator.raw_ptr()")
@@ -661,20 +549,17 @@ def generate(
 
     aux_views = "\n".join(aux_lines) if aux_lines else "pass"
 
-    # ---- epilogue snippet (interleaves op chain with tap stores) ----------
-
+    # epilogue snippet (interleaves op chain with tap stores)
     body_lines: list[str] = []
     normal_tap_count = sum(not tap.is_reduction and not tap.is_quant_scale for tap in chain.taps)
     tap_idx = 0  # numbered 0..N-1 in `chain.taps` order
 
-    # Per-op result variable name lookup (so an op reading from parent_idx=k
-    # picks up the right name even if op k was an `identity` pass-through).
+    # Per-op result var name lookup (handles `identity` pass-throughs).
     result_var: dict[int, str] = {}
 
-    # Round each GEMM's fp32 accumulator to the matmul output's declared dtype
-    # before any op reads it (no-op when fp32). GEMM 0 binds the legacy name
-    # ``vec_f32`` (so every other template — never multi-GEMM — is unchanged);
-    # GEMMs >0 bind ``vec_f32_<g>`` (defined by the multi-GEMM template).
+    # Round each GEMM's fp32 accumulator to the matmul out_dtype before any op
+    # reads it (no-op when fp32). GEMM 0 binds legacy ``vec_f32`` (so every
+    # non-multi-GEMM template is unchanged); GEMMs >0 bind ``vec_f32_<g>``.
     gemm_var: dict[int, str] = {}
     for g in range(chain.num_gemms):
         src = "vec_f32" if g == 0 else f"vec_f32_{g}"
@@ -684,8 +569,7 @@ def generate(
         gemm_var[g] = var
 
     def _parent_value(ref: int) -> str:
-        """Var name for an op input given its producing-operation reference:
-        a GEMM output (ref < 0 → gemm_var[gemm_index(ref)]) or a prior op."""
+        """Var name for an op input: a GEMM output (ref < 0) or a prior op."""
         if is_gemm_source(ref):
             return gemm_var[gemm_index(ref)]
         return result_var[ref]
@@ -695,8 +579,8 @@ def generate(
         body_lines.extend(_emit_tap_store(tap_idx, gemm_var[0], chain.matmul.out_dtype))
         tap_idx += 1
 
-    # No-epilogue multi-GEMM: store GEMMs >0 to their own outputs (taps); GEMM 0
-    # is the terminal (`vec_out` below). No pointwise ops run (chain.ops empty).
+    # No-epilogue multi-GEMM: GEMMs >0 store to their own outputs (taps);
+    # GEMM 0 is the terminal. No pointwise ops run.
     if chain.per_gemm_outputs is not None:
         for g in range(1, chain.num_gemms):
             body_lines.extend(_emit_tap_store(tap_idx, gemm_var[g], chain.per_gemm_outputs[g]))
@@ -715,8 +599,7 @@ def generate(
             body_lines.extend(cast_lines)
         lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain)
         body_lines.extend(lines)
-        # Round this op's result to its declared output dtype (no-op for fp32)
-        # so the next op — and the tap — observe the rounded value.
+        # Round to the op's out_dtype (no-op for fp32) so the next op + tap see it.
         round_lines, cur = _emit_round(cur, op.out_dtype, str(i))
         body_lines.extend(round_lines)
         result_var[i] = cur
@@ -729,8 +612,8 @@ def generate(
         red_source = _parent_value(red.source_ref)
         body_lines.extend(_emit_reduction_atomic(normal_tap_count + red_idx, red_idx, red, red_source))
 
-    # Terminal cast → `vec_out`. A GEMM-output terminal (ref < 0; the
-    # single-GEMM matmul-only case, ref == -1) → gemm_var; else an op result.
+    # Terminal cast → `vec_out`. GEMM-output terminal (ref < 0) → gemm_var;
+    # else an op result.
     terminal_var = gemm_var[gemm_index(terminal_idx)] if is_gemm_source(terminal_idx) else result_var[terminal_idx]
     if chain.block_quant is not None:
         quant_tap_idx = next(i for i, tap in enumerate(chain.taps) if tap.is_quant_scale)
@@ -748,11 +631,11 @@ def generate(
 
     epilogue = "\n".join(body_lines)
 
-    # ---- aux kernel params (existing) ------------------------------------
+    # aux kernel params
     kernel_params = [f"{aux.name}: cute.Tensor" for aux in chain.aux_tensors]
     host_args = [aux.name for aux in chain.aux_tensors]
 
-    # ---- tap plumbing (one entry per non-terminal output) ----------------
+    # tap plumbing (one entry per non-terminal output)
     taps = chain.taps
     tap_kernel_params = [f"mC_tap_{i}: cute.Tensor" for i in range(len(taps))]
     tap_host_params = [f"c_tap_{i}: cute.Tensor" for i in range(len(taps))]
@@ -761,7 +644,7 @@ def generate(
     for i, tap in enumerate(taps):
         tap_compile_fakes.append(
             f"fake_c_tap_{i} = make_fake_compact_tensor(\n"
-            f"    {_CUTLASS_DTYPE[tap.dtype]},\n"
+            f"    {DTYPE_TO_CUTLASS[tap.dtype]},\n"
             f"    {_tap_fake_shape(tap, chain)},\n"
             f"    stride_order=(1, 0, 2),\n"
             f"    assumed_align=16,\n"
@@ -772,10 +655,9 @@ def generate(
     for i in range(len(taps)):
         tap_ptr_binds.append(f"gC_tap_{i}_ptr = mC_tap_{i}.iterator.raw_ptr()")
         tap_ptr_binds.append(f"VEC_BYTES_TAP_{i} = vec_bytes_tap_{i}")
-    # vsize is shared across the inner loop; each tap's bytes-per-chunk
-    # scales with its element width.
+    # vsize is shared; each tap's bytes-per-chunk scales with its element width.
     vsize = vec_bytes_epi // output_elem_bytes
-    tap_constants = [f"vec_bytes_tap_{i} = {vsize * _DTYPE_BYTES[tap.dtype]}" for i, tap in enumerate(taps)]
+    tap_constants = [f"vec_bytes_tap_{i} = {vsize * DTYPE_BYTES[tap.dtype]}" for i, tap in enumerate(taps)]
 
     mainloop_transform_a = generate_mainloop(chain, "a")
     mainloop_transform_b = generate_mainloop(chain, "b")

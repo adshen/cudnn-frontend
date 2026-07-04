@@ -1,7 +1,4 @@
-"""End-to-end smoke tests: build cudnn graph, jit via cudnn.TBD.gemm, verify vs torch.
-
-Requires a CUDA device. Skipped otherwise.
-"""
+"""End-to-end smoke tests: run the co-located examples, verified vs torch. Needs a GPU."""
 
 from __future__ import annotations
 
@@ -39,5 +36,5 @@ def _load_example(name: str):
 )
 def test_example_runs_and_passes(example: str) -> None:
     mod = _load_example(example)
-    # Each example exposes main(M=, N=, K=) and asserts internally.
+    # each example exposes main(M=, N=, K=) and asserts internally
     mod.main(M=256, N=256, K=128)

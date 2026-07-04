@@ -1,8 +1,5 @@
-"""Tests for the MoE grouped matmul forward pass (mode=NONE).
-
-Covers the analyzer (graph detection, dims, mode rejection) and end-to-end
-correctness vs a torch group-loop reference with uneven + empty groups.
-"""
+"""MoE grouped matmul forward (mode=NONE): analyzer detection + end-to-end
+correctness vs a torch group-loop reference (uneven + empty groups)."""
 
 from __future__ import annotations
 
@@ -17,10 +14,9 @@ from cudnn.TBD.gemm.tile_config import CATALOG
 
 
 class _Plan:
-    """Test handle that JIT-compiles a recorded graph with a forced tile config
-    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
-    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
-    aux_names and is callable with a variant pack."""
+    """JIT-compiles a recorded graph with a forced tile config (bypassing the
+    TBD engine's auto-select). Exposes chain / binding / block_scale / aux_names;
+    callable with a variant pack."""
 
     def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
         self.g = graph
@@ -55,7 +51,7 @@ def _vp_moe(compiled, token, weight, fto, output):
 
 
 _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
-# (config name, cta_group): 2-CTA cluster2x1 (the reference design) + 1-CTA cluster1x1.
+# (config name, cta_group): 2-CTA cluster2x1 (reference) + 1-CTA cluster1x1.
 _GEOMETRIES = [
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
     ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", 1),
@@ -189,8 +185,18 @@ def _build_graph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    tok = g.tensor(
+        name="token",
+        dim=[1, S, K],
+        stride=[S * K, K, 1],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    w = g.tensor(
+        name="weight",
+        dim=[E, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
     fto_groups = E if num_groups is None else num_groups
     fto = g.tensor(
         name="first_token_offset",
@@ -199,7 +205,15 @@ def _build_graph(
         data_type=offset_dt,
     )
     kwargs = {} if token_index is None else {"token_index": token_index}
-    out = g.moe_grouped_matmul(tok, w, fto, mode=mode, compute_data_type=cudnn.data_type.FLOAT, name="moe", **kwargs)
+    out = g.moe_grouped_matmul(
+        tok,
+        w,
+        fto,
+        mode=mode,
+        compute_data_type=cudnn.data_type.FLOAT,
+        name="moe",
+        **kwargs,
+    )
     if reduction_mode is not None:
         red_kwargs = {}
         if reduction_compute_dt is not None:
@@ -326,11 +340,33 @@ def test_analyzer_rejects_gather() -> None:
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    tok = g.tensor(
+        name="token",
+        dim=[1, S, K],
+        stride=[S * K, K, 1],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    w = g.tensor(
+        name="weight",
+        dim=[E, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[E, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.INT32,
+    )
     idx = g.tensor(name="idx", dim=[S, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
-    out = g.moe_grouped_matmul(tok, w, fto, token_index=idx, mode=cudnn.moe_grouped_matmul_mode.GATHER, name="moe")
+    out = g.moe_grouped_matmul(
+        tok,
+        w,
+        fto,
+        token_index=idx,
+        mode=cudnn.moe_grouped_matmul_mode.GATHER,
+        name="moe",
+    )
     out.set_output(True)
     with pytest.raises(NotImplementedError, match="mode=NONE"):
         analyze(g)
@@ -389,8 +425,8 @@ def _block_quant_ref(x, block_size, out_dtype, scale_dtype):
 
 
 def _block_quant_q_atol(scale_dtype) -> float:
-    # Non-power-of-two E4M3 scales use the kernel's approximate reciprocal and
-    # can differ from the torch reference by one smallest E4M3 output step.
+    # Non-pow2 E4M3 scales use the kernel's approximate reciprocal → up to one
+    # smallest E4M3 output step off the torch reference.
     return 1.0 / 512.0 if scale_dtype is torch.float8_e4m3fn else 0.0
 
 
@@ -463,8 +499,8 @@ def _mk_nonpacked_data(S, N, K, E, mode):
     return token, weight, output_storage[:, :, :N]
 
 
-# first_token_offset accepts INT32 or INT64 (both valid cuDNN inputs); the
-# kernel bakes the dtype at JIT and casts reads to Int32 internally.
+# first_token_offset accepts INT32 or INT64; the kernel bakes the dtype at JIT
+# and casts reads to Int32 internally.
 _OFFSET_DTYPES = [
     (cudnn.data_type.INT32, torch.int32),
     (cudnn.data_type.INT64, torch.int64),
@@ -795,8 +831,7 @@ def _ref_bxe(token, weight, offsets, S, N, num_experts, num_groups):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 def test_moe_bxe_gt_e(cfg_name, cta_group) -> None:
-    """num_groups (BxE) > num_experts (E): expert = group % E. Exact shape +
-    offsets from fusionGraphTests.json `Moe_Grouped_Matmul_KNone_Mode`."""
+    """num_groups (BxE) > num_experts (E): expert = group % E."""
     S, N, K, E = 2000, 248, 520, 9
     offset_values = [
         0,
@@ -846,8 +881,8 @@ def test_moe_bxe_gt_e(cfg_name, cta_group) -> None:
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
     offsets = torch.tensor(offset_values, dtype=torch.int32, device="cuda")
 
-    # problem_size E slot is informational; num_experts/num_groups are derived
-    # from weight.shape[0] / first_token_offset.shape[0] inside the call.
+    # num_experts/num_groups are derived from weight.shape[0] /
+    # first_token_offset.shape[0] inside the call.
     compiled(_vp_moe(compiled, token, weight, offsets, output))
     torch.cuda.synchronize()
     torch.testing.assert_close(

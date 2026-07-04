@@ -1,67 +1,9 @@
-"""Correctness sweep over fusion chains (op × broadcast_mode × config × dtype).
+"""Correctness sweep over fused epilogue chains (op × broadcast_mode × config × dtype).
 
-This is the companion regression gate to :mod:`test_matmul_sweep` — that one
-exercises the *matmul kernel* across the (config × dtype × shape) grid for a
-**pure matmul** chain (no epilogue ops); this one exercises the *epilogue
-codegen + template integration* across the (op × broadcast_mode × config ×
-dtype) grid for **fused** chains.
-
-Why a separate file
--------------------
-
-The matmul-sweep parametrizes ``(config, dtype-pair, shape)`` and assumes one
-chain (pure matmul). Fusion sweeps need to vary the **chain** itself, so the
-parametrize order is different (chain outermost so that one compile = one
-chain) and the runtime data has to include aux tensors. Keeping it separate
-also lets a CI tier run just the fusion sweep with ``pytest -k fusion``.
-
-What's covered (target: ~40 cases, <90s on B200)
-------------------------------------------------
-
-1. **API-surface sweep** at one config / one dtype-pair / one shape —
-   one case per (op, broadcast_mode) cell, so every branch in
-   ``epilogue_codegen._emit_op`` and ``_aux_load_expr`` runs end-to-end
-   against a torch reference.
-
-   * Each *unary* op (identity / relu / gelu / gelu_approx_tanh / swish /
-     sigmoid / tanh / abs / neg). ``exp`` is skipped here — the
-     matmul-output magnitude with the small-integer inputs would overflow
-     bf16/fp16; the codegen-snapshot test covers its emission path.
-
-   * Every *binary* op (add / mul / sub) × every broadcast mode (scalar /
-     per_row / per_col / per_elem). ``div`` is omitted — small-integer
-     aux can be zero and dividing by zero is not the bug we're hunting;
-     the codegen-snapshot test covers its emission path.
-
-   * One bias case (``g.bias`` uses a different cuDNN API method than
-     ``g.add`` — they go through different recorder patches; we cover
-     the alias once with the FFN-canonical per-col bias).
-
-2. **Canonical multi-op chains** — exercises chains with 2+ ops, which
-   is where temp-var naming in ``_emit_op`` would silently collide if a
-   refactor went wrong.
-
-3. **Cross-config / cross-dtype subset** — a handful of canonical chains
-   re-run on CTA_2, cluster-MMA m=128, FP16, and FP8→FP16, to catch
-   regressions where epilogue codegen is right but the template-specific
-   epilogue layout (e.g., 2×2 DP for cluster-m=128) wires things wrong.
-
-Tolerance
----------
-
-Small-integer inputs keep the FP32 reduction exact, so the only error
-sources are (a) the deterministic dtype downcast and (b) transcendental
-ops' libm-vs-hardware differences. We use ``atol=1e-1, rtol=1e-2`` —
-generous enough that hardware-tanh / hardware-erf rounding doesn't trip
-a regression, tight enough that any real codegen bug surfaces immediately.
-
-Standalone CLI
---------------
-
-The file is pytest-first but also runs as a script::
-
-    python cudnn.TBD.gemm/tests/test_fusion_sweep.py            # invokes pytest
-    python cudnn.TBD.gemm/tests/test_fusion_sweep.py -k gelu    # forwarded to pytest
+Companion to test_matmul_sweep (pure matmul); this exercises epilogue codegen +
+template integration. Small-integer inputs keep the FP32 reduction exact, so
+atol=1e-1/rtol=1e-2 only has to absorb dtype downcast + transcendental ULPs.
+Runs as a script too (forwards argv to pytest on this file).
 """
 
 from __future__ import annotations
@@ -86,10 +28,9 @@ from cudnn.TBD.gemm.tile_config import CATALOG
 
 
 class _Plan:
-    """Test handle that JIT-compiles a recorded graph with a forced tile config
-    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
-    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
-    aux_names and is callable with a variant pack."""
+    """JIT-compiles a recorded graph with a forced tile config (sweeps pin a
+    config directly). Exposes chain/binding/block_scale/aux_names; callable
+    with a variant pack."""
 
     def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
         self.g = graph
@@ -107,7 +48,13 @@ class _Plan:
 
 
 def _plan(graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
+    return _Plan(
+        graph,
+        config=config,
+        cta_group=cta_group,
+        scheduler=scheduler,
+        force_stg_epi=force_stg_epi,
+    )
 
 
 def _vp(compiled, a, b, outs, *aux):
@@ -120,9 +67,7 @@ def _vp(compiled, a, b, outs, *aux):
     return vp
 
 
-# ---------------------------------------------------------------------------
-# Dtype tables (small dup of test_matmul_sweep — keeps the files independent)
-# ---------------------------------------------------------------------------
+# Dtype tables (dup of test_matmul_sweep to keep the files independent)
 
 _TORCH_DTYPE = {
     "bf16": torch.bfloat16,
@@ -148,10 +93,7 @@ _CUDNN_DTYPE = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Chain spec — list of (op_name, broadcast_mode | None) tuples
-# ---------------------------------------------------------------------------
-
 Op = str  # cuDNN frontend method name, e.g. "relu", "add", "bias"
 Bcast = str  # "scalar" | "per_row" | "per_col" | "per_elem"
 Step = tuple[Op, Bcast | None]  # (op, bcast); bcast=None means unary
@@ -159,7 +101,6 @@ Chain = tuple[Step, ...]
 
 
 def _chain_id(chain: Chain) -> str:
-    """Pretty pytest ID for a chain spec."""
     parts = []
     for op, bcast in chain:
         parts.append(op if bcast is None else f"{op}_{bcast}")
@@ -189,17 +130,30 @@ _NONPACKED_CONFIGS: tuple[str, ...] = (
 _NONPACKED_AUX_BCAST_MODES: tuple[Bcast, ...] = ("per_col", "per_elem")
 
 
-# --- Group A: every unary op (skip `exp` — magnitude overflow with small-int inputs) ---
-_UNARY_CHAINS: tuple[Chain, ...] = tuple(((op, None),) for op in ("identity", "relu", "gelu", "gelu_approx_tanh", "swish", "sigmoid", "tanh", "abs", "neg"))
+# Group A: every unary op (skip `exp` — magnitude overflow with small-int inputs)
+_UNARY_CHAINS: tuple[Chain, ...] = tuple(
+    ((op, None),)
+    for op in (
+        "identity",
+        "relu",
+        "gelu",
+        "gelu_approx_tanh",
+        "swish",
+        "sigmoid",
+        "tanh",
+        "abs",
+        "neg",
+    )
+)
 
-# --- Group B: every binary op × every broadcast mode (skip `div` — div-by-zero) ---
+# Group B: every binary op × every broadcast mode (skip `div` — div-by-zero)
 _BCAST_MODES: tuple[Bcast, ...] = ("scalar", "per_row", "per_col", "per_elem")
 _BINARY_CHAINS: tuple[Chain, ...] = tuple(((op, bcast),) for op in ("add", "mul", "sub") for bcast in _BCAST_MODES)
 
-# --- One `bias` case — different cuDNN API method than `add`; recorder patches them separately ---
+# `bias` uses a different cuDNN API method than `add` (separate recorder patch)
 _BIAS_CHAINS: tuple[Chain, ...] = ((("bias", "per_col"),),)
 
-# --- Group C: canonical multi-op chains (the patterns the examples cover, plus a few stress chains) ---
+# Group C: canonical multi-op chains
 _MULTI_CHAINS: tuple[Chain, ...] = (
     (("bias", "per_col"), ("gelu_approx_tanh", None)),  # FFN canonical
     (("bias", "per_row"), ("swish", None)),  # per-row bias
@@ -218,7 +172,7 @@ _LAYOUT_CHAINS: tuple[Chain, ...] = (
 _DEFAULT_AXIS_CHAINS: tuple[Chain, ...] = _UNARY_CHAINS + _BINARY_CHAINS + _BIAS_CHAINS + _MULTI_CHAINS
 
 
-# --- Cross-config subset: 3 canonical chains × {cta2 basic, cta2 cluster-m=128} ---
+# Cross-config subset: canonical chains × {cta2 basic, cta2 cluster-m=128}
 _CROSS_CONFIG_NAMES: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",  # cta_group=2 baseline
     "CONFIG_sm100_64x64x128_64x64x32_cluster2x4_2ctamma",  # cta2 cluster-m=128 (cta_tile_m=64)
@@ -230,7 +184,7 @@ _CROSS_CHAINS: tuple[Chain, ...] = (
 )
 
 
-# --- Cross-dtype subset: 3 canonical chains × {fp16, fp8_e4m3→fp16} ---
+# Cross-dtype subset: canonical chains × {fp16, fp8_e4m3→fp16}
 _CROSS_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
     ("fp16", "fp16"),
     ("fp8_e4m3", "fp16"),
@@ -318,17 +272,48 @@ _MIXED_DTYPE_BROADCAST_CASES: tuple[MixedDtypeBroadcastCase, ...] = (
     MixedDtypeBroadcastCase((1, 1, _DEFAULT_BATCHED_SHAPE[2]), True, "int32", "fp8_e8m0"),
     MixedDtypeBroadcastCase((1, 1, _DEFAULT_BATCHED_SHAPE[2]), False, "fp8_e4m3", "fp32"),
     MixedDtypeBroadcastCase((_DEFAULT_BATCHED_SHAPE[0], 1, _DEFAULT_BATCHED_SHAPE[2]), True, "int8", "bf16"),
-    MixedDtypeBroadcastCase((_DEFAULT_BATCHED_SHAPE[0], 1, _DEFAULT_BATCHED_SHAPE[2]), False, "fp8_e5m2", "fp16"),
-    MixedDtypeBroadcastCase((1, _DEFAULT_BATCHED_SHAPE[1], _DEFAULT_BATCHED_SHAPE[2]), True, "uint8", "int32"),
-    MixedDtypeBroadcastCase((1, _DEFAULT_BATCHED_SHAPE[1], _DEFAULT_BATCHED_SHAPE[2]), False, "fp8_e8m0", "fp8_e4m3"),
-    MixedDtypeBroadcastCase((_DEFAULT_BATCHED_SHAPE[0], _DEFAULT_BATCHED_SHAPE[1], _DEFAULT_BATCHED_SHAPE[2]), True, "bf16", "fp8_e5m2"),
-    MixedDtypeBroadcastCase((_DEFAULT_BATCHED_SHAPE[0], _DEFAULT_BATCHED_SHAPE[1], _DEFAULT_BATCHED_SHAPE[2]), False, "fp16", "uint8"),
+    MixedDtypeBroadcastCase(
+        (_DEFAULT_BATCHED_SHAPE[0], 1, _DEFAULT_BATCHED_SHAPE[2]),
+        False,
+        "fp8_e5m2",
+        "fp16",
+    ),
+    MixedDtypeBroadcastCase(
+        (1, _DEFAULT_BATCHED_SHAPE[1], _DEFAULT_BATCHED_SHAPE[2]),
+        True,
+        "uint8",
+        "int32",
+    ),
+    MixedDtypeBroadcastCase(
+        (1, _DEFAULT_BATCHED_SHAPE[1], _DEFAULT_BATCHED_SHAPE[2]),
+        False,
+        "fp8_e8m0",
+        "fp8_e4m3",
+    ),
+    MixedDtypeBroadcastCase(
+        (
+            _DEFAULT_BATCHED_SHAPE[0],
+            _DEFAULT_BATCHED_SHAPE[1],
+            _DEFAULT_BATCHED_SHAPE[2],
+        ),
+        True,
+        "bf16",
+        "fp8_e5m2",
+    ),
+    MixedDtypeBroadcastCase(
+        (
+            _DEFAULT_BATCHED_SHAPE[0],
+            _DEFAULT_BATCHED_SHAPE[1],
+            _DEFAULT_BATCHED_SHAPE[2],
+        ),
+        False,
+        "fp16",
+        "uint8",
+    ),
 )
 
 
-# ---------------------------------------------------------------------------
 # Reference (torch fp32, then downcast)
-# ---------------------------------------------------------------------------
 
 _TORCH_UNARY: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "identity": lambda x: x,
@@ -363,18 +348,12 @@ _TORCH_BINARY: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] =
 }
 
 
-# ---------------------------------------------------------------------------
 # Aux shape / runtime data helpers
-# ---------------------------------------------------------------------------
 
 
 def _aux_dim_stride(bcast: Bcast, M: int, N: int) -> tuple[list[int], list[int]]:
-    """cuDNN tensor dim+stride for an aux that broadcasts in the given mode.
-
-    The analyzer in :mod:`graph_analyzer` infers ``bcast_mode`` from these
-    dims (see ``_infer_bcast_mode``), so getting the shape right here is what
-    drives the codegen branch under test.
-    """
+    """cuDNN dim+stride for an aux broadcasting in the given mode. The analyzer
+    infers bcast_mode from these dims, so the shape drives the codegen branch."""
     if bcast == "scalar":
         return [1, 1], [1, 1]
     if bcast == "per_row":
@@ -417,8 +396,7 @@ def _nonpacked_aux_dim_stride(bcast: Bcast, batch: int, M: int, N: int) -> tuple
 
 
 def _mkaux(bcast: Bcast, M: int, N: int, dtype: str, seed: int) -> torch.Tensor:
-    """Small-integer aux tensor. Range matches `_mkdata` so the FP32 reduction
-    is exact and the kernel-vs-torch diff is bounded by transcendental ULPs."""
+    """Small-integer aux; range matches `_mkdata` so the FP32 reduction is exact."""
     torch.manual_seed(seed)
     if bcast == "scalar":
         shape = (1, 1)
@@ -498,7 +476,7 @@ def _mkdata(
     b_major: str = "k",
     out_major: str = "n",
 ):
-    """A, B, C tensors (rank-3 with batch=1). Small-integer inputs ⇒ FP32 matmul is exact."""
+    """A, B, C tensors (rank-3, batch=1). Small-integer inputs ⇒ exact FP32 matmul."""
     torch.manual_seed(seed)
     rng = (-3, 3) if in_dt.startswith("fp8") else (-2, 2)
     a_shape = (1, M, K) if a_major == "k" else (1, K, M)
@@ -584,9 +562,7 @@ def _apply_binary(g: cudnn.pygraph, op: str, lhs, rhs, name: str):
     return getattr(g, op)(a=lhs, b=rhs, name=name)
 
 
-# ---------------------------------------------------------------------------
 # Graph builder — drives the cuDNN frontend API + the recorder
-# ---------------------------------------------------------------------------
 
 
 def _build_graph(
@@ -600,12 +576,9 @@ def _build_graph(
     b_major: str = "k",
     out_major: str = "n",
 ) -> tuple[cudnn.pygraph, list[str]]:
-    """Build a `cudnn.pygraph` for a matmul + the given chain.
-
-    Returns (graph, aux_names) where aux_names is the in-chain order of aux
-    tensors — the call site needs this to pass aux through CompiledFusedGemm
-    in the same order they appear in chain.aux_tensors.
-    """
+    """Build a `cudnn.pygraph` for a matmul + the given chain. Returns
+    (graph, aux_names); aux_names is the in-chain order the call site must
+    pass aux in (matching chain.aux_tensors)."""
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[in_dt],
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -808,7 +781,13 @@ def _build_epilogue_dtype_graph(
     return g
 
 
-def _reference(a: torch.Tensor, b: torch.Tensor, aux_runtime: dict[str, torch.Tensor], chain: Chain, out_dt: str) -> torch.Tensor:
+def _reference(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    aux_runtime: dict[str, torch.Tensor],
+    chain: Chain,
+    out_dt: str,
+) -> torch.Tensor:
     cur = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
     for i, (op, bcast) in enumerate(chain):
         if bcast is None:
@@ -852,9 +831,7 @@ def _rank3_broadcast_reference(
     return cur.to(_TORCH_DTYPE[out_dt])
 
 
-# ---------------------------------------------------------------------------
 # Config lookup
-# ---------------------------------------------------------------------------
 
 
 _NAME_TO_CFG = {c.name: c for c in CATALOG}
@@ -866,12 +843,14 @@ def _resolve(legacy_name):
     """Legacy config-name -> (pure-geometry config, cta_group, scheduler)."""
     m = _LEGACY_RE.match(legacy_name)
     assert m, legacy_name
-    return (_NAME_TO_CFG[m.group(1)], int(m.group(2)), "static" if m.group(3) else "clc")
+    return (
+        _NAME_TO_CFG[m.group(1)],
+        int(m.group(2)),
+        "static" if m.group(3) else "clc",
+    )
 
 
-# ---------------------------------------------------------------------------
 # Test bodies — each parametrized axis is a separate test for clear IDs
-# ---------------------------------------------------------------------------
 
 
 def _run_case(
@@ -895,7 +874,17 @@ def _run_case(
         first = str(e).splitlines()[0] if str(e) else ""
         pytest.fail(f"JIT compile failed: {type(e).__name__}: {first[:200]}", pytrace=False)
 
-    a, b, c = _mkdata(M, N, K, in_dt, out_dt, seed=0, a_major=a_major, b_major=b_major, out_major=out_major)
+    a, b, c = _mkdata(
+        M,
+        N,
+        K,
+        in_dt,
+        out_dt,
+        seed=0,
+        a_major=a_major,
+        b_major=b_major,
+        out_major=out_major,
+    )
     aux_runtime: dict[str, torch.Tensor] = {}
     for i, (op, bcast) in enumerate(chain):
         if bcast is None:
@@ -1041,8 +1030,7 @@ def _run_epilogue_dtype_case(aux_dtype: str, out_dtype: str) -> None:
     torch.cuda.synchronize()
 
     ref = aux.to(torch.float32).expand(1, M, N).to(_TORCH_DTYPE[out_dtype])
-    # Exact compare is intentional: the test values are 1/2, which round-trip
-    # exactly through the covered integer and FP8 storage dtypes.
+    # Exact compare: test values 1/2 round-trip exactly through the covered dtypes.
     torch.testing.assert_close(
         c.to(torch.float32),
         ref.to(torch.float32),
@@ -1071,8 +1059,8 @@ def _run_mixed_dtype_broadcast_case(case: MixedDtypeBroadcastCase) -> None:
     a[:, :, 1] = 1
     b[:, :, 1] = col_bit.unsqueeze(0).to(_TORCH_DTYPE[_DEFAULT_IN_DT])
     if case.out_dtype == "fp8_e8m0":
-        # e8m0 has no mantissa; keep this case at exactly representable 1s so
-        # the test isolates dtype plumbing and broadcast indexing.
+        # e8m0 has no mantissa; use exactly-representable 1s to isolate dtype
+        # plumbing + broadcast indexing.
         a.zero_()
         b.zero_()
         a[:, :, 0] = 1
@@ -1093,8 +1081,7 @@ def _run_mixed_dtype_broadcast_case(case: MixedDtypeBroadcastCase) -> None:
     torch.cuda.synchronize()
 
     ref = (torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32)) + aux.to(torch.float32)).to(_TORCH_DTYPE[case.out_dtype])
-    # Exact compare is intentional: test data is restricted to values that
-    # round-trip exactly for the chosen output dtype.
+    # Exact compare: test data round-trips exactly for the chosen output dtype.
     torch.testing.assert_close(
         c.to(torch.float32),
         ref.to(torch.float32),
@@ -1110,8 +1097,7 @@ def _run_mixed_dtype_broadcast_case(case: MixedDtypeBroadcastCase) -> None:
     ids=[_chain_id(c) for c in _DEFAULT_AXIS_CHAINS],
 )
 def test_fusion_default_axis(chain: Chain) -> None:
-    """One case per (op, broadcast_mode) cell at the default config + dtype +
-    shape. This is the API-surface gate — every codegen branch lights up here."""
+    """API-surface gate: one case per (op, broadcast_mode) cell, default axes."""
     M, N, K = _DEFAULT_SHAPE
     _run_case(M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, _DEFAULT_CONFIG, chain)
 
@@ -1129,7 +1115,7 @@ _M_MAJOR_CHAINS: tuple[Chain, ...] = (
     ids=[_chain_id(c) for c in _M_MAJOR_CHAINS],
 )
 def test_fusion_m_major(chain: Chain) -> None:
-    """Epilogue fusion with M-major output at the default config / dtype / shape."""
+    """Epilogue fusion with M-major output."""
     M, N, K = _DEFAULT_SHAPE
     _run_case(M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, _DEFAULT_CONFIG, chain, out_major="m")
 
@@ -1221,12 +1207,8 @@ def test_batched_rank1_per_col_fusion() -> None:
     ids=[_rank3_broadcast_case_id(c) for c in _RANK3_BROADCAST_CASES],
 )
 def test_rank3_batched_broadcast_patterns(case: Rank3BroadcastCase) -> None:
-    """Rank-3 aux supports every [B/1, M/1, N/1] broadcast pattern.
-
-    `sub` is non-commutative, so running both aux-on-RHS and aux-on-LHS checks
-    that analyzer/codegen preserve the input port direction as well as the
-    broadcast shape.
-    """
+    """Rank-3 aux, every [B/1, M/1, N/1] broadcast pattern. `sub` (non-commutative)
+    covers both aux-on-RHS and aux-on-LHS to check port direction is preserved."""
     _run_rank3_broadcast_case(case)
 
 
@@ -1317,11 +1299,14 @@ def test_zero_stride_epilogue_aux_broadcast(
     _CROSS_CHAINS,
     ids=[_chain_id(c) for c in _CROSS_CHAINS],
 )
-@pytest.mark.parametrize("config_name", _CROSS_CONFIG_NAMES, ids=[n.replace("CONFIG_", "").replace("_sm100", "") for n in _CROSS_CONFIG_NAMES])
+@pytest.mark.parametrize(
+    "config_name",
+    _CROSS_CONFIG_NAMES,
+    ids=[n.replace("CONFIG_", "").replace("_sm100", "") for n in _CROSS_CONFIG_NAMES],
+)
 def test_fusion_cross_config(config_name: str, chain: Chain) -> None:
-    """Canonical chains re-run on non-default configs (CTA_2 baseline + cluster-MMA
-    m=128). Catches template-side bugs that the default-config sweep can't see —
-    e.g., the 2×2 DP TMEM layout for cluster-m=128 vs the standard layout."""
+    """Canonical chains on non-default configs — catches template-side bugs
+    (e.g. the 2×2 DP TMEM layout for cluster-m=128)."""
     M, N, K = _DEFAULT_SHAPE
     _run_case(M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, config_name, chain)
 
@@ -1332,10 +1317,13 @@ def test_fusion_cross_config(config_name: str, chain: Chain) -> None:
     _CROSS_CHAINS,
     ids=[_chain_id(c) for c in _CROSS_CHAINS],
 )
-@pytest.mark.parametrize("in_dt,out_dt", _CROSS_DTYPE_PAIRS, ids=[f"{p[0]}->{p[1]}" for p in _CROSS_DTYPE_PAIRS])
+@pytest.mark.parametrize(
+    "in_dt,out_dt",
+    _CROSS_DTYPE_PAIRS,
+    ids=[f"{p[0]}->{p[1]}" for p in _CROSS_DTYPE_PAIRS],
+)
 def test_fusion_cross_dtype(in_dt: str, out_dt: str, chain: Chain) -> None:
-    """Canonical chains re-run with FP16 and FP8→FP16. Catches dtype-specific
-    codegen bugs (e.g., the cast in `vec_out = (...).to(cutlass.X)` for X=Float16)."""
+    """Canonical chains with FP16 and FP8→FP16 — catches dtype-specific codegen bugs."""
     M, N, K = _DEFAULT_SHAPE
     _run_case(M, N, K, in_dt, out_dt, _DEFAULT_CONFIG, chain)
 
@@ -1557,17 +1545,13 @@ def test_fusion_input_layouts(a_major: str, b_major: str, chain: Chain) -> None:
     ids=[_batched_case_id(c) for c in _BATCHED_FUSION_CASES],
 )
 def test_batched_fusion_default_axis(case: BatchedFusionCase) -> None:
-    """Rank-3 matmul with fused epilogues. Cases cover unary-only fusion,
-    rank-2 aux tensors shared across batch, and rank-3 aux tensors that vary
-    per batch slice."""
+    """Rank-3 matmul + fused epilogues: unary-only, batch-shared aux, and
+    per-batch rank-3 aux."""
     batch, M, N, K = _DEFAULT_BATCHED_SHAPE
     _run_batched_case(batch, M, N, K, _DEFAULT_IN_DT, _DEFAULT_OUT_DT, _DEFAULT_CONFIG, case)
 
 
-# ---------------------------------------------------------------------------
-# Coverage manifest — what this file exercises, programmatically.
-# `python -m cudnn.TBD.gemm.verify --list` reads this.
-# ---------------------------------------------------------------------------
+# Coverage manifest (read by `python -m cudnn.TBD.gemm.verify --list`)
 
 
 @dataclass(frozen=True)
@@ -1602,9 +1586,7 @@ COVERAGE = _CoverageManifest(
 )
 
 
-# ---------------------------------------------------------------------------
 # Standalone CLI shim — forwards remaining argv to pytest on this file
-# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":

@@ -32,9 +32,7 @@ def main(M: int = 256, N: int = 256, K: int = 128) -> None:
     torch.manual_seed(0)
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
-    # Two GMEM outputs (chain.outputs order):
-    #   slot 0 = terminal (Y, FP32 after gelu)
-    #   slot 1 = matmul tap (C, BF16 raw matmul output)
+    # Two GMEM outputs: slot 0 = terminal Y (FP32); slot 1 = matmul tap C (BF16).
     c_term = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     bias_t = torch.randn(1, M, 1, device="cuda", dtype=torch.bfloat16)

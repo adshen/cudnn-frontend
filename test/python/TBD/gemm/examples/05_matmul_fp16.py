@@ -1,14 +1,7 @@
 """Example 05: FP16 matmul + relu.
 
-Same path as 02_matmul_relu.py, but the cudnn graph is built with
-io_data_type=HALF so all inputs and the output are FP16. Exercises the
-dtype-injection path through TileConfig rendering — the generated kernel
-should have `mma_a_dtype = cutlass.Float16` and friends.
-
-Usage:
-
-    source active_tbd.sh
-    python cudnn.TBD.gemm/examples/05_matmul_fp16.py
+Like 02 but io_data_type=HALF (FP16 inputs + output), exercising the FP16
+dtype-injection path through TileConfig rendering.
 """
 
 from __future__ import annotations

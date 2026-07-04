@@ -1,40 +1,9 @@
-"""Benchmark the mixed-input-A mainloop matmul graph vs cuBLAS.
+"""Benchmark the mixed-input-A mainloop matmul (narrow-loaded A cast to the wider
+MMA dtype) vs the equivalent dense cuBLAS matmul on the widened operands.
 
-The graph (cuDNN `MatmulMainloopMixedInputA_abstract`):
+Default: load=int8, tin=tout=bf16. Timing / buffer-rotation / CLI mirror
+benchmark_matmul.py.
 
-    aTensor      : <load_dtype>   (batch, M, K)        ← loaded narrow
-    after_pw0    : <tin>          (batch, M, K) virtual ← identity cast of A
-    bTensor      : <tin>          (batch, K, N)
-    cTensor      : <tout>         (batch, M, N)
-
-    pw_in_mainloop0 : identity(aTensor) -> after_pw0   (the int8->bf16 cast)
-    mm              : after_pw0 @ bTensor -> cTensor   (mathPrec <tcomp>)
-
-The identity pointwise feeding the matmul's A operand is *mainloop fusion*:
-the analyzer walks back through it to the root `aTensor`, so the matmul is
-recorded as a MIXED-INPUT GEMM (A=<load_dtype>, B=<tin>). The compiler picks
-the 12-warp mainloop template and casts A in SMEM before the MMA.
-
-Default dtypes: load=int8, tin=tout=bf16 (an int8-weight / bf16-activation
-mixed GEMM). The cuBLAS reference is the equivalent dense bf16 matmul
-(`torch.matmul(A.to(tin), B.to(tin).T)`), since cuBLAS has no native mixed
-int8×bf16 path — the comparison is "our fused load+cast+MMA" vs "cuBLAS on
-the already-widened operands".
-
-NOTE: the int8→bf16 mainloop cast combo (`int8×bf16→fp32`) is not yet in the
-matmul support table, so until that lands every GEMM config row reports the
-gate's `NotImplementedError`; the cuBLAS reference still measures. The script
-is otherwise identical in shape to `benchmark_matmul.py` and starts producing
-real GEMM numbers the moment the feature is implemented.
-
-Timing modes, buffer rotation, and CLI mirror `benchmark_matmul.py` — read its
-docstring for the `delayed` / `nsys` / `events` and `--rotate-buffers` details.
-
-Usage (from workspace root, after `source active_tbd.sh`):
-
-    python cudnn.TBD.gemm/benchmarks/benchmark_matmul_mixed_input.py                       # delayed (default)
-    python cudnn.TBD.gemm/benchmarks/benchmark_matmul_mixed_input.py --timing nsys
-    python cudnn.TBD.gemm/benchmarks/benchmark_matmul_mixed_input.py --shape 1,8192,8192,8192
     python cudnn.TBD.gemm/benchmarks/benchmark_matmul_mixed_input.py --load-dtype int8 --tin bf16 --tout bf16
 """
 
@@ -57,15 +26,9 @@ import torch
 from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
 from cudnn.TBD.gemm.graph_analyzer import analyze
 from cudnn.TBD.gemm.kernel_registry import candidates as _candidates
-from cudnn.TBD.gemm.tile_config import TileConfig
 
-# ---------------------------------------------------------------------------
-# Dtype tables
-# ---------------------------------------------------------------------------
-#
-# `name -> (cudnn enum, torch dtype, element bytes, is_integer)`. The load
-# dtype is the narrow A storage; tin is the MMA / B dtype; tout is the output.
-
+# name -> (cudnn enum, torch dtype, element bytes, is_integer). load = narrow A
+# storage; tin = MMA / B dtype; tout = output.
 _DTYPES = {
     "int8": (cudnn.data_type.INT8, torch.int8, 1, True),
     "bf16": (cudnn.data_type.BFLOAT16, torch.bfloat16, 2, False),
@@ -82,14 +45,9 @@ def _dt(name: str):
     return _DTYPES[name]
 
 
-# ---------------------------------------------------------------------------
-# Config enumeration — the mainloop templates (CLC 1ctamma / 2ctamma).
-# ---------------------------------------------------------------------------
-#
-# Build a SUPPORTED mainloop chain (bf16 identity(A) @ bf16 B) purely to
-# enumerate config labels via the support funnel — the real mixed-input graph
-# would currently be rejected at stage 2 (mma-type), returning no candidates.
-# Labels reconstruct the `CONFIG_..._Nctamma` form so --configs is shared with
+# Enumerate config labels from a SUPPORTED bf16 mainloop chain — the real
+# mixed-input graph is rejected at the mma-type funnel stage, returning no
+# candidates. Labels reconstruct CONFIG_..._Nctamma so --configs is shared with
 # benchmark_matmul.py.
 
 
@@ -101,7 +59,7 @@ def _enum_chain():
         compute_data_type=cudnn.data_type.FLOAT,
     )
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
-    Ai = g.identity(input=A, name="pw_in_mainloop0")
+    Ai = g.identity(input=A, name="pw_in_mainloop0").set_data_type(cudnn.data_type.BFLOAT16)
     Bt = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
     C = g.matmul(A=Ai, B=Bt, name="mm")
     C.set_output(True)
@@ -109,8 +67,7 @@ def _enum_chain():
 
 
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group, scheduler) for every mainloop
-    matmul strategy that the funnel accepts."""
+    """Label -> (cfg, cta_group, scheduler) for every mainloop strategy the funnel accepts."""
     chain = _enum_chain()
     m = {}
     for t, cfg in _candidates(chain):
@@ -123,15 +80,13 @@ _SPEC_MAP = _build_spec_map()
 
 
 def _vp(handles, a, b, c):
-    """Variant-pack dict {cuDNN tensor: buffer} keyed by the graph's tensors.
-    `a` is the narrow (load-dtype) A root operand."""
+    """Variant-pack dict {tensor: buffer}; `a` is the narrow (load-dtype) A root operand."""
     A, B, C = handles
     return {A: a, B: b, C: c}
 
 
 def _build_plan(g, cfg, name):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile the graph with a forced tile config -> callable kernel."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
 
 
@@ -141,7 +96,7 @@ def _build_plan(g, cfg, name):
 
 
 def _graph_mixed_input(batch: int, M: int, N: int, K: int, load_dt: str, tin_dt: str, tout_dt: str):
-    """The MatmulMainloopMixedInputA graph: identity(A_load) @ B_tin -> C_tout."""
+    """The mixed-input graph: identity(A_load) @ B_tin -> C_tout."""
     cu_load = _dt(load_dt)[0]
     cu_tin = _dt(tin_dt)[0]
     cu_tout = _dt(tout_dt)[0]
@@ -179,11 +134,9 @@ def _cublas_ref(a, b, c, tin_dt: str):
     torch.matmul(a.to(t_tin), b.to(t_tin).transpose(-1, -2), out=c)
 
 
-# ---------------------------------------------------------------------------
-# Buffer rotation — defeat the hot-L2 artifact on small shapes (see
-# benchmark_matmul.py for the rationale).
-# ---------------------------------------------------------------------------
-
+# Buffer rotation — rotate timed launches across independent tensor copies so a
+# kernel doesn't re-read the prior launch's data from a hot L2 (inflates
+# small-shape TFLOPS). See benchmark_matmul.py.
 _L2_BYTES_B200 = 126 * 1024 * 1024
 
 
@@ -229,16 +182,7 @@ def _rotating(fn_of_buf: Callable, pool: list) -> Callable:
     return lambda i: fn_of_buf(pool[i % n])
 
 
-def _compatible(cfg: TileConfig, M: int, N: int, K: int, tin_dt: str) -> bool:
-    # K tile governed by the MMA dtype (tin), not the narrow load dtype.
-    tm, tn = cfg.cgrp_tile_mn
-    tk = cfg.cta_tile_k(elem_bytes=_dt(tin_dt)[2])
-    return M % tm == 0 and N % tn == 0 and K % tk == 0
-
-
-# ---------------------------------------------------------------------------
-# Timing (events / delayed) — identical to benchmark_matmul.py
-# ---------------------------------------------------------------------------
+# Timing (events / delayed) — identical to benchmark_matmul.py.
 
 
 def _time_ms_events(timed_fn, warmup_fn, *, warmup, iters) -> float:
@@ -435,7 +379,7 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf, load_dt, tin_dt, tout_dt) 
     config_names = configs or list(_SPEC_MAP)
     for name in config_names:
         cfg = name_to_cfg.get(name)
-        if cfg is None or not _compatible(cfg, M, N, K, tin_dt):
+        if cfg is None:
             continue
         try:
             g, h = _graph_mixed_input(B, M, N, K, load_dt, tin_dt, tout_dt)
@@ -464,11 +408,22 @@ def main() -> int:
     parser.add_argument("--load-dtype", default="int8", help="A storage dtype (default int8)")
     parser.add_argument("--tin", default="bf16", help="compute / B dtype (default bf16)")
     parser.add_argument("--tout", default="bf16", help="output dtype (default bf16)")
-    parser.add_argument("--configs", default=None, help="comma-separated config names (default: every mainloop CATALOG entry)")
-    parser.add_argument("--timing", choices=("delayed", "events", "nsys"), default="delayed")
-    parser.add_argument("--stream", action="store_true", help="print each config's result as it finishes (events/delayed only)")
     parser.add_argument(
-        "--rotate-buffers", default="auto", metavar="N", help="independent tensor copies to rotate timed launches across " "(default 'auto'; 1 disables)."
+        "--configs",
+        default=None,
+        help="comma-separated config names (default: every mainloop CATALOG entry)",
+    )
+    parser.add_argument("--timing", choices=("delayed", "events", "nsys"), default="delayed")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="print each config's result as it finishes (events/delayed only)",
+    )
+    parser.add_argument(
+        "--rotate-buffers",
+        default="auto",
+        metavar="N",
+        help="independent tensor copies to rotate timed launches across " "(default 'auto'; 1 disables).",
     )
     parser.add_argument("--_nsys-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -513,8 +468,17 @@ def main() -> int:
         return f"  {name:50s} {tflops:8.2f}   {ms:7.3f}   {ratio:>9.2f}×"
 
     if args.timing == "nsys":
-        print(f"  [timing: nsys median kernel duration]\n")
-        kern_times = _nsys_run_and_parse(args.shape, config_names, args.warmup, args.iters, nbuf, load_dt, tin_dt, tout_dt)
+        print("  [timing: nsys median kernel duration]\n")
+        kern_times = _nsys_run_and_parse(
+            args.shape,
+            config_names,
+            args.warmup,
+            args.iters,
+            nbuf,
+            load_dt,
+            tin_dt,
+            tout_dt,
+        )
 
         cublas_hit = _find_cublas_time(kern_times)
         if cublas_hit:
@@ -530,9 +494,6 @@ def main() -> int:
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            if not _compatible(cfg, M, N, K, tin_dt):
-                rows.append((name, 0.0, float("inf"), "incompatible"))
-                continue
             matches = [(k, v) for k, v in kern_times.items() if _match_kernel_name(k, name)]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))
@@ -542,13 +503,13 @@ def main() -> int:
     else:
         timer = _time_ms_delayed if args.timing == "delayed" else _time_ms_events
         if args.timing == "delayed":
-            print(f"  [timing: events bracketed around delayed back-to-back launches]\n")
+            print("  [timing: events bracketed around delayed back-to-back launches]\n")
         else:
-            print(f"  [timing: torch.cuda.Event wall-clock around python loop " f"(~50us/call overhead)]\n")
+            print("  [timing: torch.cuda.Event wall-clock around python loop " "(~50us/call overhead)]\n")
         wa, wb, wc = _mkdata(B, M, N, K, load_dt, tin_dt, tout_dt)
         pool = _mkdata_pool(B, M, N, K, load_dt, tin_dt, tout_dt, nbuf)
         if args.stream:
-            print(f"  ▶ running cuBLAS reference ...", flush=True)
+            print("  ▶ running cuBLAS reference ...", flush=True)
         cublas_ms = timer(
             _rotating(lambda t: _cublas_ref(t[0], t[1], t[2], tin_dt), pool),
             lambda: _cublas_ref(wa, wb, wc, tin_dt),
@@ -557,15 +518,16 @@ def main() -> int:
         )
         cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12
         if args.stream:
-            print(_fmt_row("cuBLAS (reference)", cublas_tflops, cublas_ms, "", cublas_tflops), flush=True)
+            print(
+                _fmt_row("cuBLAS (reference)", cublas_tflops, cublas_ms, "", cublas_tflops),
+                flush=True,
+            )
 
         ctx_dead = False
         for name in config_names:
             cfg = name_to_cfg.get(name)
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
-            elif not _compatible(cfg, M, N, K, tin_dt):
-                row = (name, 0.0, float("inf"), "incompatible")
             elif ctx_dead:
                 row = (name, 0.0, float("inf"), "skipped (CUDA context dead)")
             else:
@@ -575,7 +537,10 @@ def main() -> int:
                     g, h = _graph_mixed_input(B, M, N, K, load_dt, tin_dt, tout_dt)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
-                        _rotating(lambda t, _plan=plan, _h=h: _plan(_vp(_h, t[0], t[1], t[2])), pool),
+                        _rotating(
+                            lambda t, _plan=plan, _h=h: _plan(_vp(_h, t[0], t[1], t[2])),
+                            pool,
+                        ),
                         lambda _plan=plan, _h=h: _plan(_vp(_h, wa, wb, wc)),
                         warmup=args.warmup,
                         iters=args.iters,

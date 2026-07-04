@@ -1,14 +1,7 @@
-"""Correctness for the fused SwiGLU block — cuDNN ``DualMatmulSiluMulDequant``:
+"""Fused SwiGLU (cuDNN DualMatmulSiluMulDequant): out = silu(a@b0) * (a@b1) * scale.
 
-    c0 = a @ b0                                   # mm0 (matmul, mathPrec=Tcomp)
-    c1 = a @ b1                                   # mm1 (matmul)
-    c0silu = silu(c0)                             # CUDNN_POINTWISE_SWISH_FWD
-    mul = c0silu * c1                             # CUDNN_POINTWISE_MUL
-    out = mul * scaleFactor                       # CUDNN_POINTWISE_MUL  (dequant)
-
-A is shared by both GEMMs; b0/b1 distinct. Virtual intermediates are fp32; the
-final output is Tout. Run through the multi-GEMM 1ctamma path and check against
-a torch reference at the spec's rel/abs tolerances.
+A is shared by both GEMMs; b0/b1 distinct. Runs the multi-GEMM path, checked vs
+a torch reference.
 """
 
 from __future__ import annotations
@@ -25,10 +18,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU
 
 
 class _Plan:
-    """Test handle that JIT-compiles a recorded graph with a forced tile config
-    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
-    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
-    aux_names and is callable with a variant pack."""
+    """JIT-compiles a recorded graph with a forced tile config (bypassing the
+    TBD engine's auto-select). Exposes chain / binding / block_scale / aux_names;
+    callable with a variant pack."""
 
     def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
         self.g = graph
@@ -50,8 +42,8 @@ def _plan(graph, config=None, cta_group=2, scheduler="clc"):
 
 
 def _vp_mg(compiled, gemm_pairs, outs, *aux):
-    """Multi-GEMM variant-pack dict from the compiled binding (dedup pairs by
-    tensor identity → distinct A/B slots, + outputs + aux)."""
+    """Multi-GEMM variant-pack dict: dedup pairs by identity → distinct A/B slots,
+    + outputs + aux."""
     bd = compiled.binding
     a_seen, b_seen = [], []
     for ag, bg in gemm_pairs:
@@ -74,13 +66,12 @@ _TORCH_DT = {"bf16": torch.bfloat16, "fp16": torch.float16}
 # N=128 cta_group=1 geometry — small enough that dual-GEMM (2 acc) and triple fit.
 _CFG_N128 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
 _CFG_N256 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
-# cluster2x1 (cgrp_size_m=2) N=256 geometry for the 2-CTA-MMA templates.
+# cluster2x1 N=256 geometry for the 2-CTA-MMA templates.
 _CFG_N256_C2 = next(
     c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 2 and c.cgrp_size_n == 1
 )
 
-# Every plain-matmul template strategy that supports multi-GEMM: (cta_group,
-# scheduler, config). 1ctamma uses cluster1x1, 2ctamma uses cluster2x1.
+# Every multi-GEMM-capable plain-matmul strategy: (label, cta_group, scheduler, config).
 _STRATEGIES = [
     ("1ctamma-clc", 1, "clc", _CFG_N256),
     ("1ctamma-static", 1, "static", _CFG_N256),
@@ -98,7 +89,12 @@ def _build_swiglu(B, M, N, K, in_dt, out_dt):
     aT = g.tensor(name="aTensor", dim=[B, M, K], stride=[M * K, K, 1])
     b0T = g.tensor(name="b0Tensor", dim=[B, K, N], stride=[K * N, 1, K])
     b1T = g.tensor(name="b1Tensor", dim=[B, K, N], stride=[K * N, 1, K])
-    sf = g.tensor(name="scaleFactor", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    sf = g.tensor(
+        name="scaleFactor",
+        dim=[1, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.FLOAT,
+    )
     c0 = g.matmul(A=aT, B=b0T, name="mm0")
     c1 = g.matmul(A=aT, B=b1T, name="mm1")
     c0silu = g.swish(input=c0, name="silu0")
@@ -122,7 +118,12 @@ def _run(B, M, N, K, in_dt, out_dt, cfg, *, seed=0, cta_group=1, scheduler="clc"
     b1 = torch.randn(B, N, K, device="cuda", dtype=_TORCH_DT[in_dt]) * 0.4
     scale = torch.tensor([[[0.5]]], device="cuda", dtype=torch.float32)
     out = torch.zeros(B, M, N, device="cuda", dtype=_TORCH_DT[out_dt])
-    compiled = _plan(_build_swiglu(B, M, N, K, in_dt, out_dt), config=cfg, cta_group=cta_group, scheduler=scheduler)
+    compiled = _plan(
+        _build_swiglu(B, M, N, K, in_dt, out_dt),
+        config=cfg,
+        cta_group=cta_group,
+        scheduler=scheduler,
+    )
     compiled(_vp_mg(compiled, [(a, b0), (a, b1)], out, scale))
     torch.cuda.synchronize()
     return out, _reference(a, b0, b1, scale, out_dt)
@@ -152,9 +153,18 @@ def _nonpacked_inputs(B, M, N, K, in_dt, out_dt, mode):
 
 @pytest.mark.parametrize("label,cta_group,scheduler,cfg", _STRATEGIES, ids=[s[0] for s in _STRATEGIES])
 def test_swiglu_all_templates(label, cta_group, scheduler, cfg) -> None:
-    """The SwiGLU block runs correctly on every multi-GEMM-capable matmul
-    template: 1ctamma / 2ctamma × clc / static."""
-    out, ref = _run(512, 256, 256, 128, "bf16", "bf16", cfg, cta_group=cta_group, scheduler=scheduler)
+    """SwiGLU on every multi-GEMM template: 1ctamma / 2ctamma × clc / static."""
+    out, ref = _run(
+        512,
+        256,
+        256,
+        128,
+        "bf16",
+        "bf16",
+        cfg,
+        cta_group=cta_group,
+        scheduler=scheduler,
+    )
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-1)
 
 
@@ -163,7 +173,7 @@ def test_swiglu_all_templates(label, cta_group, scheduler, cfg) -> None:
     [
         (1, 256, 256, 128),
         (1, 512, 256, 256),
-        (1, 384, 128, 128),  # M not a tile multiple (TMA zero-fill)
+        (1, 384, 128, 128),  # M not a tile multiple
     ],
 )
 def test_swiglu_bf16(B, M, N, K) -> None:
@@ -178,7 +188,7 @@ def test_swiglu_fp16() -> None:
 
 
 def test_swiglu_batched() -> None:
-    """B>1: independent same-shape SwiGLU blocks (gemm_B in the spec)."""
+    """B>1: independent same-shape SwiGLU blocks."""
     out, ref = _run(2, 256, 256, 128, "bf16", "bf16", _CFG_N256)
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-1)
 

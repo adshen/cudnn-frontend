@@ -1,47 +1,11 @@
 """Functional-verification driver for CI and agent-callable correctness gates.
 
-Why this exists
----------------
-
-The project ships several correctness gates:
-
-* unit tests (``cudnn.TBD.gemm/tests/test_{fusion_ir,graph_analyzer,compiler,
-  epilogue_codegen,tile_config,smoke}.py``)
-* matmul sweep (``test_matmul_sweep.py`` — pure matmul × configs × dtypes ×
-  shapes; ~60s default, ~30min with ``CUDNN_GEMM_TEST_FULL=1``)
-* fusion sweep (``test_fusion_sweep.py`` — ops × broadcast modes × ...; ~50s)
-* end-to-end examples (``examples/01..06_*.py``)
-
-For CI to be reliable — and for an *agent* changing codegen or template code to
-know whether its diff broke anything — there needs to be one entrypoint that:
-
-* picks the right subset for the tier (smoke / quick / full)
-* runs all gates with consistent env (env vars, working dir, kernel cache)
-* emits a structured machine-readable summary alongside the pretty-printed one
-* returns a clean exit code
-
-That's this module. Usage::
-
-    python -m cudnn.TBD.gemm.verify                       # default: quick tier
-    python -m cudnn.TBD.gemm.verify --tier smoke          # fast, no GPU sweep
-    python -m cudnn.TBD.gemm.verify --tier full           # everything, ~30min
-    python -m cudnn.TBD.gemm.verify --json                # machine-readable
-    python -m cudnn.TBD.gemm.verify --list                # coverage manifest
-    python -m cudnn.TBD.gemm.verify -k bias_per_col       # forward pytest -k
-
-Tier scope
-----------
-
-* ``smoke``  — unit tests. <30s. No GPU sweep, no examples.
-              The fastest signal that codegen / IR / analyzer didn't break.
-* ``quick``  — smoke + default matmul sweep + default fusion sweep + all 6
-              examples. <5min on B200. The standard regression gate.
-* ``full``   — quick + ``CUDNN_GEMM_TEST_FULL=1`` matmul sweep (384 configs).
-              ~30min. The pre-release / nightly gate.
-
-Exit code is 0 if every required gate passes, 1 if any real failure (xfail
-strict-pass also surfaces as failure), 2 if the harness itself broke before
-running gates.
+One entrypoint that runs the right gate subset per tier with consistent env and
+emits both a pretty and a machine-readable summary. Tiers: ``smoke`` (unit
+tests, <30s), ``quick`` (+ sweeps + examples, <5min), ``full`` (+ full 384-config
+matmul sweep, ~30min). Exit code 0 = clean, 1 = real failure (incl. strict
+xpass), 2 = harness broke. Usage: ``python -m cudnn.TBD.gemm.verify [--tier ...]
+[--json] [--list] [-k EXPR]``.
 """
 
 from __future__ import annotations
@@ -63,8 +27,7 @@ from xml.etree import ElementTree
 
 
 _THIS_FILE = Path(__file__).resolve()
-# python/cudnn/TBD/gemm/verify.py -> parents[4] = cudnn-frontend root.
-# Tests + examples live under test/python/TBD/gemm/ in the frontend tree.
+# parents[4] = cudnn-frontend root; tests/examples under test/python/TBD/gemm/.
 _REPO_ROOT = _THIS_FILE.parents[4]
 _TESTS_DIR = _REPO_ROOT / "test" / "python" / "TBD" / "gemm"
 _EXAMPLES_DIR = _TESTS_DIR / "examples"
@@ -79,10 +42,8 @@ _EXAMPLES_DIR = _TESTS_DIR / "examples"
 class GateResult:
     """Outcome of one named gate (one pytest run or one example).
 
-    `passed` counts unmarked passes; `xfailed` is expected failures (counted
-    separately so an agent can see they're known-issue without flagging them
-    as regressions). `xpassed` (unexpected passes when strict=True) is a real
-    failure — they show up in `failures` too.
+    ``xfailed`` = expected failures (known-issue, not regressions); ``xpassed``
+    (strict unexpected pass) is a real failure and also appears in ``failures``.
     """
 
     name: str
@@ -93,7 +54,7 @@ class GateResult:
     xfailed: int = 0
     xpassed: int = 0
     failures: list[dict] = dataclasses.field(default_factory=list)
-    error: str | None = None  # set when the gate itself crashed (subprocess died)
+    error: str | None = None  # set when the gate itself crashed
 
     @property
     def total(self) -> int:
@@ -160,17 +121,11 @@ class TierResult:
 def _parse_junit(xml_path: Path) -> tuple[int, int, int, int, int, list[dict]]:
     """Return (passed, failed, skipped, xfailed, xpassed, failures).
 
-    pytest JUnit XML encodes xfail/xpass via the ``skipped`` element with a
-    ``type=pytest.xfail`` (xfail-passing-or-failing). We disambiguate by
-    looking at whether the testcase also has a ``failure`` element:
-    * skipped + type=pytest.xfail + no failure  -> xfailed (clean, known-issue)
-    * skipped + type=pytest.xfail + with failure -> xpassed strict (regression!)
-    * failure (no skipped)                      -> failed
-    * skipped (no xfail type)                   -> skipped
+    JUnit encodes xfail via ``skipped type=pytest.xfail``; a strict xpass is
+    reported as a ``failure`` (→ counted as failed above).
     """
     tree = ElementTree.parse(xml_path)
     root = tree.getroot()
-    # JUnit format puts testsuite[s] -> testcase nodes.
     testcases = root.findall(".//testcase")
     passed = failed = skipped = xfailed = xpassed = 0
     failures: list[dict] = []
@@ -194,16 +149,12 @@ def _parse_junit(xml_path: Path) -> tuple[int, int, int, int, int, list[dict]]:
         if skip is not None:
             stype = skip.get("type", "")
             if stype.endswith("xfail"):
-                # strict-xpass: pytest reports the case as failure under JUnit
-                # (we already handled `failure` above), so a `skipped` w/
-                # xfail type here is an actual xfailed (known issue, clean).
-                xfailed += 1
+                xfailed += 1  # strict xpass is a `failure`, handled above
             else:
                 skipped += 1
             continue
         if fail is not None:
-            # Could be a regular failure, or a strict xpass (pytest reports
-            # strict xpass as a failure). Either way it's a regression.
+            # Regular failure or strict xpass — either way a regression.
             failed += 1
             msg = (fail.get("message") or "").splitlines()[0][:300]
             failures.append({"id": case_id, "kind": "fail", "msg": msg})
@@ -258,8 +209,7 @@ def _run_pytest(
     duration = time.monotonic() - start
 
     if not junit_path.exists():
-        # pytest crashed before emitting XML (e.g., collection error). Surface
-        # the last lines of stderr to make the error self-explanatory.
+        # pytest crashed before emitting XML (e.g. collection error).
         tail = (proc.stderr or proc.stdout or "").splitlines()[-20:]
         return GateResult(
             name=name,
@@ -356,14 +306,14 @@ def _run_tier(tier: str, pytest_filter: str | None = None) -> TierResult:
     start = time.monotonic()
     gates: list[GateResult] = []
 
-    # Common pytest extras: `-k` filter forwards to every pytest gate.
+    # `-k` filter forwards to every pytest gate.
     extra = ["-k", pytest_filter] if pytest_filter else []
 
     # smoke: unit tests.
     if tier in ("smoke", "quick", "full"):
         gates.append(_run_pytest("unit_tests", _UNIT_TEST_FILES, extra))
 
-    # quick: + matmul sweep (default) + fusion sweep + examples.
+    # quick: + matmul sweep + fusion sweep + examples.
     if tier in ("quick", "full"):
         gates.append(
             _run_pytest(
@@ -405,11 +355,11 @@ def _run_tier(tier: str, pytest_filter: str | None = None) -> TierResult:
 
 
 def _load_test_module(path: Path) -> object:
-    """Load a test file by absolute path (tests/ isn't a Python package).
+    """Load a test file by absolute path (tests/ isn't a package).
 
-    Registering the module in ``sys.modules`` before ``exec_module`` is
-    required because the test files use ``@dataclass(frozen=True)`` and
-    dataclasses look up ``sys.modules[cls.__module__]`` during class build.
+    Register in ``sys.modules`` before ``exec_module`` — the test files use
+    ``@dataclass(frozen=True)``, which looks up ``sys.modules[cls.__module__]``
+    during class build.
     """
     import importlib.util
 
@@ -423,11 +373,10 @@ def _load_test_module(path: Path) -> object:
 
 
 def _coverage_manifest() -> dict:
-    """Programmatic snapshot of what each tier exercises.
+    """Snapshot of what each tier exercises.
 
-    Loads both sweep test modules by file path (they read torch/cuDNN at import
-    time, so this only works in the activated env) to keep the manifest in sync
-    if those test files are edited.
+    Loads both sweep modules by path (they import torch/cuDNN, so activated-env
+    only) to keep the manifest in sync with the test files.
     """
     matmul_sweep = _load_test_module(_TESTS_DIR / "test_matmul_sweep.py")
     fusion_sweep = _load_test_module(_TESTS_DIR / "test_fusion_sweep.py")
@@ -490,7 +439,7 @@ def _coverage_manifest() -> dict:
 
 
 def _print_human(tier: TierResult, *, file=sys.stderr) -> None:
-    """Pretty summary. Goes to stderr by default so stdout stays JSON-clean."""
+    """Pretty summary. stderr by default so stdout stays JSON-clean."""
 
     def w(s: str = "") -> None:
         print(s, file=file)

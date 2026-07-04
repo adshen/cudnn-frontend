@@ -1,17 +1,5 @@
-"""Fused dual MoE grouped matmul + SwiGLU — cuDNN ``Dual_Grouped_Matmul_Swiglu``:
-
-    c0 = moe_grouped_matmul(token, w0, fto)      # moe0
-    c1 = moe_grouped_matmul(token, w1, fto)      # moe1 (shares token + fto)
-    c0silu = silu(c0)                            # CUDNN_POINTWISE_SWISH_FWD
-    mul = c0silu * c1                            # CUDNN_POINTWISE_MUL
-    out = mul * scaleFactor                      # CUDNN_POINTWISE_MUL (dequant)
-
-Two grouped matmuls run in parallel sharing the token (A) and the single
-``first_token_offset`` (so both have identical routed-group layout); the weights
-(B) are distinct. Both feed one pointwise epilogue DAG. Multi-GEMM extension of
-the MoE grouped matmul pipeline (1ctamma + 2ctamma). Checked against a torch
-group-loop reference at the spec's rel/abs tolerances.
-"""
+"""Fused dual MoE grouped matmul + SwiGLU: two grouped matmuls sharing token (A)
+and first_token_offset feed one pointwise epilogue DAG (multi-GEMM, 1/2ctamma)."""
 
 from __future__ import annotations
 
@@ -26,10 +14,7 @@ from cudnn.TBD.gemm.tile_config import CATALOG
 
 
 class _Plan:
-    """Test handle that JIT-compiles a recorded graph with a forced tile config
-    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
-    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
-    aux_names and is callable with a variant pack."""
+    """JIT-compiles a recorded graph with a forced tile config; callable with a variant pack."""
 
     def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
         self.g = graph
@@ -51,8 +36,8 @@ def _plan(graph, config=None, cta_group=2, scheduler="clc"):
 
 
 def _vp_moe_mg(compiled, gemm_pairs, fto, outs, *aux):
-    """MoE multi-GEMM variant-pack dict from the binding (dedup (token, weight)
-    pairs → distinct A/B slots; + first_token_offset + outputs + aux)."""
+    """MoE multi-GEMM variant-pack dict: dedup (token, weight) pairs → distinct
+    A/B slots, + first_token_offset + outputs + aux."""
     bd = compiled.binding
     a_seen, b_seen = [], []
     for ag, bg in gemm_pairs:
@@ -69,7 +54,7 @@ def _vp_moe_mg(compiled, gemm_pairs, fto, outs, *aux):
     return vp
 
 
-# (config name, cta_group): 1-CTA cluster1x1 + 2-CTA cluster2x1 (reference design).
+# (config name, cta_group): 1-CTA cluster1x1 + 2-CTA cluster2x1 (reference design)
 _GEOMETRIES = [
     ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", 1),
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
@@ -91,13 +76,52 @@ def _build_graph(
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    w0 = g.tensor(name="weight0", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    w1 = g.tensor(name="weight1", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="first_token_offset", dim=[num_groups, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
-    sf = g.tensor(name="scaleFactor", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
-    c0 = g.moe_grouped_matmul(tok, w0, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe0")
-    c1 = g.moe_grouped_matmul(tok, w1, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe1")
+    tok = g.tensor(
+        name="token",
+        dim=[1, S, K],
+        stride=[S * K, K, 1],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    w0 = g.tensor(
+        name="weight0",
+        dim=[E, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    w1 = g.tensor(
+        name="weight1",
+        dim=[E, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[num_groups, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.INT32,
+    )
+    sf = g.tensor(
+        name="scaleFactor",
+        dim=[1, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.FLOAT,
+    )
+    c0 = g.moe_grouped_matmul(
+        tok,
+        w0,
+        fto,
+        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        compute_data_type=cudnn.data_type.FLOAT,
+        name="moe0",
+    )
+    c1 = g.moe_grouped_matmul(
+        tok,
+        w1,
+        fto,
+        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        compute_data_type=cudnn.data_type.FLOAT,
+        name="moe1",
+    )
     c0silu = g.swish(input=c0, name="silu0")
     mul = g.mul(a=c0silu, b=c1, name="mul0")
     dq = g.mul(a=mul, b=sf, name="dequant0")
@@ -130,9 +154,7 @@ def _ref(token, w0, w1, offsets, scale, S, N, num_experts, num_groups):
     return out.to(torch.bfloat16)
 
 
-# --------------------------------------------------------------------------- #
-# Analyzer (no GPU needed)
-# --------------------------------------------------------------------------- #
+# --- Analyzer (no GPU needed) ---
 
 
 def test_analyzer_detects_dual_moe() -> None:
@@ -144,7 +166,6 @@ def test_analyzer_detects_dual_moe() -> None:
     assert chain.moe.num_experts == 9
     assert (chain.matmul.M, chain.matmul.N, chain.matmul.K) == (2000, 248, 520)
     assert [o.op for o in chain.ops] == ["swish", "mul", "mul"]
-    # single fused output (the terminal)
     assert len(chain.outputs) == 1 and chain.outputs[0].source == "terminal"
 
 
@@ -166,16 +187,13 @@ def test_analyzer_detects_dual_moe_reduction() -> None:
     assert [o.source for o in chain.outputs] == ["terminal", "reduction_0"]
 
 
-# --------------------------------------------------------------------------- #
-# End-to-end correctness (GPU)
-# --------------------------------------------------------------------------- #
+# --- End-to-end correctness (GPU) ---
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 def test_dual_moe_swiglu_exact_case(cfg_name, cta_group) -> None:
-    """The ``Dual_Grouped_Matmul_Swiglu_KNone_Mode`` spec case: S=2000, N=248,
-    K=520, E=9, 36 routed groups (BxE > E) with custom offsets."""
+    """Spec case: S=2000, N=248, K=520, E=9, 36 routed groups (BxE > E)."""
     S, N, K, E = 2000, 248, 520, 9
     offset_values = [
         0,
@@ -243,7 +261,7 @@ def test_dual_moe_swiglu_exact_case(cfg_name, cta_group) -> None:
     "group_sizes",
     [
         [64, 0, 200, 128, 100, 12, 196, 68],  # uneven + one empty group
-        [96, 96, 96, 96, 96, 96, 96, 96],  # balanced
+        [96, 96, 96, 96, 96, 96, 96, 96],
     ],
 )
 def test_dual_moe_swiglu_groups(group_sizes, cfg_name, cta_group) -> None:

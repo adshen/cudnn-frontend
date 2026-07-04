@@ -157,8 +157,24 @@ def _kernel(
 
     sA_elems = cta_tile_mnk[0] * cgrp_tile_mnk[2]
     sB_elems = cta_tile_mnk[1] * cgrp_tile_mnk[2]
-    smem_a_list = [cutlass.Array(ab_dtype, sA_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024) for _ in range(num_a_operands)]
-    smem_b_list = [cutlass.Array(ab_dtype, sB_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024) for _ in range(num_b_operands)]
+    smem_a_list = [
+        cutlass.Array(
+            ab_dtype,
+            sA_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_a_operands)
+    ]
+    smem_b_list = [
+        cutlass.Array(
+            ab_dtype,
+            sB_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_b_operands)
+    ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
     epi_subtile_elems = cta_tile_mnk[0] * epi_tile_mn[1]
@@ -437,7 +453,11 @@ def _kernel(
                 if acc_stage == 0 and tile_iter != 0:
                     acc_empty_phase_bit = acc_empty_phase_bit ^ 1
 
-                while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr + acc_stage, acc_empty_phase_bit, time_limit=10_000_000):
+                while not nvvm.mbarrier_try_wait_parity(
+                    acc_empty_mbar_ptr + acc_stage,
+                    acc_empty_phase_bit,
+                    time_limit=10_000_000,
+                ):
                     pass
 
                 acc_base_col = base_col_id_root + acc_stage * acc_region_cols
@@ -456,7 +476,11 @@ def _kernel(
                     if stage == 0 and ab_iter != 0:
                         ab_full_phase_bit = ab_full_phase_bit ^ 1
 
-                    while not nvvm.mbarrier_try_wait_parity(ab_full_mbar_ptr + stage, ab_full_phase_bit, time_limit=10_000_000):
+                    while not nvvm.mbarrier_try_wait_parity(
+                        ab_full_mbar_ptr + stage,
+                        ab_full_phase_bit,
+                        time_limit=10_000_000,
+                    ):
                         pass
 
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -517,7 +541,11 @@ def _kernel(
                     if tail_stage == acc_stages:
                         tail_stage = cutlass.Int32(0)
                         tail_phase = tail_phase ^ 1
-                    while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr + tail_stage, tail_phase, time_limit=10_000_000):
+                    while not nvvm.mbarrier_try_wait_parity(
+                        acc_empty_mbar_ptr + tail_stage,
+                        tail_phase,
+                        time_limit=10_000_000,
+                    ):
                         pass
             nvvm.bar_warp_sync(0xFFFFFFFF)
 
@@ -617,7 +645,11 @@ def _kernel(
                 if cutlass.const_expr((not use_tma_store_epi) and subtile_idx == subtile_cnt - 1):
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if nvvm.elect_sync():
-                        nvvm.mbarrier_arrive(nvvm.mapa(acc_empty_mbar_ptr + acc_stage, pair_leader_rank), scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                        nvvm.mbarrier_arrive(
+                            nvvm.mapa(acc_empty_mbar_ptr + acc_stage, pair_leader_rank),
+                            scope=nvvm.MemScope.CLUSTER,
+                            relaxed=True,
+                        )
 
                 col = coord_n_c + subtile_col_offset
 

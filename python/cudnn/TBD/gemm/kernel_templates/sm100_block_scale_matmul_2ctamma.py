@@ -176,10 +176,42 @@ def _kernel(
 
     sA_elems = sA_packed_elems
     sB_elems = sB_packed_elems
-    smem_a_list = [cutlass.Array(ab_dtype, sA_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024) for _ in range(num_a_operands)]
-    smem_b_list = [cutlass.Array(ab_dtype, sB_elems * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024) for _ in range(num_b_operands)]
-    smem_sfa_list = [cutlass.Array(cutlass.Uint8, sfa_smem_bytes * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024) for _ in range(num_a_operands)]
-    smem_sfb_list = [cutlass.Array(cutlass.Uint8, sfb_smem_bytes * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024) for _ in range(num_b_operands)]
+    smem_a_list = [
+        cutlass.Array(
+            ab_dtype,
+            sA_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_a_operands)
+    ]
+    smem_b_list = [
+        cutlass.Array(
+            ab_dtype,
+            sB_elems * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_b_operands)
+    ]
+    smem_sfa_list = [
+        cutlass.Array(
+            cutlass.Uint8,
+            sfa_smem_bytes * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_a_operands)
+    ]
+    smem_sfb_list = [
+        cutlass.Array(
+            cutlass.Uint8,
+            sfb_smem_bytes * ab_stages,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        for _ in range(num_b_operands)
+    ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
     epi_subtile_elems = cta_tile_mnk[0] * epi_tile_mn[1]
@@ -287,7 +319,11 @@ def _kernel(
                     stage = sched_iter % CLC_SCHED_STAGES
                     if stage == 0 and sched_iter != 0:
                         clc_empty_phase = clc_empty_phase ^ 1
-                    while not nvvm.mbarrier_try_wait_parity(clc_empty_mbar_ptr + stage, clc_empty_phase, time_limit=10_000_000):
+                    while not nvvm.mbarrier_try_wait_parity(
+                        clc_empty_mbar_ptr + stage,
+                        clc_empty_phase,
+                        time_limit=10_000_000,
+                    ):
                         pass
                     sched_iter += 1
 
@@ -508,7 +544,11 @@ def _kernel(
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
                 clc_full_phase_tma = clc_full_phase_tma ^ 1
-            while not nvvm.mbarrier_try_wait_parity(clc_full_mbar_ptr + consumer_stage, clc_full_phase_tma, time_limit=10_000_000):
+            while not nvvm.mbarrier_try_wait_parity(
+                clc_full_mbar_ptr + consumer_stage,
+                clc_full_phase_tma,
+                time_limit=10_000_000,
+            ):
                 pass
             m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
             is_valid = vld
@@ -598,7 +638,11 @@ def _kernel(
                 if acc_stage == 0 and tile_iter != 0:
                     acc_empty_phase_bit = acc_empty_phase_bit ^ 1
 
-                while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr + acc_stage, acc_empty_phase_bit, time_limit=10_000_000):
+                while not nvvm.mbarrier_try_wait_parity(
+                    acc_empty_mbar_ptr + acc_stage,
+                    acc_empty_phase_bit,
+                    time_limit=10_000_000,
+                ):
                     pass
 
                 if cutlass.const_expr(use_acc_overlap):
@@ -619,7 +663,11 @@ def _kernel(
                     if stage == 0 and ab_iter != 0:
                         ab_full_phase_bit = ab_full_phase_bit ^ 1
 
-                    while not nvvm.mbarrier_try_wait_parity(ab_full_mbar_ptr + stage, ab_full_phase_bit, time_limit=10_000_000):
+                    while not nvvm.mbarrier_try_wait_parity(
+                        ab_full_mbar_ptr + stage,
+                        ab_full_phase_bit,
+                        time_limit=10_000_000,
+                    ):
                         pass
 
                     desc_a_bases = [
@@ -721,7 +769,11 @@ def _kernel(
                 consumer_stage = tile_iter % CLC_SCHED_STAGES
                 if consumer_stage == 0 and tile_iter != 0:
                     clc_full_phase_mma = clc_full_phase_mma ^ 1
-                while not nvvm.mbarrier_try_wait_parity(clc_full_mbar_ptr + consumer_stage, clc_full_phase_mma, time_limit=10_000_000):
+                while not nvvm.mbarrier_try_wait_parity(
+                    clc_full_mbar_ptr + consumer_stage,
+                    clc_full_phase_mma,
+                    time_limit=10_000_000,
+                ):
                     pass
                 _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
                 is_valid = vld
@@ -742,7 +794,11 @@ def _kernel(
                     if tail_stage == acc_stages:
                         tail_stage = cutlass.Int32(0)
                         tail_phase = tail_phase ^ 1
-                    while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr + tail_stage, tail_phase, time_limit=10_000_000):
+                    while not nvvm.mbarrier_try_wait_parity(
+                        acc_empty_mbar_ptr + tail_stage,
+                        tail_phase,
+                        time_limit=10_000_000,
+                    ):
                         pass
             nvvm.bar_warp_sync(0xFFFFFFFF)
 
@@ -762,7 +818,11 @@ def _kernel(
                 consumer_stage = tile_iter % CLC_SCHED_STAGES
                 if consumer_stage == 0 and tile_iter != 0:
                     clc_full_phase_mma = clc_full_phase_mma ^ 1
-                while not nvvm.mbarrier_try_wait_parity(clc_full_mbar_ptr + consumer_stage, clc_full_phase_mma, time_limit=10_000_000):
+                while not nvvm.mbarrier_try_wait_parity(
+                    clc_full_mbar_ptr + consumer_stage,
+                    clc_full_phase_mma,
+                    time_limit=10_000_000,
+                ):
                     pass
                 _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
                 is_valid = vld
@@ -856,7 +916,11 @@ def _kernel(
                 if cutlass.const_expr(not (use_tma_store_epi and cd_out_is_m_major)):
                     c_rmem_vecs = []
                     for g in cutlass.range_constexpr(num_gemms):
-                        tmem = cutlass.inttoptr(tmem_col_addr_gemms[g] + subtile_col_offset, 6, cutlass.Float32)
+                        tmem = cutlass.inttoptr(
+                            tmem_col_addr_gemms[g] + subtile_col_offset,
+                            6,
+                            cutlass.Float32,
+                        )
                         c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx))
                     c_rmem_vec = c_rmem_vecs[0]
 
@@ -967,7 +1031,11 @@ def _kernel(
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
                 clc_full_phase_epi = clc_full_phase_epi ^ 1
-            while not nvvm.mbarrier_try_wait_parity(clc_full_mbar_ptr + consumer_stage, clc_full_phase_epi, time_limit=10_000_000):
+            while not nvvm.mbarrier_try_wait_parity(
+                clc_full_mbar_ptr + consumer_stage,
+                clc_full_phase_epi,
+                time_limit=10_000_000,
+            ):
                 pass
             m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
             is_valid = vld
@@ -1072,7 +1140,12 @@ def _host(
             cute.recast_ptr(_sfa_op.iterator, dtype=cutlass.Float16),
             cute.make_layout(
                 (256, rest_k, rest_m, batch),
-                stride=(1, 256, cute.assume(256 * rest_k, 8), cute.assume(256 * rest_k * rest_m, 8)),
+                stride=(
+                    1,
+                    256,
+                    cute.assume(256 * rest_k, 8),
+                    cute.assume(256 * rest_k * rest_m, 8),
+                ),
             ),
         )
         tma_sfa_desc_list.append(
@@ -1121,7 +1194,12 @@ def _host(
             cute.recast_ptr(_sfb_op.iterator, dtype=cutlass.Float16),
             cute.make_layout(
                 (256, rest_k, rest_n, batch),
-                stride=(1, 256, cute.assume(256 * rest_k, 8), cute.assume(256 * rest_k * rest_n, 8)),
+                stride=(
+                    1,
+                    256,
+                    cute.assume(256 * rest_k, 8),
+                    cute.assume(256 * rest_k * rest_n, 8),
+                ),
             ),
         )
         tma_sfb_desc_list.append(

@@ -1,34 +1,7 @@
-"""Benchmark the fused multi-GEMM SwiGLU block (DualMatmulSiluMulDequant) vs an
-unfused 2×cuBLAS + pointwise baseline.
+"""Benchmark the fused multi-GEMM SwiGLU block silu(a@b0)*(a@b1)*scale vs an
+unfused 2×cuBLAS + pointwise baseline. --shape is B,M,N,K.
 
-Graph (matches the cuDNN ``DualMatmulSiluMulDequant`` abstract case):
-
-    c0 = a @ b0            # mm0
-    c1 = a @ b1            # mm1  (shares a; b0/b1 distinct)
-    out = silu(c0) * c1 * scaleFactor          # swish -> mul -> mul(scale)
-
-A is shared by both GEMMs, so our kernel loads it once and runs two ``tcgen05``
-MMAs into two TMEM accumulators, fusing the whole epilogue. The unfused baseline
-is two separate cuBLAS GEMMs (``torch.matmul``) plus the elementwise chain — what
-you'd otherwise launch. We report the fused kernel's TFLOPS (counting both GEMMs)
-and its speedup over that baseline.
-
-``--shape`` is ``B,M,N,K`` (B = batch / independent same-shape SwiGLU blocks;
-B=1 = a single block). Multi-GEMM is the 1-CTA-MMA CLC template, so configs are
-swept with ``cta_group=1``.
-
-Timing (CLAUDE.md rule: keep ``--iters`` <= 20):
-  * **delayed** (default) — queue a long ``torch.cuda._sleep`` first so the host
-    enqueues every launch behind it; the GPU then runs them back-to-back at full
-    speed. Kernel-only, matches nsys to <2%.
-  * **events** — plain events around the loop (includes ~50us/call Python +
-    TVM-FFI dispatch overhead; inflates small/fast kernels).
-
-Usage:
-    python cudnn.TBD.gemm/benchmarks/benchmark_matmul_swiglu.py
     python cudnn.TBD.gemm/benchmarks/benchmark_matmul_swiglu.py --shape 1,4096,11008,4096
-    python cudnn.TBD.gemm/benchmarks/benchmark_matmul_swiglu.py --dtype fp16 --iters 20
-    python cudnn.TBD.gemm/benchmarks/benchmark_matmul_swiglu.py --configs CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma
 """
 
 from __future__ import annotations
@@ -50,14 +23,13 @@ from cudnn.TBD.gemm.kernel_registry import candidates as _registry_candidates
 
 
 def _build_plan(g, cfg, cta_group, sched):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile the recorded graph with a forced tile config."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
 
 
 def _vp_mg(handles, gemm_pairs, outs, *aux):
-    """Multi-GEMM variant-pack dict keyed by the graph's tensors (dedup pairs by
-    tensor identity → distinct A/B slots, + outputs + aux)."""
+    """Multi-GEMM variant-pack dict (dedup pairs by tensor identity → distinct
+    A/B slots, + outputs + aux)."""
     bd = handles
     a_seen, b_seen = [], []
     for ag, bg in gemm_pairs:
@@ -93,7 +65,12 @@ def _graph_swiglu(B: int, M: int, N: int, K: int, in_dt: str, out_dt: str):
     A = g.tensor(name="aTensor", dim=[B, M, K], stride=[M * K, K, 1])
     B0 = g.tensor(name="b0Tensor", dim=[B, K, N], stride=[K * N, 1, K])
     B1 = g.tensor(name="b1Tensor", dim=[B, K, N], stride=[K * N, 1, K])
-    scale = g.tensor(name="scaleFactor", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    scale = g.tensor(
+        name="scaleFactor",
+        dim=[1, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.FLOAT,
+    )
     C0 = g.matmul(A=A, B=B0, name="mm0")
     C1 = g.matmul(A=A, B=B1, name="mm1")
     S0 = g.swish(input=C0, name="silu0")
@@ -114,24 +91,22 @@ def _mkdata(B, M, N, K, in_dt, out_dt):
 
 
 def _reference(a, b0, b1, scale, out_dt):
-    """Unfused baseline = 2 cuBLAS GEMMs + the elementwise chain (also the
-    correctness reference). einsum 'bmk,bnk->bmn' matches the (B,N,K) operands."""
+    """Correctness reference: 2 GEMMs + elementwise chain (einsum 'bmk,bnk->bmn'
+    matches the (B,N,K) operands)."""
     c0 = torch.einsum("bmk,bnk->bmn", a.float(), b0.float())
     c1 = torch.einsum("bmk,bnk->bmn", a.float(), b1.float())
     return (torch.nn.functional.silu(c0) * c1 * scale.flatten()[0]).to(_TORCH_DT[out_dt])
 
 
 def _unfused_launch(a, b0, b1, scale, out):
-    """One unfused SwiGLU block on the stream (2 cuBLAS GEMMs + pointwise),
-    matching the fused kernel's math — the baseline we measure speedup against."""
+    """Baseline: 2 cuBLAS GEMMs + pointwise, matching the fused kernel's math."""
     c0 = torch.matmul(a, b0.transpose(-1, -2))
     c1 = torch.matmul(a, b1.transpose(-1, -2))
     out.copy_((torch.nn.functional.silu(c0.float()) * c1.float() * scale.flatten()[0]).to(out.dtype))
 
 
-# ---------------------------------------------------------------------------
-# Timing (delayed / events) — same pattern as benchmark_matmul.py
-# ---------------------------------------------------------------------------
+# Timing (delayed / events) — same pattern as benchmark_matmul.py. delayed hides
+# host-launch overhead behind a CUDA _sleep so kernels run back-to-back.
 
 
 def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> float:
@@ -153,18 +128,10 @@ def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> f
     return start.elapsed_time(end) / iters
 
 
-# ---------------------------------------------------------------------------
-# Config candidates
-# ---------------------------------------------------------------------------
-
-
 def _build_spec_map():
-    """Legacy label ``CONFIG_..._Nctamma[_static]`` -> (geometry cfg, cta_group,
-    scheduler) for every multi-GEMM-capable sm100 matmul strategy, via the
-    registry funnel — SAME convention as benchmark_matmul.py, so ``--configs`` takes
-    the full suffixed names. Multi-GEMM TMEM fits `num_gemms` accumulators only
-    for cta_tile_n<=256 (2*256<=512); 1ctamma uses cluster1x1, 2ctamma cluster2x1
-    (both cta_tile_m=128). K_bytes 64 and 128 both run (TMEM sizing is K-agnostic)."""
+    """Legacy label -> (geometry cfg, cta_group, scheduler) for every multi-GEMM-
+    capable sm100 matmul strategy. Multi-GEMM TMEM fits num_gemms accumulators
+    only for cta_tile_n<=256 (2*256<=512); cta_tile_m=128."""
     chain = analyze(_graph_swiglu(1, 256, 256, 256, "bf16", "bf16")[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
@@ -190,7 +157,9 @@ def main() -> int:
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=20)  # CLAUDE.md: <= 20
     p.add_argument(
-        "--configs", default=None, help="comma-separated CONFIG_..._Nctamma[_static] labels " "(same form as benchmark_matmul.py; default: sweep all)"
+        "--configs",
+        default=None,
+        help="comma-separated CONFIG_..._Nctamma[_static] labels " "(same form as benchmark_matmul.py; default: sweep all)",
     )
     p.add_argument("--timing", choices=("delayed", "events"), default="delayed")
     p.add_argument("--rtol", type=float, default=2e-2)
@@ -218,7 +187,12 @@ def main() -> int:
 
     # --- baseline: unfused 2×cuBLAS + pointwise ---
     out_bl = torch.empty_like(out)
-    bl_ms = _time_ms(lambda: _unfused_launch(a, b0, b1, scale, out_bl), warmup=args.warmup, iters=args.iters, delayed=delayed)
+    bl_ms = _time_ms(
+        lambda: _unfused_launch(a, b0, b1, scale, out_bl),
+        warmup=args.warmup,
+        iters=args.iters,
+        delayed=delayed,
+    )
     bl_tflops = flops / (bl_ms * 1e-3) / 1e12
     print(f"  {'unfused 2xcuBLAS + pointwise':52s} {bl_tflops:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms   {'1.00×':>8s}")
 
@@ -244,7 +218,12 @@ def main() -> int:
             continue
         err = (out.float() - ref.float()).abs().max().item()
         ok = torch.allclose(out.float(), ref.float(), rtol=args.rtol, atol=args.atol)
-        ms = _time_ms(lambda: plan(_vp_mg(h, [(a, b0), (a, b1)], out, scale)), warmup=args.warmup, iters=args.iters, delayed=delayed)
+        ms = _time_ms(
+            lambda: plan(_vp_mg(h, [(a, b0), (a, b1)], out, scale)),
+            warmup=args.warmup,
+            iters=args.iters,
+            delayed=delayed,
+        )
         tflops = flops / (ms * 1e-3) / 1e12
         ratio = bl_ms / ms if ms > 0 else 0.0
         flag = "" if ok else f"  !! maxerr={err:.3g}"

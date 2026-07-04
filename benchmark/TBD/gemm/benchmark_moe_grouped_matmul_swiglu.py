@@ -1,34 +1,8 @@
 """Benchmark the fused dual MoE grouped-matmul SwiGLU block vs an unfused
-2×cuBLAS-batched-GEMM + pointwise baseline.
+2×cuBLAS-batched-GEMM + pointwise baseline. ``--shape`` is ``G,M,N,K`` (even
+split, S=G*M).
 
-Graph (matches the cuDNN ``Dual_Grouped_Matmul_Swiglu`` abstract case):
-
-    c0 = moe_grouped_matmul(token, w0, fto)        # moe0
-    c1 = moe_grouped_matmul(token, w1, fto)        # moe1  (shares token + fto)
-    out = silu(c0) * c1 * scaleFactor              # swish -> mul -> mul(scale)
-
-The token (A) is shared by both grouped matmuls (loaded once → two ``tcgen05``
-MMAs into two TMEM accumulators), the weights (B) are distinct, and the whole
-epilogue is fused. The unfused baseline is two separate cuBLAS **batched** GEMMs
-(one per weight) over the E equal-sized groups, plus the elementwise chain — what
-you'd otherwise launch. We report the fused kernel's TFLOPS (counting both GEMMs)
-and its speedup over that baseline.
-
-``--shape`` is ``G,M,N,K``: G groups, M tokens per group (even split), N, K. So
-S = G*M total tokens, num_groups = G (group g uses expert g), and the offsets are
-``[0, M, 2M, ...]``. Even split makes the cuBLAS baseline a single batched GEMM
-over ``(G, M, K) @ (G, K, N)`` per weight.
-
-Timing (CLAUDE.md rule: keep ``--iters`` <= 20):
-  * **delayed** (default) — queue a long ``torch.cuda._sleep`` first so the host
-    enqueues every launch behind it; the GPU runs them back-to-back at full
-    speed. Kernel-only, matches nsys to <2%.
-  * **events** — plain events around the loop (includes host/dispatch overhead).
-
-Usage (from workspace root, after `source active_tbd.sh`):
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_grouped_matmul_swiglu.py
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_grouped_matmul_swiglu.py --shape 8,512,4096,4096
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_grouped_matmul_swiglu.py --configs CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma
+    python .../benchmark_moe_grouped_matmul_swiglu.py --shape 8,512,4096,4096
 """
 
 from __future__ import annotations
@@ -49,14 +23,13 @@ from cudnn.TBD.gemm.kernel_registry import candidates as _registry_candidates
 
 
 def _build_plan(g, cfg, cta_group, sched):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile the graph with a forced tile config → callable kernel."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)
 
 
 def _vp_moe_mg(handles, gemm_pairs, fto, outs, *aux):
-    """MoE multi-GEMM variant-pack dict keyed by the graph's tensors (dedup
-    (token, weight) pairs → distinct A/B slots; + first_token_offset + outputs + aux)."""
+    """MoE multi-GEMM variant-pack dict: dedup (token, weight) pairs → distinct
+    A/B slots, + first_token_offset + outputs + aux."""
     bd = handles
     a_seen, b_seen = [], []
     for ag, bg in gemm_pairs:
@@ -73,32 +46,75 @@ def _vp_moe_mg(handles, gemm_pairs, fto, outs, *aux):
     return vp
 
 
-# ---------------------------------------------------------------------------
 # Graph + data
-# ---------------------------------------------------------------------------
 
 
 def _graph_swiglu(S: int, N: int, K: int, E: int):
-    """Build the dual MoE grouped-matmul SwiGLU graph:
-    silu(moe(tok, w0)) * moe(tok, w1) * scale."""
+    """Dual MoE grouped-matmul SwiGLU: silu(moe(tok, w0)) * moe(tok, w1) * scale.
+    token is shared by both grouped matmuls (loaded once → two accumulators)."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    w0 = g.tensor(name="weight0", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    w1 = g.tensor(name="weight1", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    scale = g.tensor(name="scaleFactor", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
-    # fto must be the SAME tensor for both grouped matmuls (shared routed-group layout).
-    fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
-    c0 = g.moe_grouped_matmul(tok, w0, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe0")
-    c1 = g.moe_grouped_matmul(tok, w1, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe1")
+    tok = g.tensor(
+        name="token",
+        dim=[1, S, K],
+        stride=[S * K, K, 1],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    w0 = g.tensor(
+        name="weight0",
+        dim=[E, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    w1 = g.tensor(
+        name="weight1",
+        dim=[E, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    scale = g.tensor(
+        name="scaleFactor",
+        dim=[1, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.FLOAT,
+    )
+    # fto MUST be the SAME tensor for both matmuls (shared routed-group layout).
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[E, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.INT32,
+    )
+    c0 = g.moe_grouped_matmul(
+        tok,
+        w0,
+        fto,
+        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        compute_data_type=cudnn.data_type.FLOAT,
+        name="moe0",
+    )
+    c1 = g.moe_grouped_matmul(
+        tok,
+        w1,
+        fto,
+        mode=cudnn.moe_grouped_matmul_mode.NONE,
+        compute_data_type=cudnn.data_type.FLOAT,
+        name="moe1",
+    )
     s0 = g.swish(input=c0, name="silu0")
     mu = g.mul(a=s0, b=c1, name="mul0")
     dq = g.mul(a=mu, b=scale, name="dequant0")
     dq.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
-    return g, SimpleNamespace(first_token_offset=fto, a_operands=[tok], b_operands=[w0, w1], outputs=[dq], aux=[scale])
+    return g, SimpleNamespace(
+        first_token_offset=fto,
+        a_operands=[tok],
+        b_operands=[w0, w1],
+        outputs=[dq],
+        aux=[scale],
+    )
 
 
 def _offsets(S: int, E: int) -> torch.Tensor:
@@ -120,15 +136,14 @@ def _reference(tok, w0, w1, scale, S, N, K, E):
     """Correctness reference: even-split grouped GEMMs + the elementwise chain."""
     group_m = S // E
     tok_g = tok.view(E, group_m, K).float()
-    c0 = torch.bmm(tok_g, w0.transpose(-1, -2).float())  # (E, group_m, N)
+    c0 = torch.bmm(tok_g, w0.transpose(-1, -2).float())
     c1 = torch.bmm(tok_g, w1.transpose(-1, -2).float())
     out = torch.nn.functional.silu(c0) * c1 * scale.flatten()[0]
     return out.reshape(S, N).to(torch.bfloat16)
 
 
 def _unfused_launch(tok, w0, w1, scale, out, S, N, K, E):
-    """Unfused baseline = 2 cuBLAS batched GEMMs + pointwise, matching the fused
-    math — the baseline we measure speedup against."""
+    """Unfused baseline: 2 cuBLAS batched GEMMs + pointwise."""
     group_m = S // E
     tok_g = tok.view(E, group_m, K)
     c0 = torch.bmm(tok_g, w0.transpose(-1, -2))
@@ -137,9 +152,8 @@ def _unfused_launch(tok, w0, w1, scale, out, S, N, K, E):
     out.view(E, group_m, N).copy_(res.to(out.dtype))
 
 
-# ---------------------------------------------------------------------------
-# Timing (delayed / events) — same pattern as benchmark_matmul_swiglu.py
-# ---------------------------------------------------------------------------
+# Timing. delayed mode queues a torch.cuda._sleep first so the host can enqueue
+# every launch behind it → kernels run back-to-back (kernel-only, matches nsys).
 
 
 def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> float:
@@ -161,16 +175,13 @@ def _time_ms(timed_fn: Callable, *, warmup: int, iters: int, delayed: bool) -> f
     return start.elapsed_time(end) / iters
 
 
-# ---------------------------------------------------------------------------
 # Config candidates — MoE templates only (1ctamma cluster1x1, 2ctamma cluster2x1)
-# ---------------------------------------------------------------------------
 
 
 def _build_spec_map():
-    """Legacy label ``CONFIG_..._Nctamma`` -> (geometry cfg, cta_group, scheduler)
-    for every multi-GEMM-capable MoE strategy, via the registry funnel. Dual-GEMM
-    TMEM fits two accumulators only for cta_tile_n<=256 (2*256<=512); cgrp_size_n=1,
-    cta_tile_m=128 (cluster-m=256 under cta_group=2)."""
+    """Label -> (cfg, cta_group, scheduler) for multi-GEMM-capable MoE strategies.
+    Dual-GEMM TMEM fits two accumulators only for cta_tile_n<=256 (2*256<=512);
+    cgrp_size_n=1, cta_tile_m=128."""
     chain = analyze(_graph_swiglu(2048, 256, 256, 9)[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
@@ -184,9 +195,7 @@ def _build_spec_map():
 _SPEC_MAP = _build_spec_map()
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 
 
 def main() -> int:
@@ -194,7 +203,11 @@ def main() -> int:
     p.add_argument("--shape", default="8,512,4096,4096", help="G,M,N,K (even split)")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=20)  # CLAUDE.md: <= 20
-    p.add_argument("--configs", default=None, help="comma-separated CONFIG_..._Nctamma labels (default: sweep all)")
+    p.add_argument(
+        "--configs",
+        default=None,
+        help="comma-separated CONFIG_..._Nctamma labels (default: sweep all)",
+    )
     p.add_argument("--timing", choices=("delayed", "events"), default="delayed")
     p.add_argument(
         "--stream",
@@ -217,8 +230,7 @@ def main() -> int:
     S = G * M
     delayed = args.timing == "delayed"
 
-    # 2 grouped GEMMs, each 2*S*N*K flops.
-    flops = 2 * (2 * S * N * K)
+    flops = 2 * (2 * S * N * K)  # 2 grouped GEMMs, each 2*S*N*K
     print(f"\n=== MoE dual grouped-matmul SwiGLU  G={G} groups × M={M}  " f"(S={S}) {N}x{K}  (~{flops / 1e9:.1f} GFLOP, 2 GEMMs) ===")
     print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]\n")
 
@@ -226,9 +238,14 @@ def main() -> int:
     offsets = _offsets(S, E)
     ref = _reference(tok, w0, w1, scale, S, N, K, E)
 
-    # --- baseline: unfused 2×cuBLAS batched GEMM + pointwise ---
+    # baseline: unfused 2×cuBLAS batched GEMM + pointwise
     out_bl = torch.empty_like(out)
-    bl_ms = _time_ms(lambda: _unfused_launch(tok, w0, w1, scale, out_bl, S, N, K, E), warmup=args.warmup, iters=args.iters, delayed=delayed)
+    bl_ms = _time_ms(
+        lambda: _unfused_launch(tok, w0, w1, scale, out_bl, S, N, K, E),
+        warmup=args.warmup,
+        iters=args.iters,
+        delayed=delayed,
+    )
     bl_tflops = flops / (bl_ms * 1e-3) / 1e12
     print(f"  {'unfused 2xcuBLAS batched + pointwise':54s} {bl_tflops:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms   {'1.00×':>8s}")
 
@@ -253,7 +270,12 @@ def main() -> int:
             continue
         err = (out.float() - ref.float()).abs().max().item()
         ok = torch.allclose(out.float(), ref.float(), rtol=args.rtol, atol=args.atol)
-        ms = _time_ms(lambda: plan(_vp_moe_mg(h, [(tok, w0), (tok, w1)], offsets, out, scale)), warmup=args.warmup, iters=args.iters, delayed=delayed)
+        ms = _time_ms(
+            lambda: plan(_vp_moe_mg(h, [(tok, w0), (tok, w1)], offsets, out, scale)),
+            warmup=args.warmup,
+            iters=args.iters,
+            delayed=delayed,
+        )
         tflops = flops / (ms * 1e-3) / 1e12
         ratio = bl_ms / ms if ms > 0 else 0.0
         flag = "" if ok else f"  !! maxerr={err:.3g}"

@@ -34,7 +34,13 @@ def test_unary_chain() -> None:
 
 
 def test_binary_with_aux_bias() -> None:
-    bias = TensorRef(name="bias", dim=(1, 1, 128), stride=(128, 128, 1), dtype="bf16", bcast_mode="per_col")
+    bias = TensorRef(
+        name="bias",
+        dim=(1, 1, 128),
+        stride=(128, 128, 1),
+        dtype="bf16",
+        bcast_mode="per_col",
+    )
     c = FusionChain(
         matmul=_mm(),
         aux_tensors=[bias],
@@ -96,7 +102,7 @@ def test_reduction_dtype_accepts_fp32_and_int32_only() -> None:
 
 
 def test_op_out_dtype_defaults_fp32_and_accepts_narrow() -> None:
-    # Default (legacy) is fp32 = no rounding; a narrow out_dtype is accepted.
+    # Default fp32 = no rounding; a narrow out_dtype is accepted.
     assert FusionOp("relu").out_dtype == "fp32"
     assert FusionOp("relu", out_dtype="bf16").out_dtype == "bf16"
     assert FusionOp("relu", out_dtype="int8").out_dtype == "int8"
@@ -125,7 +131,7 @@ def test_rejects_binary_with_both_aux_and_parent_idx_b() -> None:
 
 
 def test_accepts_binary_fan_in() -> None:
-    """Phase 4: binary op with parent_idx_b set is fan-in (no aux)."""
+    """Binary op with parent_idx_b set is fan-in (no aux)."""
     op = FusionOp("add", parent_idx=-1, parent_idx_b=0)
     assert op.aux is None
     assert op.parent_idx_b == 0
@@ -195,19 +201,16 @@ def test_fp16_matmul_accepted() -> None:
 
 
 def test_matmul_spec_accepts_any_dtype_fields() -> None:
-    # MatmulSpec doesn't judge MMA-dtype runnability (no arch info) — it accepts
-    # the dtype fields as given; the compiler's gate rejects unrunnable combos
-    # (e.g. fp32×fp32, which has no TF32 path) at JIT time.
+    # MatmulSpec doesn't judge MMA-dtype runnability (no arch info); the compiler
+    # gate rejects unrunnable combos (e.g. fp32×fp32, no TF32 path) at JIT time.
     spec = MatmulSpec(M=128, N=128, K=64, a_dtype="fp32", b_dtype="fp32", accum_dtype="fp32")
     assert spec.a_dtype == "fp32"
 
 
 def test_matmul_spec_does_not_validate_mma_dtype_combo() -> None:
-    # The IR has no GPU-arch info, so it does NOT judge whether an
-    # (a, b, accum) MMA combination is runnable — that's the compiler's
-    # arch-aware `_check_supported` gate (see test_compiler.py). MatmulSpec
-    # only enforces structural invariants + output-storage dtype. So these
-    # combos CONSTRUCT fine here and are rejected later, at JIT time.
+    # The IR has no arch info, so it does NOT judge (a, b, accum) runnability —
+    # that's the compiler's arch-aware _check_supported gate. These combos
+    # construct fine here and are rejected later at JIT time.
     for a, b, acc in [
         ("fp8_e4m3", "bf16", "fp32"),  # mixed fp8 / 16-bit
         ("int8", "bf16", "int32"),  # int8 paired with non-int8
@@ -220,7 +223,7 @@ def test_matmul_spec_does_not_validate_mma_dtype_combo() -> None:
 
 
 def test_matmul_spec_still_validates_output_storage_dtype() -> None:
-    # Output-storage dtype well-formedness IS checked here (the combo table
-    # doesn't cover it; an unknown out_dtype would KeyError at render).
+    # Output-storage dtype well-formedness IS checked here (an unknown out_dtype
+    # would KeyError at render).
     with pytest.raises(ValueError, match="out_dtype"):
         MatmulSpec(M=128, N=128, K=64, a_dtype="bf16", b_dtype="bf16", accum_dtype="fp32", out_dtype="fp64")  # type: ignore[arg-type]

@@ -1,11 +1,7 @@
-"""Tests for mainloop fusion: A' = op(A), C = A' @ B (Phase 6).
+"""Tests for mainloop fusion: A' = op(A), C = A' @ B.
 
-Three layers:
-  * analyzer  — the upstream-A unary op chain lands in `chain.mainloop_a_ops`
-                and is kept out of the epilogue ops.
-  * codegen   — `generate_mainloop` emits the load->fp32->op->ab_dtype snippet.
-  * end-to-end — JIT + run abs/relu/neg(A) @ B on both the 1ctamma and 2ctamma
-                 mainloop templates (BF16 + FP16) against a torch reference.
+Covers the analyzer (upstream ops land in mainloop_a/b_ops, kept out of the
+epilogue), codegen (generate_mainloop), and end-to-end JIT+run vs torch.
 """
 
 from __future__ import annotations
@@ -37,16 +33,18 @@ _LEGACY_RE = re.compile(r"^(CONFIG_sm100_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)
 
 
 def _kw(legacy_name):
-    """Legacy config-name (with _Nctamma/_static) -> jit kwargs: pure-geometry
-    config + cta_group + scheduler. Names are kept as readable test IDs."""
+    """Legacy config-name -> jit kwargs (pure-geometry config + cta_group + scheduler)."""
     m = _LEGACY_RE.match(legacy_name)
     assert m, legacy_name
-    return dict(config=by_name(m.group(1)), cta_group=int(m.group(2)), scheduler="static" if m.group(3) else "clc")
+    return dict(
+        config=by_name(m.group(1)),
+        cta_group=int(m.group(2)),
+        scheduler="static" if m.group(3) else "clc",
+    )
 
 
 def _plan(g, **kw):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile with a forced tile config; returns the callable kernel."""
     return jit_from_cudnn_graph(g, **kw)
 
 
@@ -55,7 +53,14 @@ def _plan(g, **kw):
 # ---------------------------------------------------------------------------
 
 
-def _mainloop_graph(op: str, M: int, N: int, K: int, io_dtype=cudnn.data_type.BFLOAT16, out_major: str = "n"):
+def _mainloop_graph(
+    op: str,
+    M: int,
+    N: int,
+    K: int,
+    io_dtype=cudnn.data_type.BFLOAT16,
+    out_major: str = "n",
+):
     return _mainloop_graph_ab(op, "none", M, N, K, io_dtype, out_major)
 
 
@@ -76,8 +81,8 @@ def _mainloop_graph_ab(
     )
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
-    Ai = getattr(g, aop)(input=A, name="aop") if aop != "none" else A
-    Bi = getattr(g, bop)(input=B, name="bop") if bop != "none" else B
+    Ai = getattr(g, aop)(input=A, name="aop").set_data_type(io_dtype) if aop != "none" else A
+    Bi = getattr(g, bop)(input=B, name="bop").set_data_type(io_dtype) if bop != "none" else B
     C = g.matmul(A=Ai, B=Bi, name="mm")
     if out_major == "m":
         C.set_stride([M * N, 1, M])  # column-major (M-contiguous)
@@ -134,7 +139,12 @@ def test_zero_preserving_registry() -> None:
     """The K-OOB-mask decision rests on ZERO_PRESERVING_OPS: an op is listed
     iff f(0)=0 for any other operand (unary f(0)=0, plus mul). Everything else
     — including div (aux/0=inf) — must be non-preserving so the mask fires."""
-    from cudnn.TBD.gemm.fusion_ir import ZERO_PRESERVING_OPS, UNARY_OPS, BINARY_OPS, FusionOp
+    from cudnn.TBD.gemm.fusion_ir import (
+        ZERO_PRESERVING_OPS,
+        UNARY_OPS,
+        BINARY_OPS,
+        FusionOp,
+    )
     from cudnn.TBD.gemm.compiler import _mainloop_chain_zero_preserving as zp
 
     # Pin membership both ways so a newly-added op can't silently slip in/out.
@@ -275,9 +285,7 @@ def test_e2e_mainloop_fp16(cfg) -> None:
 )
 def test_e2e_mainloop_int8(op, cfg) -> None:
     """INT8 mainloop fusion: f(int8 A) @ int8 B → int32 acc → fp32 out.
-
-    Exercises the integer idesc path + int32→fp32 widen in the mainloop
-    templates. Bit-exact vs an integer reference."""
+    Exercises the integer idesc + int32→fp32 widen; bit-exact vs int reference."""
     M, N, K = 512, 512, 256
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.INT8,
@@ -287,6 +295,7 @@ def test_e2e_mainloop_int8(op, cfg) -> None:
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
     Ai = getattr(g, op)(input=A, name="aop")
+    Ai.set_data_type(cudnn.data_type.INT8)
     C = g.matmul(A=Ai, B=B, name="mm")
     C.set_output(True)
     C.set_data_type(cudnn.data_type.FLOAT)
@@ -371,9 +380,11 @@ def _scaled_graph(scale_a: bool, scale_b: bool, M, N, K):
     if scale_a:
         al = g.tensor(name="alpha", dim=[1, 1, 1], stride=[1, 1, 1])
         Ai = g.mul(a=A, b=al, name="sA")
+        Ai.set_data_type(cudnn.data_type.BFLOAT16)
     if scale_b:
         be = g.tensor(name="beta", dim=[1, 1, 1], stride=[1, 1, 1])
         Bi = g.mul(a=B, b=be, name="sB")
+        Bi.set_data_type(cudnn.data_type.BFLOAT16)
     C = g.matmul(A=Ai, B=Bi, name="mm")
     C.set_output(True)
     return g
@@ -491,10 +502,8 @@ def test_e2e_cos_a_only_oob_ok() -> None:
 
 
 def test_fp32_matmul_rejected_no_implicit_cast() -> None:
-    """An fp32 matmul (with or without mainloop ops) is rejected at JIT — the
-    MMA dtype strictly follows the graph, and there is no TF32 path nor an
-    implicit fp32 → bf16 cast. analyze() succeeds (it doesn't judge runnability);
-    the compiler's arch-aware gate is what rejects fp32×fp32→fp32."""
+    """fp32 matmul is rejected at JIT (no TF32 path, no implicit fp32→bf16 cast).
+    analyze() succeeds; the compiler's arch-aware gate rejects fp32×fp32→fp32."""
 
     def _fp32_graph(with_op: bool):
         g = cudnn.pygraph(
@@ -502,8 +511,18 @@ def test_fp32_matmul_rejected_no_implicit_cast() -> None:
             intermediate_data_type=cudnn.data_type.FLOAT,
             compute_data_type=cudnn.data_type.FLOAT,
         )
-        A = g.tensor(name="A", dim=[1, 128, 64], stride=[128 * 64, 64, 1], data_type=cudnn.data_type.FLOAT)
-        B = g.tensor(name="B", dim=[1, 64, 128], stride=[64 * 128, 128, 1], data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(
+            name="A",
+            dim=[1, 128, 64],
+            stride=[128 * 64, 64, 1],
+            data_type=cudnn.data_type.FLOAT,
+        )
+        B = g.tensor(
+            name="B",
+            dim=[1, 64, 128],
+            stride=[64 * 128, 128, 1],
+            data_type=cudnn.data_type.FLOAT,
+        )
         Ai = g.relu(input=A, name="r") if with_op else A
         C = g.matmul(A=Ai, B=B, name="mm")
         C.set_output(True)
@@ -516,17 +535,27 @@ def test_fp32_matmul_rejected_no_implicit_cast() -> None:
             jit_from_cudnn_graph(gg, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
 
 
-# ---------------------------------------------------------------------------
-# Mixed-input mainloop (dtype cast): the fused operand is LOADED at a narrower
-# dtype than the MMA reads (e.g. int8 A -> identity -> bf16 MMA). The mainloop
-# warps widen the narrow tile into the MMA SMEM tile before the MMA.
-# ---------------------------------------------------------------------------
+# Mixed-input mainloop (dtype cast): the fused operand is LOADED narrower than
+# the MMA reads (e.g. int8 A -> identity -> bf16 MMA); the mainloop warps widen
+# the narrow tile into the MMA SMEM tile before the MMA.
 
 
-def _mixed_input_graph(cast_a: bool, cast_b: bool, M: int, N: int, K: int, load=cudnn.data_type.INT8, tin=cudnn.data_type.BFLOAT16):
+def _mixed_input_graph(
+    cast_a: bool,
+    cast_b: bool,
+    M: int,
+    N: int,
+    K: int,
+    load=cudnn.data_type.INT8,
+    tin=cudnn.data_type.BFLOAT16,
+):
     """`identity(A_load) @ identity(B_load)` casting load->tin before the MMA.
     A non-cast operand stays at `tin` (no mainloop op on that side)."""
-    g = cudnn.pygraph(io_data_type=tin, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=tin,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
     if cast_a:
         A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=load)
         Ai = g.identity(input=A, name="pwa")
@@ -611,18 +640,35 @@ def test_e2e_mixed_input_koob() -> None:
         ("int8", "bf16", torch.int8, cudnn.data_type.BFLOAT16),
         ("int8", "fp16", torch.int8, cudnn.data_type.HALF),
         ("e4m3", "bf16", torch.float8_e4m3fn, cudnn.data_type.BFLOAT16),
-        ("int8", "e4m3", torch.int8, cudnn.data_type.FP8_E4M3),  # int->fp8 fold workaround
-        ("int8", "e5m2", torch.int8, cudnn.data_type.FP8_E5M2),  # int->fp8 fold workaround
+        (
+            "int8",
+            "e4m3",
+            torch.int8,
+            cudnn.data_type.FP8_E4M3,
+        ),  # int->fp8 fold workaround
+        (
+            "int8",
+            "e5m2",
+            torch.int8,
+            cudnn.data_type.FP8_E5M2,
+        ),  # int->fp8 fold workaround
         ("bf16", "e4m3", torch.bfloat16, cudnn.data_type.FP8_E4M3),  # narrowing to fp8
     ],
 )
 def test_e2e_mixed_input_cast_targets(load, mma, torch_load, cu_mma) -> None:
-    """Cast A (loaded `load`) -> `mma` dtype; B is the same `mma` dtype (the MMA
-    combo must be a supported same-dtype float combo). int->fp8 exercises the
-    fold workaround (without it the int->fp32->fp8 fold yields NaN)."""
-    cu_load = {"int8": cudnn.data_type.INT8, "e4m3": cudnn.data_type.FP8_E4M3, "bf16": cudnn.data_type.BFLOAT16}[load]
+    """Cast A (loaded `load`) -> `mma` dtype; B is the same `mma` dtype. int->fp8
+    exercises the fold workaround (else int->fp32->fp8 folds to NaN)."""
+    cu_load = {
+        "int8": cudnn.data_type.INT8,
+        "e4m3": cudnn.data_type.FP8_E4M3,
+        "bf16": cudnn.data_type.BFLOAT16,
+    }[load]
     M, N, K = 512, 512, 512
-    g = cudnn.pygraph(io_data_type=cu_mma, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=cu_mma,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=cu_load)
     Ai = g.identity(input=A, name="pw")
     Ai.set_data_type(cu_mma)
@@ -656,17 +702,37 @@ def test_e2e_mixed_input_cast_targets(load, mma, torch_load, cu_mma) -> None:
 
 
 def test_codegen_int_to_fp8_fold_war() -> None:
-    """GPU-free guard for the int->fp8 fold workaround (foot-gun #3). `generate_mainloop`
-    must insert a `+ cutlass.full_like(., 0.0)` before the fp8 narrowing when the
-    operand is LOADED as an integer (else int->fp32->fp8 folds to an invalid
-    direct int->fp8 cast -> NaN). It must NOT appear for int->bf16 (no fold)."""
+    """GPU-free guard for the int->fp8 fold workaround (foot-gun #3):
+    generate_mainloop inserts `+ cutlass.full_like(., 0.0)` before the fp8
+    narrowing for integer-loaded operands (else int->fp32->fp8 folds to NaN);
+    absent for int->bf16."""
     # int8 -> fp8: workaround present, narrows to fp8.
-    chain_fp8 = analyze(_mixed_input_graph(True, False, 256, 256, 256, load=cudnn.data_type.INT8, tin=cudnn.data_type.FP8_E4M3)[0])
+    chain_fp8 = analyze(
+        _mixed_input_graph(
+            True,
+            False,
+            256,
+            256,
+            256,
+            load=cudnn.data_type.INT8,
+            tin=cudnn.data_type.FP8_E4M3,
+        )[0]
+    )
     snip = generate_mainloop(chain_fp8, "a")
     assert "cutlass.full_like" in snip and "0.0" in snip
     assert ".to(cutlass.Float8E4M3FN)" in snip
     # int8 -> bf16: no fp8 narrowing, so no workaround.
-    chain_bf16 = analyze(_mixed_input_graph(True, False, 256, 256, 256, load=cudnn.data_type.INT8, tin=cudnn.data_type.BFLOAT16)[0])
+    chain_bf16 = analyze(
+        _mixed_input_graph(
+            True,
+            False,
+            256,
+            256,
+            256,
+            load=cudnn.data_type.INT8,
+            tin=cudnn.data_type.BFLOAT16,
+        )[0]
+    )
     assert "cutlass.full_like" not in generate_mainloop(chain_bf16, "a")
 
 
@@ -674,7 +740,11 @@ def test_e2e_mixed_input_int8_fp8_2ctamma() -> None:
     """int8 -> fp8 (fold workaround) on the 2-CTA template, to cover both staging
     paths (1ctamma is covered by test_e2e_mixed_input_cast_targets)."""
     M, N, K = 512, 512, 512
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.FP8_E4M3,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.INT8)
     Ai = g.identity(input=A, name="pw")
     Ai.set_data_type(cudnn.data_type.FP8_E4M3)

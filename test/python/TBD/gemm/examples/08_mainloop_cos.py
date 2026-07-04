@@ -1,16 +1,9 @@
 """Example 08: mainloop fusion with cos on BOTH operands — cos(A) @ cos(B).
 
-cos has f(0) != 0, so a partial last K-tile (K not a multiple of the K-tile)
-is a correctness trap: the TMA zero-fills the out-of-bounds K elements, but the
-mainloop transform turns those zeros into cos(0)=1, which would then contribute
-1*1 to every accumulator. The mainloop fixes this by zeroing A's OOB K elements
-before the MMA reads them. It reads/writes A with the SAME XOR swizzle the MMA
-expects (load_swizzled / store_swizzled), so the loop index is the *logical*
-(m, k) and the OOB test is just `global_k >= K` — no manual de-swizzle, and it
-works at sub-K-block granularity (handles K=264 where K%16 != 0).
-
-Shapes exercised: M=240 (M-tail), N=272 (N%16==0 but not tile-aligned), and
-K in {288 (K%16==0), 264 (K%16==8, partial OOB K-block)}.
+cos(0)=1, so a partial last K-tile is a trap: TMA zero-fills OOB K elements but
+the transform turns them into 1, contributing 1*1 to every accumulator. Fix: the
+mainloop zeros A's OOB K elements (swizzle-aware, sub-K-block granular). Shapes
+cover K%16==0 and K%16==8 (partial OOB K-block).
 """
 
 from __future__ import annotations
@@ -28,8 +21,8 @@ def _run(M: int, N: int, K: int) -> None:
     )
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
-    Ac = g.cos(input=A, name="cosA")  # mainloop fusion on A
-    Bc = g.cos(input=B, name="cosB")  # mainloop fusion on B
+    Ac = g.cos(input=A, name="cosA").set_data_type(cudnn.data_type.BFLOAT16)
+    Bc = g.cos(input=B, name="cosB").set_data_type(cudnn.data_type.BFLOAT16)
     C = g.matmul(A=Ac, B=Bc, name="mm")
     C.set_output(True)
 
@@ -56,7 +49,7 @@ def _run(M: int, N: int, K: int) -> None:
 
 def main() -> None:
     _run(240, 272, 288)  # K%16 == 0
-    _run(240, 272, 264)  # K%16 == 8 — partial OOB K-block
+    _run(240, 272, 264)  # K%16 == 8, partial OOB K-block
     print("[08] PASS  cos(A) @ cos(B)")
 
 

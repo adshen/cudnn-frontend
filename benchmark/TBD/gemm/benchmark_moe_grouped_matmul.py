@@ -1,32 +1,8 @@
-"""Benchmark every MoE-capable CATALOG config on a single MoE grouped-matmul
-shape vs a cuBLAS batched-GEMM baseline.
+"""Benchmark every MoE-capable CATALOG config on one MoE grouped-matmul shape vs
+a cuBLAS batched-GEMM baseline. Mirrors benchmark_matmul.py.
 
-Mirrors ``benchmark_matmul.py`` (same timing modes, buffer rotation, nsys workflow),
-but the matmul's single batch becomes ``E`` routed **groups** and the M
-(token) dimension is split **evenly** across them: every group owns
-``group_m = S // E`` token rows and uses its own expert weight. So the problem is
-
-    out[g*group_m : (g+1)*group_m] = token[that range] @ weight[g].T   for g in [0, E)
-
-with ``first_token_offset = [0, group_m, 2*group_m, ...]``. Because the split is
-even, the apples-to-apples cuBLAS baseline is a single **batched** GEMM over
-``(E, group_m, K) @ (E, K, N)`` (what cuBLAS would do for equal-sized groups).
-
-Total work = ``2 * S * N * K`` FLOP (every one of the S tokens does one K×N GEMV).
-
-Three timing modes (delayed / nsys / events) and ``--rotate-buffers`` behave
-exactly as in ``benchmark_matmul.py`` — see that file's header for the rationale.
-
-Usage (from workspace root, after `source active_tbd.sh`):
-
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_grouped_matmul.py                          # delayed (default)
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_grouped_matmul.py --timing nsys            # ground-truth
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_grouped_matmul.py --shape 8,512,4096,4096  # G,M,N,K
-    python cudnn.TBD.gemm/benchmarks/benchmark_moe_grouped_matmul.py --configs CONFIG_a,CONFIG_b
-
-`--shape` is `G,M,N,K`: G groups, M tokens per group (even split), N, K. Total
-tokens S = G*M; num_groups == G (group g uses expert g). (active_tbd.sh uses
-$PWD to find .micromamba; source it from the workspace root.)
+`--shape` is `G,M,N,K` (G groups, M tokens/group even split, S=G*M tokens). Even
+split makes the baseline a single batched GEMM over (E, group_m, K) @ (E, K, N).
 """
 
 from __future__ import annotations
@@ -46,9 +22,13 @@ import cudnn.TBD.gemm  # noqa: F401
 import torch
 
 from cudnn.TBD.gemm.compiler import jit_from_cudnn_graph
-from cudnn.TBD.gemm.fusion_ir import FusionChain as _FC, MatmulSpec as _MS, MoeSpec as _MoeS
+from cudnn.TBD.gemm.fusion_ir import (
+    FusionChain as _FC,
+    MatmulSpec as _MS,
+    MoeSpec as _MoeS,
+)
 from cudnn.TBD.gemm.kernel_registry import candidates as _candidates
-from cudnn.TBD.gemm.tile_config import CATALOG, TileConfig
+from cudnn.TBD.gemm.tile_config import TileConfig
 
 
 def _vp_moe(handles, token, weight, fto, output):
@@ -58,16 +38,24 @@ def _vp_moe(handles, token, weight, fto, output):
 
 
 def _build_plan(g, cfg, name):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile the recorded graph with a forced tile config."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
 
 
 def _build_spec_map():
-    """Legacy label -> (geometry cfg, cta_group, scheduler) for every sweepable
-    MoE strategy, via the registry funnel (MoE templates only)."""
+    """Legacy label -> (geometry cfg, cta_group, scheduler) for sweepable MoE
+    strategies, via the registry funnel."""
     chain = _FC(
-        matmul=_MS(M=4096, N=4096, K=4096, a_major="k", b_major="k", a_dtype="bf16", b_dtype="bf16", accum_dtype="fp32"),
+        matmul=_MS(
+            M=4096,
+            N=4096,
+            K=4096,
+            a_major="k",
+            b_major="k",
+            a_dtype="bf16",
+            b_dtype="bf16",
+            accum_dtype="fp32",
+        ),
         output_dtype="bf16",
         moe=_MoeS(num_experts=8),
     )
@@ -92,9 +80,24 @@ def _graph_moe(S: int, N: int, K: int, E: int):
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
-    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    tok = g.tensor(
+        name="token",
+        dim=[1, S, K],
+        stride=[S * K, K, 1],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    w = g.tensor(
+        name="weight",
+        dim=[E, K, N],
+        stride=[K * N, 1, K],
+        data_type=cudnn.data_type.BFLOAT16,
+    )
+    fto = g.tensor(
+        name="first_token_offset",
+        dim=[E, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.INT32,
+    )
     out = g.moe_grouped_matmul(
         tok,
         w,
@@ -121,9 +124,9 @@ def _mkdata(S: int, N: int, K: int, E: int):
     return tok, w, out
 
 
-# ---------------------------------------------------------------------------
-# Buffer rotation — defeat the hot-L2 artifact on small shapes (see benchmark_matmul)
-# ---------------------------------------------------------------------------
+# Buffer rotation — defeat the hot-L2 artifact on small shapes: rotate timed
+# launches across nbuf independent tensor sets so a kernel doesn't re-read the
+# prior launch's inputs from a hot L2 (see benchmark_matmul).
 
 _L2_BYTES_B200 = 126 * 1024 * 1024
 
@@ -153,10 +156,10 @@ _AUTO_NBUF_CAP = 1024
 
 def _auto_nbuf(S: int, N: int, K: int, E: int) -> int:
     """Smallest buffer count whose pool exceeds L2 (1.5× margin), clamped to a
-    memory budget. See benchmark_matmul._auto_nbuf."""
+    memory budget."""
     per_set = _per_set_bytes(S, N, K, E)
     target = int(1.5 * _L2_BYTES_B200)
-    nbuf = max(2, -(-target // per_set))  # ceil-div
+    nbuf = max(2, -(-target // per_set))
     budget = _AUTO_POOL_BUDGET_BYTES
     if torch.cuda.is_available():
         free, _total = torch.cuda.mem_get_info()
@@ -176,27 +179,18 @@ def _rotating(fn_of_buf: Callable, pool: list) -> Callable:
     return lambda i: fn_of_buf(pool[i % n])
 
 
-def _compatible(cfg: TileConfig, N: int, K: int) -> bool:
-    """MoE absorbs any per-group M via TMA OOB, so only N / K must tile cleanly
-    (N-tile = cgrp_tile_n, K-tile = cta_tile_k)."""
-    _tm, tn = cfg.cgrp_tile_mn
-    tk = cfg.cta_tile_k(elem_bytes=2)
-    return N % tn == 0 and K % tk == 0
-
-
 # ---------------------------------------------------------------------------
 # cuBLAS baseline — batched GEMM over the E equal-sized groups
 # ---------------------------------------------------------------------------
 
 
 def _cublas_launch(buf, S: int, N: int, K: int, E: int) -> None:
-    """One batched GEMM: (E, group_m, K) @ (E, K, N) -> (E, group_m, N).
-    Equivalent to the grouped matmul when groups are equal-sized."""
+    """One batched GEMM: (E, group_m, K) @ (E, K, N) -> (E, group_m, N);
+    equivalent to the grouped matmul when groups are equal-sized."""
     tok, w, out = buf
     group_m = S // E
     tok_g = tok.view(E, group_m, K)
     out_g = out.view(E, group_m, N)
-    # w is (E, N, K) → transpose to (E, K, N) for token @ weight.T.
     torch.matmul(tok_g, w.transpose(-1, -2), out=out_g)
 
 
@@ -220,8 +214,8 @@ def _time_ms_events(timed_fn, warmup_fn, *, warmup, iters) -> float:
 
 
 def _time_ms_delayed(timed_fn, warmup_fn, *, warmup, iters) -> float:
-    """Kernel-only timing: hide host-launch overhead behind a delay kernel.
-    See benchmark_matmul._time_ms_delayed for the full rationale."""
+    """Kernel-only timing: queue a _sleep first so the host enqueues every launch
+    behind it and the GPU runs them back-to-back (see benchmark_matmul)."""
     for _ in range(warmup):
         warmup_fn()
     torch.cuda.synchronize()
@@ -302,8 +296,7 @@ def _nsys_run_and_parse(shape, configs, warmup, iters, nbuf) -> dict[str, float]
 
 
 def _parse_nsys_stats(text: str) -> dict[str, float]:
-    """Parse `nsys stats --report cuda_gpu_kern_sum`. See benchmark_matmul for the
-    column layout. Returns {kernel_name: median_ms}."""
+    """Parse `nsys stats --report cuda_gpu_kern_sum` -> {kernel_name: median_ms}."""
     lines = text.splitlines()
     header_i = None
     for i, ln in enumerate(lines):
@@ -346,11 +339,9 @@ def _parse_nsys_stats(text: str) -> dict[str, float]:
 
 
 def _kernel_match_token(cfg: TileConfig, cta_group: int) -> str:
-    """The substring the generated kernel symbol carries for this (template
-    cta_group, geometry): `<G>ctamma_<geometry_name>` (e.g.
-    `2ctamma_128x256x128_128x256x32_cluster2x1`). nsys demangles the symbol to
-    `cutlass::_kernel_sm100_moe_grouped_matmul_fwd_<G>ctamma_<geometry>(...)`, so
-    this token uniquely identifies the (group, geometry) pair."""
+    """`<G>ctamma_<geometry_name>` — the substring the nsys-demangled symbol
+    `cutlass::_kernel_sm100_moe_grouped_matmul_fwd_<G>ctamma_<geom>(...)` carries;
+    uniquely identifies the (group, geometry) pair."""
     return f"{cta_group}ctamma_{cfg.geometry_name}"
 
 
@@ -368,7 +359,7 @@ def _find_cublas_time(kern_times: dict[str, float]) -> tuple[str, float] | None:
 
 def _nsys_worker(shape, configs, warmup, iters, nbuf) -> None:
     G, M, N, K = (int(x) for x in shape.split(","))
-    S, E = G * M, G  # total tokens, num groups
+    S, E = G * M, G
     wtok, ww, wout = _mkdata(S, N, K, E)  # dedicated warmup buffer
     pool = _mkdata_pool(S, N, K, E, nbuf)  # rotation pool for timed iters
     offsets = _offsets(S, E)
@@ -386,7 +377,7 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf) -> None:
     config_names = configs or list(_SPEC_MAP)
     for name in config_names:
         cfg = name_to_cfg.get(name)
-        if cfg is None or not _compatible(cfg, N, K):
+        if cfg is None:
             continue
         try:
             g, h = _graph_moe(S, N, K, E)
@@ -409,12 +400,24 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shape", default="8,512,4096,4096", help="G,M,N,K (groups × per-group-M × N × K; default " "8,512,4096,4096 → S=G*M=4096 tokens)")
+    parser.add_argument(
+        "--shape",
+        default="8,512,4096,4096",
+        help="G,M,N,K (groups × per-group-M × N × K; default " "8,512,4096,4096 → S=G*M=4096 tokens)",
+    )
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=20)  # CLAUDE.md: keep <= 20
-    parser.add_argument("--configs", default=None, help="comma-separated config names (default: every MoE-capable CATALOG entry)")
+    parser.add_argument("--iters", type=int, default=20)  # CLAUDE.md: keep <= 20 (more just holds the GPU)
+    parser.add_argument(
+        "--configs",
+        default=None,
+        help="comma-separated config names (default: every MoE-capable CATALOG entry)",
+    )
     parser.add_argument("--timing", choices=("delayed", "events", "nsys"), default="delayed")
-    parser.add_argument("--stream", action="store_true", help="print each config's result as soon as it finishes (events/delayed only)")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="print each config's result as soon as it finishes (events/delayed only)",
+    )
     parser.add_argument(
         "--rotate-buffers",
         default="auto",
@@ -440,7 +443,6 @@ def main() -> int:
         _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf)
         return 0
 
-    group_m = M
     flops = 2 * S * N * K
     config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
     name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
@@ -465,7 +467,7 @@ def main() -> int:
         return f"  {name:50s} {tflops:8.2f}   {ms:7.3f}   {ratio:>9.2f}×"
 
     if args.timing == "nsys":
-        print(f"  [timing: nsys median kernel duration]\n")
+        print("  [timing: nsys median kernel duration]\n")
         kern_times = _nsys_run_and_parse(args.shape, config_names, args.warmup, args.iters, nbuf)
         cublas_hit = _find_cublas_time(kern_times)
         if cublas_hit:
@@ -479,9 +481,6 @@ def main() -> int:
             cfg = name_to_cfg.get(name)
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
-                continue
-            if not _compatible(cfg, N, K):
-                rows.append((name, 0.0, float("inf"), "incompatible"))
                 continue
             tok = _kernel_match_token(cfg, _SPEC_MAP[name][1])
             matches = [(k, v) for k, v in kern_times.items() if tok in k]
@@ -509,15 +508,16 @@ def main() -> int:
         )
         cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12
         if args.stream:
-            print(_fmt_row("cuBLAS (reference)", cublas_tflops, cublas_ms, "", cublas_tflops), flush=True)
+            print(
+                _fmt_row("cuBLAS (reference)", cublas_tflops, cublas_ms, "", cublas_tflops),
+                flush=True,
+            )
 
         ctx_dead = False
         for name in config_names:
             cfg = name_to_cfg.get(name)
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
-            elif not _compatible(cfg, N, K):
-                row = (name, 0.0, float("inf"), "incompatible")
             elif ctx_dead:
                 row = (name, 0.0, float("inf"), "skipped (CUDA context dead)")
             else:
@@ -527,7 +527,10 @@ def main() -> int:
                     g, h = _graph_moe(S, N, K, E)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
-                        _rotating(lambda t, _plan=plan, _h=h: _plan(_vp_moe(_h, t[0], t[1], offsets, t[2])), pool),
+                        _rotating(
+                            lambda t, _plan=plan, _h=h: _plan(_vp_moe(_h, t[0], t[1], offsets, t[2])),
+                            pool,
+                        ),
                         lambda _plan=plan, _h=h: _plan(_vp_moe(_h, wtok, ww, offsets, wout)),
                         warmup=args.warmup,
                         iters=args.iters,
@@ -536,7 +539,14 @@ def main() -> int:
                 except Exception as e:
                     msg = str(e).splitlines()[0][:50] if str(e) else type(e).__name__
                     row = (name, 0.0, float("inf"), f"ERR {msg}")
-                    if any(s in str(e) for s in ("illegal memory access", "unspecified launch failure", "CUDA_ERROR_LAUNCH_FAILED")):
+                    if any(
+                        s in str(e)
+                        for s in (
+                            "illegal memory access",
+                            "unspecified launch failure",
+                            "CUDA_ERROR_LAUNCH_FAILED",
+                        )
+                    ):
                         ctx_dead = True
             rows.append(row)
             if args.stream:

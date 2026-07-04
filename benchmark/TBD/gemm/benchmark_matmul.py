@@ -1,62 +1,10 @@
 """Benchmark every CATALOG config on a single matmul shape vs cuBLAS.
 
-`--shape` is `B,M,N,K`: B independent same-shape GEMMs (B=1 → a plain matmul;
-B>1 → batched, A=(B,M,K) @ B=(B,N,K).T). Default 1,4096,4096,4096 (BF16). The
-cuBLAS reference is torch.matmul (natively batched). Pure matmul, no fusion. No
-CPU verify (trust the existing test suite — this script is for perf).
+`--shape` is `B,M,N,K` (B independent same-shape GEMMs; B=1 = plain matmul).
+Timing modes: delayed (default) / nsys / events. `--rotate-buffers` defeats
+hot-L2 inflation on small shapes.
 
-Three timing modes:
-
-  * **delayed** (default) — the trick: queue a long `torch.cuda._sleep`
-    onto the stream BEFORE the timed loop, then queue `iters` kernels
-    behind it. While the GPU is busy executing the sleep, the host has
-    plenty of time to enqueue every kernel launch, so by the time the
-    sleep finishes all launches are sitting in the stream and execute
-    back-to-back with no host-side gaps. `start.record()` queues the
-    timestamp right after the sleep, `end.record()` after the last
-    kernel — the elapsed time covers kernel work only. Matches nsys
-    median to <2% on 4096³.
-
-  * **nsys** — re-exec under `nsys profile`, then parse median per-kernel
-    duration from `nsys stats --report cuda_gpu_kern_sum`. Ground truth
-    (reads GPU-side timestamps), and you can inspect the report file.
-    A bit slower (~20s instead of ~15s for 18 configs) because of nsys
-    profile overhead.
-
-  * **events** — plain `torch.cuda.Event` wall-clock around a Python
-    loop. Inflated by ~50us/call from Python + TVM-FFI dispatch — for
-    sub-ms kernels this is significant (GEMM measured ~0.13ms but real
-    kernel time is ~0.085ms). Kept as a fallback / sanity-check mode.
-
-Why we can't use `torch.cuda.CUDAGraph`: GEMM kernels are launched via
-`cuLaunchKernelEx` from libcute_dsl_runtime.so, outside torch's stream
-API, so torch's graph capture produces an empty graph. `cute.testing.benchmark`
-*could* capture, but it requires the cute jit fn to take `stream` as an
-explicit parameter; GEMM's `_host` doesn't, so we'd have to touch every
-kernel template. The delay trick is a less invasive workaround.
-
-Usage (from the cudnn-frontend repo root):
-
-    python benchmark/TBD/gemm/benchmark_matmul.py                              # delayed (default)
-    python benchmark/TBD/gemm/benchmark_matmul.py --timing nsys                # ground-truth
-    python benchmark/TBD/gemm/benchmark_matmul.py --timing events              # incl Python overhead
-    python benchmark/TBD/gemm/benchmark_matmul.py --shape 1,8192,8192,8192    # B,M,N,K
-    python benchmark/TBD/gemm/benchmark_matmul.py --shape 16,512,512,512      # batched (16 GEMMs)
-    python benchmark/TBD/gemm/benchmark_matmul.py --configs CONFIG_a,CONFIG_b
-    python benchmark/TBD/gemm/benchmark_matmul.py --shape 1,1024,1024,1024 --rotate-buffers 64
-
-Buffer rotation (`--rotate-buffers N`, default 'auto'): allocate N independent
-copies of every tensor and rotate the timed launches across them, so a kernel
-never re-reads the previous launch's inputs from a hot L2. Without it, small
-shapes (whose working set fits in B200's ~126 MB L2) report inflated TFLOPS
-because every launch after the first reads its inputs at L2 — not DRAM — speed,
-which a real back-to-back workload wouldn't. The default 'auto' sizes the pool
-to exceed L2 for the given shape (large shapes → 2 copies since one set already
-dwarfs L2; small shapes → scaled up until the pool is L2-cold), capped at 4 GB.
-Warmup runs against a separate dedicated buffer (never rotated). Pass an integer
-to override; `--rotate-buffers 1` disables rotation.
-
-(active_tbd.sh uses $PWD to find .micromamba; source it from workspace root.)
+    python benchmark/TBD/gemm/benchmark_matmul.py --shape 1,8192,8192,8192
 """
 
 from __future__ import annotations
@@ -82,10 +30,21 @@ from cudnn.TBD.gemm.kernel_registry import candidates as _candidates
 
 def _build_spec_map():
     """Legacy label -> (geometry cfg, cta_group, scheduler) for every sweepable
-    matmul strategy, via the registry funnel (excludes known-bad/unsupported).
-    Labels reconstruct the old CONFIG_..._Nctamma[_static] form so --configs
-    still accepts them."""
-    chain = _FC(matmul=_MS(M=4096, N=4096, K=4096, a_major="k", b_major="k", a_dtype="bf16", b_dtype="bf16", accum_dtype="fp32"), output_dtype="bf16")
+    matmul strategy, via the registry funnel. Labels reconstruct the old
+    CONFIG_..._Nctamma[_static] form so --configs still accepts them."""
+    chain = _FC(
+        matmul=_MS(
+            M=4096,
+            N=4096,
+            K=4096,
+            a_major="k",
+            b_major="k",
+            a_dtype="bf16",
+            b_dtype="bf16",
+            accum_dtype="fp32",
+        ),
+        output_dtype="bf16",
+    )
     m = {}
     for t, cfg in _candidates(chain):
         label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
@@ -94,7 +53,6 @@ def _build_spec_map():
 
 
 _SPEC_MAP = _build_spec_map()
-from cudnn.TBD.gemm.tile_config import CATALOG, TileConfig
 
 
 def _vp(handles, a, b, c):
@@ -104,8 +62,7 @@ def _vp(handles, a, b, c):
 
 
 def _build_plan(g, cfg, name):
-    """JIT-compile the recorded graph with a forced tile config via jit_from_cudnn_graph.
-    Returns the compiled kernel (callable with a variant-pack dict)."""
+    """JIT-compile the recorded graph with a forced tile config."""
     return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
 
 
@@ -138,29 +95,21 @@ def _mkdata(batch: int, M: int, N: int, K: int):
 # ---------------------------------------------------------------------------
 # Buffer rotation — defeat the hot-L2 artifact on small shapes
 # ---------------------------------------------------------------------------
-#
-# Back-to-back launches against the SAME a/b/c keep those tensors resident in
-# L2, so a small matmul reads its inputs at L2 latency/bandwidth instead of
-# DRAM — inflating the measured TFLOPS vs a cold first launch. To measure
-# realistic (DRAM-fed) performance, allocate a POOL of N independent copies of
-# every tensor and rotate the launch across them: launch i uses pool[i % N].
-# If the pool footprint exceeds L2 (~126 MB on B200), by the time the rotation
-# wraps back to buffer 0 its data has been evicted, so every launch pays the
-# DRAM cost — the same situation a real workload sees.
+# Rotating launches across a pool of independent tensor copies (launch i uses
+# pool[i % N]) forces DRAM reads once the pool exceeds L2 — otherwise a small
+# matmul re-reads hot-L2 inputs and reports inflated TFLOPS.
 
 
-# B200 L2 is ~126 MB. A pool smaller than this still gets fully cached after one
-# rotation, so its launches stay warm — warn the user to bump --rotate-buffers.
+# B200 L2 is ~126 MB; a pool smaller than this stays fully cached — warn to bump.
 _L2_BYTES_B200 = 126 * 1024 * 1024
 
 
 def _mkdata_pool(batch: int, M: int, N: int, K: int, nbuf: int):
-    """Return a list of `nbuf` independent (a, b, c) triples at distinct GMEM
-    addresses. nbuf<=1 returns the single base triple (legacy behavior)."""
+    """`nbuf` independent (a, b, c) triples at distinct GMEM addresses (nbuf<=1
+    returns the single base triple)."""
     a, b, c = _mkdata(batch, M, N, K)
     pool = [(a, b, c)]
-    # Distinct allocations (clone → fresh GMEM). Contents are irrelevant for
-    # perf timing; what matters is that each launch hits a different address.
+    # Distinct allocations (clone → fresh GMEM); contents don't matter for timing.
     for _ in range(max(0, nbuf - 1)):
         pool.append((a.clone(), b.clone(), c.clone()))
     return pool
@@ -175,23 +124,19 @@ def _pool_footprint_bytes(batch: int, M: int, N: int, K: int, nbuf: int) -> int:
     return _per_set_bytes(batch, M, N, K) * nbuf
 
 
-# Cap the auto-sized pool so a large shape (whose single tensor set already
-# dwarfs L2) doesn't allocate dozens of needless multi-GB copies.
+# Cap the auto-sized pool so a large shape doesn't allocate needless copies.
 _AUTO_POOL_BUDGET_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
 _AUTO_NBUF_CAP = 1024
 
 
 def _auto_nbuf(batch: int, M: int, N: int, K: int) -> int:
-    """Pick the smallest buffer count whose pool exceeds L2 (with 1.5× margin
-    so the wrap-around is a guaranteed miss), clamped to a memory budget.
-
-    Large shapes → 2 (one tensor set already far exceeds L2, so minimal
-    rotation suffices). Small shapes → scaled up until the pool is L2-cold."""
+    """Smallest buffer count whose pool exceeds L2 (1.5× margin), clamped to a
+    memory budget. Large shapes → 2; small shapes → scaled up until L2-cold."""
     per_set = _per_set_bytes(batch, M, N, K)
     target = int(1.5 * _L2_BYTES_B200)
     nbuf = max(2, -(-target // per_set))  # ceil-div
 
-    # Don't exceed a memory budget: min(4 GB, half of currently-free GMEM).
+    # Cap at min(4 GB, half of currently-free GMEM).
     budget = _AUTO_POOL_BUDGET_BYTES
     if torch.cuda.is_available():
         free, _total = torch.cuda.mem_get_info()
@@ -202,24 +147,17 @@ def _auto_nbuf(batch: int, M: int, N: int, K: int) -> int:
 
 
 def _resolve_nbuf(spec: str, batch: int, M: int, N: int, K: int) -> int:
-    """Resolve the --rotate-buffers CLI value: 'auto' → shape-sized count,
-    else the given integer (floored at 1 = rotation disabled)."""
+    """Resolve --rotate-buffers: 'auto' → shape-sized count, else the integer
+    (1 = rotation disabled)."""
     if spec.strip().lower() == "auto":
         return _auto_nbuf(batch, M, N, K)
     return max(1, int(spec))
 
 
 def _rotating(fn_of_buf: Callable, pool: list) -> Callable:
-    """Wrap a `(a, b, c) -> None` callable into an `i -> None` callable that
-    selects pool[i % len(pool)] for launch index i."""
+    """Wrap `(a,b,c) -> None` into `i -> None` selecting pool[i % len(pool)]."""
     n = len(pool)
     return lambda i: fn_of_buf(pool[i % n])
-
-
-def _compatible(cfg: TileConfig, M: int, N: int, K: int) -> bool:
-    tm, tn = cfg.cgrp_tile_mn
-    tk = cfg.cta_tile_k(elem_bytes=2)
-    return M % tm == 0 and N % tn == 0 and K % tk == 0
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +173,8 @@ def _time_ms_events(
     iters: int,
 ) -> float:
     """Wall-clock CUDA Event timing around a python loop. Inflated by
-    Python+TVM-FFI dispatch overhead (~50us/call); use `--timing delayed`
-    or `--timing nsys` for clean kernel-only timing.
-
-    `timed_fn(i)` is the per-launch callable for the timed loop (i = launch
-    index, used to rotate buffers). `warmup_fn()` runs the warmup launches
-    against a separate dedicated buffer (not part of the rotation pool)."""
+    Python+TVM-FFI dispatch overhead (~50us/call). `timed_fn(i)` rotates
+    buffers; `warmup_fn()` uses a separate dedicated buffer."""
     for _ in range(warmup):
         warmup_fn()
     torch.cuda.synchronize()
@@ -261,48 +195,24 @@ def _time_ms_delayed(
     warmup: int,
     iters: int,
 ) -> float:
-    """Kernel-only timing by hiding host-launch overhead behind a delay kernel.
+    """Kernel-only timing: queue a long `_sleep` first so the host enqueues
+    every launch behind it → kernels run back-to-back with no host gaps.
+    `timed_fn(i)` rotates buffers; `warmup_fn()` uses a separate buffer.
 
-    `timed_fn(i)` is the per-launch callable for the timed loop (i = launch
-    index, used to rotate buffers); `warmup_fn()` runs the warmups against a
-    separate dedicated buffer (not part of the rotation pool).
-
-    Pattern on the stream (everything async, GPU executes in order):
-
-        torch.cuda._sleep(D)        # ~120ms — host enqueues all of the below
-                                    # while GPU is busy here
-        for _ in range(post_warmup):
-            warmup_fn()             # post-sleep warmup so SM clocks are boosted
-                                    # by the time we start timing
-        start.record()
-        for i in range(iters):
-            timed_fn(i)
-        end.record()
-
-    Why the post-sleep warmup matters: the first few kernels after the sleep
-    (especially small/fast ones) run at lower SM clock — `_sleep` keeps the
-    GPU busy but doesn't fully load the FMA / TC pipes, so DVFS hasn't ramped
-    to boost. Without this warmup, the first delayed measurement of a fast
-    config (e.g. 64×256) inflates ~2× while the second is fine. With it the
-    first run already matches the nsys median.
-
-    The delay needs to outlast `iters × per_launch_host_overhead` (~50us/call
-    for GEMM kernels). Floor 1e8 cycles ≈ 60ms; for big `iters` we scale up.
-    """
+    The post-sleep warmup ramps SM clocks (DVFS) back up before timing —
+    without it the first fast-config measurement inflates ~2×."""
     for _ in range(warmup):
         warmup_fn()
     torch.cuda.synchronize()
 
-    # Auto-scale the delay: 50us/launch * iters + 20ms slack, in B200 cycles.
-    # B200 SM clock ~1.7 GHz → 1ms = 1.7e6 cycles. Floor at 1e8 cycles.
+    # Delay must outlast iters × ~50us host overhead. B200 ~1.7 GHz; floor 1e8.
     delay_cycles = max(
         int(1e8),
         int((iters * 0.05 + 20.0) * 1.7e6),
     )
     torch.cuda._sleep(delay_cycles)
 
-    # Post-sleep warmup (queued behind the sleep, same stream) — ramps GPU
-    # clocks back up before we start timing.
+    # Post-sleep warmup (behind the sleep) ramps clocks before timing.
     post_warmup = max(5, warmup)
     for _ in range(post_warmup):
         warmup_fn()
@@ -329,14 +239,10 @@ def _nsys_run_and_parse(
     iters: int,
     nbuf: int,
 ) -> dict[str, float]:
-    """Re-exec self under nsys, run every (config) sequentially, parse the
-    `cuda_gpu_kern_sum` report to get median kernel time (ms) per config.
-
-    Returns {config_name_or_'cuBLAS': median_ms}.
-    """
-    # Prefer the system-wide nsys (/usr/local/bin/nsys). The cuda-13.x
-    # bundled nsys in this env's PATH has an unresolved libbpf.so.1
-    # dependency on B200 — falling back to it would just error out.
+    """Re-exec self under nsys, parse `cuda_gpu_kern_sum` for median kernel
+    time (ms) per config. Returns {config_name_or_'cuBLAS': median_ms}."""
+    # Prefer the system-wide nsys; the PATH cuda-13.x bundle has a broken
+    # libbpf.so.1 dependency on B200.
     nsys = "/usr/local/bin/nsys" if os.path.exists("/usr/local/bin/nsys") else shutil.which("nsys")
     if nsys is None:
         sys.exit("nsys not found — install nsight-systems or use the default events mode.")
@@ -345,12 +251,11 @@ def _nsys_run_and_parse(
     os.makedirs(workdir, exist_ok=True)
     report_prefix = os.path.join(workdir, "report")
 
-    # nsys writes to /tmp/nvidia/nsight_systems by default; on this host that
-    # path is owned by root and the user can't write to it. Redirect via env.
+    # Redirect nsys's default /tmp/nvidia path (root-owned on this host) via env.
     nsys_env = os.environ.copy()
     nsys_env.setdefault("TMPDIR", os.environ.get("TMPDIR", tempfile.gettempdir()))
 
-    # Build the inner command — same script with --_nsys-worker.
+    # Inner command — same script with --_nsys-worker.
     inner = [
         sys.executable,
         "-u",
@@ -368,8 +273,7 @@ def _nsys_run_and_parse(
     if configs:
         inner += ["--configs", ",".join(configs)]
 
-    # Step 1: profile (record only; --stats output to stdout is unreliable
-    # across nsys versions when capture_output=True).
+    # Step 1: profile (record only; --stats stdout is unreliable across versions).
     profile_cmd = [
         nsys,
         "profile",
@@ -407,20 +311,10 @@ def _nsys_run_and_parse(
 
 
 def _parse_nsys_stats(text: str) -> dict[str, float]:
-    """Parse `nsys stats --report cuda_gpu_kern_sum` output. Returns
-    {kernel_name (possibly truncated with …): median_ms}.
-
-    Format (nsys 2025+):
-
-      Time (%)  Total Time (ns)  Instances  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)  Name
-      --------  ---------------  ---------  --------  --------  --------  --------  -----------  ----
-       22.4     25,508,650       35         728,818.6 728,898.0 727,970   729,699   496.6        kernel_cutlass__kernel_CONFIG_sm100_...…
-
-    Numeric columns are space-separated but each number may contain commas
-    as thousands separators (no spaces inside a number). The Name column
-    starts at a fixed text offset in the header (used to extract the rest
-    of the line — names contain spaces, parens, and may be truncated with `…`).
-    """
+    """Parse `nsys stats --report cuda_gpu_kern_sum`. Returns {kernel_name:
+    median_ms}. Columns: 8 numeric (Time% Total Instances Avg Med Min Max
+    StdDev), then Name. Numbers may carry commas but no internal spaces, so
+    whitespace tokenization is reliable."""
     lines = text.splitlines()
     header_i = None
     for i, ln in enumerate(lines):
@@ -434,10 +328,7 @@ def _parse_nsys_stats(text: str) -> dict[str, float]:
     unit = m_unit.group(1) if m_unit else "ns"
     unit_div = {"ns": 1e6, "us": 1e3, "ms": 1.0, "s": 1e-3}.get(unit, 1e6)
 
-    # Numeric columns (0-indexed): 0 Time%, 1 Total, 2 Instances, 3 Avg, 4 Med,
-    # 5 Min, 6 Max, 7 StdDev, then the kernel name (everything that follows).
-    # Numbers may contain commas as thousands separators but no internal spaces,
-    # so whitespace tokenization is reliable.
+    # Med is numeric col 4 (0-indexed); the name is everything after col 8.
     NUM_NUMERIC_COLS = 8
     MED_COL = 4
 
@@ -473,15 +364,12 @@ def _parse_nsys_stats(text: str) -> dict[str, float]:
 
 
 def _match_kernel_name(kern_name: str, config_name: str) -> bool:
-    """nsys reports demangled symbols like
-    'cutlass::_kernel_CONFIG_sm100_...<...>(...)'. Match by substring."""
+    """Match a config against nsys's demangled symbol by substring."""
     return config_name in kern_name
 
 
 def _find_cublas_time(kern_times: dict[str, float]) -> tuple[str, float] | None:
-    """Largest 'nvjet_*' kernel (cuBLAS) — assume single-kernel matmul, but
-    if multiple match, pick the one with the largest invocation total (Med
-    is what we have, so longest median)."""
+    """The cuBLAS 'nvjet_*' kernel with the longest median."""
     cands = [(k, v) for k, v in kern_times.items() if k.startswith("nvjet_")]
     if not cands:
         return None
@@ -500,18 +388,16 @@ def _nsys_worker(
     iters: int,
     nbuf: int,
 ) -> None:
-    """Inner mode: re-exec'd under nsys. Run each config (and cuBLAS) for
-    warmup+iters launches each, no timing. nsys captures everything.
-
-    Warmup runs against a dedicated buffer; the timed iters rotate across a
-    pool of `nbuf` independent buffers to avoid the hot-L2 artifact."""
+    """Inner mode re-exec'd under nsys: run each config (and cuBLAS) for
+    warmup+iters launches, no timing — nsys captures it. Timed iters rotate
+    across the pool; warmup uses a dedicated buffer."""
     B, M, N, K = (int(x) for x in shape.split(","))
     wa, wb, wc = _mkdata(B, M, N, K)  # dedicated warmup buffer
     pool = _mkdata_pool(B, M, N, K, nbuf)  # rotation pool for timed iters
 
     print(f"[worker] shape={B}x{M}x{N}x{K}, configs={len(configs)}, " f"warmup={warmup}, iters={iters}, rotate_buffers={nbuf}")
 
-    # 1. cuBLAS — torch.matmul.
+    # 1. cuBLAS.
     for _ in range(warmup):
         torch.matmul(wa, wb.transpose(-1, -2), out=wc)
     for i in range(iters):
@@ -525,8 +411,6 @@ def _nsys_worker(
     for name in config_names:
         cfg = name_to_cfg.get(name)
         if cfg is None:
-            continue
-        if not _compatible(cfg, M, N, K):
             continue
         try:
             g, h = _graph_matmul(B, M, N, K)
@@ -555,8 +439,7 @@ def main() -> int:
         help="B,M,N,K (default 1,4096,4096,4096; B = batch / number of " "independent same-shape GEMMs)",
     )
     parser.add_argument("--warmup", type=int, default=10)
-    # Perf-testing rule (CLAUDE.md): keep iters <= 20 — more doesn't sharpen the
-    # measurement here, it just lengthens the run / holds the GPU.
+    # CLAUDE.md: keep iters <= 20 (more doesn't sharpen the measurement).
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
         "--configs",
@@ -644,8 +527,7 @@ def main() -> int:
         return f"  {name:50s} {tflops:8.2f}   {ms:7.3f}   {ratio:>9.2f}×"
 
     if args.timing == "nsys":
-        # nsys mode: one driver invocation, parse kernel times.
-        print(f"  [timing: nsys median kernel duration]\n")
+        print("  [timing: nsys median kernel duration]\n")
         kern_times = _nsys_run_and_parse(args.shape, config_names, args.warmup, args.iters, nbuf)
 
         cublas_hit = _find_cublas_time(kern_times)
@@ -662,32 +544,27 @@ def main() -> int:
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            if not _compatible(cfg, M, N, K):
-                rows.append((name, 0.0, float("inf"), "incompatible"))
-                continue
             matches = [(k, v) for k, v in kern_times.items() if _match_kernel_name(k, name)]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))
                 continue
-            # If multiple specializations share the same config name, pick the
-            # heaviest (most representative).
+            # Multiple specializations share a config name → pick the heaviest.
             _, ms = max(matches, key=lambda x: x[1])
             rows.append((name, flops / (ms * 1e-3) / 1e12, ms, ""))
     else:
-        # In-process events timing (events or delayed).
         timer = _time_ms_delayed if args.timing == "delayed" else _time_ms_events
         if args.timing == "delayed":
-            print(f"  [timing: events bracketed around delayed back-to-back " f"launches — host overhead hidden behind a CUDA _sleep]\n")
+            print("  [timing: events bracketed around delayed back-to-back " "launches — host overhead hidden behind a CUDA _sleep]\n")
         else:
             print(
-                f"  [timing: torch.cuda.Event wall-clock around python loop — "
-                f"includes ~50us/call Python+TVM-FFI dispatch overhead; use "
-                f"--timing delayed or --timing nsys for kernel-only timing]\n"
+                "  [timing: torch.cuda.Event wall-clock around python loop — "
+                "includes ~50us/call Python+TVM-FFI dispatch overhead; use "
+                "--timing delayed or --timing nsys for kernel-only timing]\n"
             )
         wa, wb, wc = _mkdata(B, M, N, K)  # dedicated warmup buffer
         pool = _mkdata_pool(B, M, N, K, nbuf)  # rotation pool for timed iters
         if args.stream:
-            print(f"  ▶ running cuBLAS reference ...", flush=True)
+            print("  ▶ running cuBLAS reference ...", flush=True)
         cublas_ms = timer(
             _rotating(lambda t: torch.matmul(t[0], t[1].transpose(-1, -2), out=t[2]), pool),
             lambda: torch.matmul(wa, wb.transpose(-1, -2), out=wc),
@@ -701,20 +578,14 @@ def main() -> int:
                 flush=True,
             )
 
-        # Once a kernel emits an async device-side fault (e.g. illegal address),
-        # the CUDA context stays sticky-poisoned for the rest of the process —
-        # every subsequent cuLaunchKernel returns CUDA_ERROR_LAUNCH_FAILED even
-        # for known-good configs. JIT-compiling + launching every remaining
-        # config in that state still costs seconds each, which looks like a
-        # hang. After the first such error, short-circuit the remaining
-        # configs and mark them CTX_DEAD instead of trying to launch them.
+        # An async device fault sticky-poisons the CUDA context for the rest of
+        # the process (every later launch returns LAUNCH_FAILED). After the
+        # first such error, short-circuit the remaining configs as CTX_DEAD.
         ctx_dead = False
         for name in config_names:
             cfg = name_to_cfg.get(name)
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
-            elif not _compatible(cfg, M, N, K):
-                row = (name, 0.0, float("inf"), "incompatible")
             elif ctx_dead:
                 row = (name, 0.0, float("inf"), "skipped (CUDA context dead)")
             else:
@@ -724,7 +595,10 @@ def main() -> int:
                     g, h = _graph_matmul(B, M, N, K)
                     plan = _build_plan(g, cfg, name)
                     ms = timer(
-                        _rotating(lambda t, _plan=plan, _h=h: _plan(_vp(_h, t[0], t[1], t[2])), pool),
+                        _rotating(
+                            lambda t, _plan=plan, _h=h: _plan(_vp(_h, t[0], t[1], t[2])),
+                            pool,
+                        ),
                         lambda _plan=plan, _h=h: _plan(_vp(_h, wa, wb, wc)),
                         warmup=args.warmup,
                         iters=args.iters,
@@ -733,8 +607,7 @@ def main() -> int:
                 except Exception as e:
                     msg = str(e).splitlines()[0][:50] if str(e) else type(e).__name__
                     row = (name, 0.0, float("inf"), f"ERR {msg}")
-                    # CUDA context-poisoning errors are unrecoverable in this
-                    # process. Stop trying — everything after will fail too.
+                    # Context-poisoning errors are unrecoverable — stop trying.
                     if any(
                         s in str(e)
                         for s in (
@@ -748,7 +621,6 @@ def main() -> int:
             if args.stream:
                 print(_fmt_row(*row, cublas_tflops), flush=True)
 
-    # Sort best → worst, print.
     rows.sort(key=lambda r: -r[1])
     print("=" * 88)
     print(f"  {'config':50s} {'TFLOPS':>8s}   {'ms':>7s}   {'vs cuBLAS':>10s}")

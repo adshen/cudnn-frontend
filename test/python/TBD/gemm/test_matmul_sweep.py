@@ -1,57 +1,10 @@
-"""Correctness sweep over (config × dtype-pair × shape).
+"""Correctness sweep over (config × dtype-pair × shape) — the matmul regression gate.
 
-This is the project's standing regression gate for the matmul kernels: every
-parametrized case builds a cuDNN frontend graph, JITs through the GEMM hook,
-launches against torch-fp32 ground truth, and asserts bit-tight equality on
-the downcast (small-integer inputs keep the FP32 reduction exact).
-
-What's covered
---------------
-
-* **Configs**: a curated 12-config subset of the CATALOG covering every
-  template-architectural corner (CTA_1 / CTA_2, single-CTA / cluster /
-  multicast / cluster-MMA m=128, K_BYTES ∈ {64, 128}, several `cta_tile_n`).
-  Set ``CUDNN_GEMM_TEST_FULL=1`` to expand to all 192 catalog configs (~30 min).
-* **Dtype pairs**: BF16/FP16 same-dtype, FP8 E4M3 / E5M2 into FP16, and the
-  mixed FP8 → BF16 case. Every input dtype the project supports.
-* **Shapes**: tile-aligned baseline plus M-OOB, K-OOB, and combined M+K-OOB
-  shapes — the latter only valid because TMA's default OOB-fill puts zeros
-  in SMEM (a misleadingly-named "NONE" mode at the CUDA driver layer; cuDNN
-  internally calls the same bit ``TENSOR_ZFILL``). See SKILL.md's "OOB shape
-  handling" section. N-OOB is **not** exercised — the STG store path bakes
-  a row-stride alignment at JIT time.
-* **Batched GEMM**: the same dtype-pair menu and the same shape classes, with
-  representative CTA_1 / multicast / CTA_2 configs and batch sizes 1, 2, 3.
-* **Batch-broadcast GEMM**: the same batched mainloop coverage with either A
-  or B using batch 1 and the other input using the output batch.
-* **Input layouts**: A K/M-major and B K/N-major combinations for pure,
-  batched, and batch-broadcast matmul.
-
-How it runs
------------
-
-Parametrize order is **(config outermost, dtype middle, shape innermost)** so
-each (config, in_dt, out_dt) block of 9 shapes reuses one compiled kernel
-via the session-scoped ``_compile_cache`` fixture. Default sweep is ~981
-launched/skip cases in ~2-3 minutes on B200.
-
-Knobs:
-
-* ``CUDNN_GEMM_TEST_FULL=1`` → expand the config axis to the whole CATALOG.
-* ``pytest -k <substring>`` → filter cases by ID (e.g. ``-k 255x256x240``
-  to run a specific shape, ``-k cluster2x4`` for cluster-m=128, ``-k fp8``
-  for FP8-only).
-* ``pytest -x`` → stop on first failure (useful when chasing a regression).
-
-Standalone CLI
---------------
-
-The file is pytest-first but also runs as a script::
-
-    python cudnn.TBD.gemm/tests/test_matmul_sweep.py            # invokes pytest under the hood
-    python cudnn.TBD.gemm/tests/test_matmul_sweep.py -k cta2    # forwarded to pytest
-
-so older shell wrappers (``my_run_test.sh``) keep working without changes.
+Each case builds a frontend graph, JITs through the GEMM hook, and asserts
+bit-tight equality vs torch-fp32 (small-integer inputs keep the reduction exact).
+Parametrize order is (config, dtype, shape) so each (config, dtype) block reuses
+one compiled kernel. CUDNN_GEMM_TEST_FULL=1 expands the config axis to the whole
+CATALOG. Also runnable as a script (forwards argv to pytest).
 """
 
 from __future__ import annotations
@@ -75,11 +28,9 @@ from cudnn.TBD.gemm.tile_config import CATALOG
 
 
 class _Plan:
-    """Test handle that JIT-compiles a recorded graph with a forced tile config
-    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly via the
-    low-level entry rather than letting the TBD engine auto-select). Exposes
-    chain / binding / block_scale / aux_names and is callable
-    with a variant pack."""
+    """JIT-compiles a recorded graph with a forced tile config (bypassing the
+    TBD engine's auto-select). Exposes chain / binding / block_scale / aux_names;
+    callable with a variant pack."""
 
     def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
         self.g = graph
@@ -97,12 +48,17 @@ class _Plan:
 
 
 def _plan(graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
+    return _Plan(
+        graph,
+        config=config,
+        cta_group=cta_group,
+        scheduler=scheduler,
+        force_stg_epi=force_stg_epi,
+    )
 
 
 def _vp(compiled, a, b, outs, *aux):
-    """Variant-pack dict {cuDNN tensor: buffer} from the compiled binding
-    (A/B operands, chain.outputs slot order, then aux in order)."""
+    """Variant-pack dict {cuDNN tensor: buffer}: A/B operands, outputs, then aux."""
     bd = compiled.binding
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     vp = {bd.a_operands[0]: a, bd.b_operands[0]: b}
@@ -114,10 +70,6 @@ def _vp(compiled, a, b, outs, *aux):
 # INT8 matmul runs only on SM 100 or SM 110 (disjoint range).
 _INT8_SM_RANGES = ((100, 101), (110, 111))
 
-
-# ---------------------------------------------------------------------------
-# Dtype tables
-# ---------------------------------------------------------------------------
 
 _TORCH_DTYPE = {
     "bf16": torch.bfloat16,
@@ -134,32 +86,30 @@ _CUDNN_DTYPE = {
 _ELEM_BYTES = {"bf16": 2, "fp16": 2, "fp8_e4m3": 1, "fp8_e5m2": 1}
 
 
-# ---------------------------------------------------------------------------
-# Sweep menus
-# ---------------------------------------------------------------------------
-
-# Shape menu: tile-aligned baseline + M-OOB + K-OOB + combined M+K-OOB. N
-# stays aligned across the whole menu — see _compatible() for why.
+# Shape menu: tile-aligned baseline + M-OOB + K-OOB + combined M+K-OOB. N stays
+# aligned across the whole menu — see _compatible() for why.
 _WEIRD_SHAPES: tuple[tuple[int, int, int], ...] = (
     # Tile-aligned baseline.
-    (384, 768, 384),  # oblong
-    (640, 384, 512),  # tall-ish
-    (256, 1280, 256),  # wide-flat
-    (512, 1024, 640),  # mid, K = 5×128
+    (384, 768, 384),
+    (640, 384, 512),
+    (256, 1280, 256),
+    (512, 1024, 640),  # K = 5×128
     # M-OOB (N aligned, K aligned).
     (255, 256, 256),  # one row short of a tile
     (200, 256, 256),  # deep inside a partial tile
-    # K-OOB (M aligned, N aligned). Note (256,256,200) SKIPs for FP8
-    # (K=200 violates the FP8 16-byte TMA stride rule).
-    (256, 256, 200),  # partial K-tile (valid for BF16/FP16, SKIP for FP8)
+    # K-OOB (M aligned, N aligned).
+    (
+        256,
+        256,
+        200,
+    ),  # partial K-tile (valid for BF16/FP16, SKIP for FP8: 16B TMA stride)
     (256, 256, 96),  # smaller than one K_BYTES=128 BF16 tile
-    # M + K OOB. The user's original `my_run_test.sh` shape.
+    # M + K OOB.
     (255, 256, 240),
 )
 
-# (input_dtype, output_dtype) pairs. Covers same-dtype BF16/FP16 plus the
-# typical FP8-inference setup (FP8 in → FP16 out) for both E4M3 and E5M2,
-# plus one mixed FP8 → BF16.
+# (input_dtype, output_dtype) pairs: same-dtype BF16/FP16, FP8 E4M3/E5M2 → FP16,
+# and one mixed FP8 → BF16.
 _CORE_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
     ("bf16", "bf16"),
     ("fp16", "fp16"),
@@ -168,9 +118,8 @@ _CORE_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
     ("fp8_e4m3", "bf16"),
 )
 
-# Curated config subset. Each entry covers a distinct template-architectural
-# corner; adding configs here trades runtime for coverage. The full CATALOG
-# sweep is opt-in via CUDNN_GEMM_TEST_FULL=1.
+# Curated config subset — each entry covers a distinct template-architectural
+# corner. Full CATALOG sweep is opt-in via CUDNN_GEMM_TEST_FULL=1.
 _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",  # baseline cta1 single-CTA
     "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma",  # large N
@@ -184,10 +133,7 @@ _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x256x64_128x256x32_cluster2x1_2ctamma",  # cta2 K_BYTES=64
     "CONFIG_sm100_128x128x128_128x128x32_cluster4x2_2ctamma",  # cta2 big cluster
     "CONFIG_sm100_64x64x128_64x64x32_cluster2x4_2ctamma",  # cta2 cluster-m=128 (cta_tile_m=64)
-    # K_BYTES=64 large-cluster coverage — geometry mirrors the K_BYTES=128
-    # entries above (both-multicast cta1, big cta2 cluster, cta2 cluster-m=128).
-    # Validated 2026-06-05 (380/380 back-to-back stress sweep, zero failures);
-    # closes the former "K_BYTES=64 large-cluster" open issue.
+    # K_BYTES=64 large-cluster coverage — mirrors the K_BYTES=128 entries above.
     "CONFIG_sm100_64x64x64_64x64x32_cluster2x2_1ctamma",  # cta1 both multicasts, K_BYTES=64
     "CONFIG_sm100_128x128x64_128x128x32_cluster4x2_2ctamma",  # cta2 big cluster, K_BYTES=64
     "CONFIG_sm100_64x64x64_64x64x32_cluster2x4_2ctamma",  # cta2 cluster-m=128, K_BYTES=64
@@ -202,31 +148,29 @@ _BATCHED_CONFIGS: tuple[str, ...] = (
 )
 
 _BATCHED_SHAPES: tuple[tuple[int, int, int, int], ...] = (
-    # Same shape classes as _WEIRD_SHAPES, prefixed with batch. Keep batches
-    # in {1,2,3}; the runtime wrapper intentionally binds to the graph batch,
-    # so each distinct batch value needs its own compiled graph anchor.
-    (1, 384, 768, 384),  # rank-3 path with one batch slice
-    (2, 640, 384, 512),  # tall-ish
-    (3, 256, 1280, 256),  # wide-flat
-    (2, 512, 1024, 640),  # mid, K = 5x128
-    (3, 255, 256, 256),  # M-OOB: one row short of a tile
-    (1, 200, 256, 256),  # M-OOB: deep inside a partial tile
+    # _WEIRD_SHAPES classes prefixed with batch. Batches in {1,2,3}; the runtime
+    # binds to the graph batch, so each distinct batch needs its own compiled anchor.
+    (1, 384, 768, 384),
+    (2, 640, 384, 512),
+    (3, 256, 1280, 256),
+    (2, 512, 1024, 640),
+    (3, 255, 256, 256),  # M-OOB
+    (1, 200, 256, 256),  # M-OOB
     (2, 256, 256, 200),  # K-OOB: SKIP for FP8
-    (3, 256, 256, 96),  # K-OOB: smaller than one BF16 K_BYTES=128 tile
+    (3, 256, 256, 96),  # K-OOB
     (2, 255, 256, 240),  # M + K OOB
 )
 
 _BATCH_BROADCAST_SHAPES: tuple[tuple[int, int, int, int], ...] = (
-    # Same M/N/K classes as _WEIRD_SHAPES, but keep output batch > 1 so one
-    # input is a real broadcast source in every case.
-    (2, 384, 768, 384),  # oblong
-    (3, 640, 384, 512),  # tall-ish
-    (2, 256, 1280, 256),  # wide-flat
-    (3, 512, 1024, 640),  # mid, K = 5x128
-    (2, 255, 256, 256),  # M-OOB: one row short of a tile
-    (3, 200, 256, 256),  # M-OOB: deep inside a partial tile
+    # _WEIRD_SHAPES M/N/K classes, output batch > 1 so one input is a real broadcast.
+    (2, 384, 768, 384),
+    (3, 640, 384, 512),
+    (2, 256, 1280, 256),
+    (3, 512, 1024, 640),
+    (2, 255, 256, 256),  # M-OOB
+    (3, 200, 256, 256),  # M-OOB
     (2, 256, 256, 200),  # K-OOB: SKIP for FP8
-    (3, 256, 256, 96),  # K-OOB: smaller than one BF16 K_BYTES=128 tile
+    (3, 256, 256, 96),  # K-OOB
     (2, 255, 256, 240),  # M + K OOB
 )
 
@@ -269,12 +213,15 @@ _LEGACY_RE = re.compile(r"^(CONFIG_sm100_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)
 
 
 def _resolve(legacy_name):
-    """Legacy config-name (with _Nctamma/_static) -> (pure-geometry config,
-    cta_group, scheduler). Names are kept as readable test IDs; the catalog is
-    pure geometry and the registry picks the template from cta_group/scheduler."""
+    """Legacy config-name (with _Nctamma/_static, kept as readable test IDs) ->
+    (pure-geometry config, cta_group, scheduler)."""
     m = _LEGACY_RE.match(legacy_name)
     assert m, legacy_name
-    return (_NAME_TO_CFG[m.group(1)], int(m.group(2)), "static" if m.group(3) else "clc")
+    return (
+        _NAME_TO_CFG[m.group(1)],
+        int(m.group(2)),
+        "static" if m.group(3) else "clc",
+    )
 
 
 def _sweep_config_names() -> list[str]:
@@ -284,9 +231,7 @@ def _sweep_config_names() -> list[str]:
     return list(_QUICK_CONFIGS)
 
 
-# ---------------------------------------------------------------------------
-# Pretty IDs (drive the `-k` filter and the failure report line)
-# ---------------------------------------------------------------------------
+# Pretty IDs (drive the `-k` filter and the failure report line).
 
 
 def _shape_id(s: tuple[int, int, int]) -> str:
@@ -320,12 +265,20 @@ def _layout_id(p: tuple[str, str]) -> str:
     return f"A{p[0]}_B{p[1]}"
 
 
-# ---------------------------------------------------------------------------
-# Compatibility gate — see the docstring's "What's covered" section
-# ---------------------------------------------------------------------------
+# Compatibility gate.
 
 
-def _compatible(cfg, M: int, N: int, K: int, in_dtype: str, out_dtype: str, a_major: str = "k", b_major: str = "k", cta_group: int = 2) -> tuple[bool, str]:
+def _compatible(
+    cfg,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    cta_group: int = 2,
+) -> tuple[bool, str]:
     """Reject only shapes the kernel can't service. Returns (ok, reason)."""
     in_eb = _ELEM_BYTES[in_dtype]
     out_eb = _ELEM_BYTES[out_dtype]
@@ -358,9 +311,7 @@ def _compatible(cfg, M: int, N: int, K: int, in_dtype: str, out_dtype: str, a_ma
     return True, ""
 
 
-# ---------------------------------------------------------------------------
-# Graph + data + reference
-# ---------------------------------------------------------------------------
+# Graph + data + reference.
 
 
 def _a_stride_batched(M: int, K: int, a_major: str) -> list[int]:
@@ -371,7 +322,16 @@ def _b_stride_batched(N: int, K: int, b_major: str) -> list[int]:
     return [N * K, 1, K] if b_major == "k" else [N * K, N, 1]
 
 
-def _build_graph(M: int, N: int, K: int, in_dtype: str, out_dtype: str, a_major: str = "k", b_major: str = "k", out_major: str = "n") -> cudnn.pygraph:
+def _build_graph(
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+) -> cudnn.pygraph:
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[in_dtype],
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -409,7 +369,15 @@ def _build_block_quant_graph(
 
 
 def _build_batched_graph(
-    batch: int, M: int, N: int, K: int, in_dtype: str, out_dtype: str, a_major: str = "k", b_major: str = "k", out_major: str = "n"
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
 ) -> cudnn.pygraph:
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[in_dtype],
@@ -428,7 +396,15 @@ def _build_batched_graph(
 
 
 def _build_batch_broadcast_graph(
-    batch: int, M: int, N: int, K: int, in_dtype: str, out_dtype: str, broadcast_side: str, a_major: str = "k", b_major: str = "k"
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    broadcast_side: str,
+    a_major: str = "k",
+    b_major: str = "k",
 ) -> cudnn.pygraph:
     g = cudnn.pygraph(
         io_data_type=_CUDNN_DTYPE[in_dtype],
@@ -446,12 +422,19 @@ def _build_batch_broadcast_graph(
     return g
 
 
-def _mkdata(M: int, N: int, K: int, in_dtype: str, out_dtype: str, seed: int = 0, a_major: str = "k", b_major: str = "k", out_major: str = "n"):
-    """Small-integer inputs ⇒ FP32 reduction is exact ⇒ kernel and reference
-    differ only by the deterministic downcast at the end.
-
-    All shapes are rank-3 with batch=1; the runtime contract enforces this.
-    """
+def _mkdata(
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    seed: int = 0,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+):
+    """Small-integer inputs ⇒ exact FP32 reduction ⇒ kernel and reference differ
+    only by the final deterministic downcast. All shapes rank-3, batch=1."""
     torch.manual_seed(seed)
     rng = (-3, 3) if in_dtype.startswith("fp8") else (-2, 2)
     a_shape = (1, M, K) if a_major == "k" else (1, K, M)
@@ -470,7 +453,16 @@ def _mkdata(M: int, N: int, K: int, in_dtype: str, out_dtype: str, seed: int = 0
 
 
 def _mkbatched_data(
-    batch: int, M: int, N: int, K: int, in_dtype: str, out_dtype: str, seed: int = 0, a_major: str = "k", b_major: str = "k", out_major: str = "n"
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    seed: int = 0,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
 ):
     torch.manual_seed(seed)
     rng = (-3, 3) if in_dtype.startswith("fp8") else (-2, 2)
@@ -490,7 +482,16 @@ def _mkbatched_data(
 
 
 def _mkbatch_broadcast_data(
-    batch: int, M: int, N: int, K: int, in_dtype: str, out_dtype: str, broadcast_side: str, seed: int = 0, a_major: str = "k", b_major: str = "k"
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    broadcast_side: str,
+    seed: int = 0,
+    a_major: str = "k",
+    b_major: str = "k",
 ):
     torch.manual_seed(seed)
     rng = (-3, 3) if in_dtype.startswith("fp8") else (-2, 2)
@@ -608,24 +609,19 @@ def _batch_broadcast_reference(a: torch.Tensor, b: torch.Tensor, batch: int, out
 
 
 def _tolerance(in_dtype: str, out_dtype: str) -> float:
-    """One out-dtype ULP at the scale our integer inputs reach. The kernel's
-    accumulator and the reference are both FP32 and exact for these inputs;
-    the only rounding is the deterministic downcast, so tol is tight."""
+    """One out-dtype ULP: both accumulator and reference are exact FP32, so the
+    only rounding is the deterministic downcast."""
     return 1.0 if in_dtype.startswith("fp8") else 0.5
 
 
-# ---------------------------------------------------------------------------
-# Compile cache (session-scoped) — one compile per (config, in_dt, out_dt)
-# ---------------------------------------------------------------------------
+# Compile cache (session-scoped) — one compile per (config, in_dt, out_dt).
 
 
 @pytest.fixture(scope="session")
 def _compile_cache() -> dict:
     """Maps (config_name, in_dt, out_dt) → CompiledFusedGemm | str(error).
-
-    Pytest visits cases in the parametrize-decorator order: config (outer),
-    dtype (middle), shape (inner). So each (config, dtype) block of 9 shapes
-    shares one compile."""
+    Cases visit in (config, dtype, shape) order, so each (config, dtype) block
+    of 9 shapes shares one compile."""
     return {}
 
 
@@ -637,14 +633,12 @@ def _pick_anchor(
     b_major: str = "k",
     cta_group: int = 2,
 ) -> tuple[int, int, int] | None:
-    """Pick the first menu shape compatible with (cfg, in_dt, out_dt) to use
-    as the JIT anchor. The kernel is M/N/K-symbolic so any compatible shape
-    works; we just need one to feed cuDNN's graph builder.
+    """First menu shape compatible with (cfg, in_dt, out_dt), as the JIT anchor.
+    The kernel is M/N/K-symbolic so any compatible shape works.
 
-    The C output's row-stride alignment is fixed at JIT time from the
-    anchor's N, so the menu MUST be uniform in its N-alignment class for
-    runtime shapes to be drop-in. `_compatible` enforces N % 16 / N % 32
-    above, which keeps the menu in the largest-vec_bytes class.
+    Foot-gun: the C row-stride alignment is baked at JIT from the anchor's N, so
+    the menu must be uniform in N-alignment class (enforced by `_compatible`)
+    for runtime shapes to be drop-in.
     """
     for shape in _WEIRD_SHAPES:
         ok, _ = _compatible(cfg, *shape, in_dt, out_dt, a_major, b_major, cta_group)
@@ -654,7 +648,15 @@ def _pick_anchor(
 
 
 def _get_compiled(
-    cache: dict, cfg, in_dt: str, out_dt: str, a_major: str = "k", b_major: str = "k", cta_group: int = 2, scheduler: str = "clc", out_major: str = "n"
+    cache: dict,
+    cfg,
+    in_dt: str,
+    out_dt: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    cta_group: int = 2,
+    scheduler: str = "clc",
+    out_major: str = "n",
 ):
     """Return the cached compiled kernel, building it on first miss."""
     key = (cfg.name, in_dt, out_dt, a_major, b_major, cta_group, scheduler, out_major)
@@ -666,8 +668,7 @@ def _get_compiled(
 
     anchor = _pick_anchor(cfg, in_dt, out_dt, a_major, b_major, cta_group)
     if anchor is None:
-        # No menu shape is compatible — there's no anchor to build against.
-        # Should be rare; e.g. K_BYTES vs elem_bytes catalog mismatch.
+        # No compatible anchor to build against (rare; e.g. K_BYTES vs elem_bytes mismatch).
         msg = f"no menu shape is compatible with ({cfg.name}, {in_dt}->{out_dt})"
         cache[key] = msg
         pytest.skip(msg)
@@ -717,7 +718,18 @@ def _get_batched_compiled(
     out_major: str = "n",
 ):
     """Return the cached rank-3 compiled kernel for this graph batch."""
-    key = ("batched", cfg.name, in_dt, out_dt, batch, a_major, b_major, cta_group, scheduler, out_major)
+    key = (
+        "batched",
+        cfg.name,
+        in_dt,
+        out_dt,
+        batch,
+        a_major,
+        b_major,
+        cta_group,
+        scheduler,
+        out_major,
+    )
     if key in cache:
         entry = cache[key]
         if isinstance(entry, str):
@@ -812,11 +824,6 @@ def _get_batch_broadcast_compiled(
     return compiled
 
 
-# ---------------------------------------------------------------------------
-# The parametrized test
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("shape", _WEIRD_SHAPES, ids=[_shape_id(s) for s in _WEIRD_SHAPES])
 @pytest.mark.parametrize(
     "in_dt,out_dt",
@@ -828,9 +835,14 @@ def _get_batch_broadcast_compiled(
     _sweep_config_names(),
     ids=[_config_id(n) for n in _sweep_config_names()],
 )
-def test_matmul(_compile_cache, config_name: str, in_dt: str, out_dt: str, shape: tuple[int, int, int]) -> None:
-    """One case = one (config, dtype-pair, shape). Incompatible combos SKIP;
-    every launched case must produce bit-tight FP32-reduction output."""
+def test_matmul(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    shape: tuple[int, int, int],
+) -> None:
+    """One (config, dtype-pair, shape); incompatible combos SKIP, else bit-tight."""
     cfg, cta_group, scheduler = _resolve(config_name)
     ok, reason = _compatible(cfg, *shape, in_dt, out_dt, cta_group=cta_group)
     if not ok:
@@ -850,8 +862,7 @@ def test_matmul(_compile_cache, config_name: str, in_dt: str, out_dt: str, shape
     max_diff = float(diff.max().item())
     max_ref = float(ref.abs().max().item())
 
-    # Surface the same diagnostic the old CLI sweep printed, so a failure
-    # in CI is self-explanatory without re-running locally.
+    # Rich diagnostic so a CI failure is self-explanatory without re-running.
     assert bad == 0, (
         f"\n  config:    {config_name}"
         f"\n  dtype:     {in_dt} -> {out_dt}"
@@ -927,7 +938,16 @@ def test_input_layout_matmul(
     if not ok:
         pytest.skip(reason)
 
-    compiled = _get_compiled(_compile_cache, cfg, in_dt, out_dt, a_major, b_major, cta_group=cta_group, scheduler=scheduler)
+    compiled = _get_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        a_major,
+        b_major,
+        cta_group=cta_group,
+        scheduler=scheduler,
+    )
     a, b, c = _mkdata(M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
     compiled(_vp(compiled, a, b, c))
     torch.cuda.synchronize()
@@ -1058,7 +1078,13 @@ def test_zero_stride_broadcast_input_matmul(
     _BATCHED_CONFIGS,
     ids=[_config_id(n) for n in _BATCHED_CONFIGS],
 )
-def test_batched_matmul(_compile_cache, config_name: str, in_dt: str, out_dt: str, shape: tuple[int, int, int, int]) -> None:
+def test_batched_matmul(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    shape: tuple[int, int, int, int],
+) -> None:
     """Rank-3 matmul keeps batch as the native L mode and maps it to grid.z."""
     batch, M, N, K = shape
     cfg, cta_group, scheduler = _resolve(config_name)
@@ -1066,7 +1092,15 @@ def test_batched_matmul(_compile_cache, config_name: str, in_dt: str, out_dt: st
     if not ok:
         pytest.skip(reason)
 
-    compiled = _get_batched_compiled(_compile_cache, cfg, in_dt, out_dt, batch, cta_group=cta_group, scheduler=scheduler)
+    compiled = _get_batched_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        cta_group=cta_group,
+        scheduler=scheduler,
+    )
 
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt)
     compiled(_vp(compiled, a, b, c))
@@ -1108,7 +1142,17 @@ def test_input_layout_batched_matmul(
     if not ok:
         pytest.skip(reason)
 
-    compiled = _get_batched_compiled(_compile_cache, cfg, in_dt, out_dt, batch, a_major, b_major, cta_group=cta_group, scheduler=scheduler)
+    compiled = _get_batched_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        a_major,
+        b_major,
+        cta_group=cta_group,
+        scheduler=scheduler,
+    )
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
     compiled(_vp(compiled, a, b, c))
     torch.cuda.synchronize()
@@ -1133,7 +1177,14 @@ def test_input_layout_batched_matmul(
     _BATCHED_CONFIGS,
     ids=[_config_id(n) for n in _BATCHED_CONFIGS],
 )
-def test_batch_broadcast_matmul(_compile_cache, config_name: str, in_dt: str, out_dt: str, broadcast_side: str, shape: tuple[int, int, int, int]) -> None:
+def test_batch_broadcast_matmul(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    broadcast_side: str,
+    shape: tuple[int, int, int, int],
+) -> None:
     """Rank-3 matmul with one input broadcast across the output batch."""
     batch, M, N, K = shape
     cfg, cta_group, scheduler = _resolve(config_name)
@@ -1141,7 +1192,16 @@ def test_batch_broadcast_matmul(_compile_cache, config_name: str, in_dt: str, ou
     if not ok:
         pytest.skip(reason)
 
-    compiled = _get_batch_broadcast_compiled(_compile_cache, cfg, in_dt, out_dt, batch, broadcast_side, cta_group=cta_group, scheduler=scheduler)
+    compiled = _get_batch_broadcast_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        broadcast_side,
+        cta_group=cta_group,
+        scheduler=scheduler,
+    )
 
     a, b, c = _mkbatch_broadcast_data(batch, M, N, K, in_dt, out_dt, broadcast_side)
     compiled(_vp(compiled, a, b, c))
@@ -1217,15 +1277,8 @@ def test_input_layout_batch_broadcast_matmul(
     assert int((diff > _tolerance(in_dt, out_dt)).sum().item()) == 0
 
 
-# ---------------------------------------------------------------------------
-# Mixed FP8 (A and B different FP8 variants)
-# ---------------------------------------------------------------------------
-#
-# tcgen05 F8F6F4 takes A's and B's FP8 variant independently, so every
-# {E4M3, E5M2} × {E4M3, E5M2} pair is a valid matmul — including the mixed
-# E4M3 × E5M2 directions. The sweep above only drives A==B dtypes; this covers
-# the mixed cases (and re-covers the matching ones) on a 1-CTA and a 2-CTA
-# config.
+# Mixed FP8: tcgen05 F8F6F4 takes A/B FP8 variants independently, so every
+# {E4M3,E5M2}² pair is valid. The main sweep only drives A==B; this covers mixed.
 
 _FP8_AB_PAIRS = [
     ("fp8_e4m3", "fp8_e4m3"),
@@ -1251,8 +1304,18 @@ def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"), data_type=_CUDNN_DTYPE[a_dt])
-    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"), data_type=_CUDNN_DTYPE[b_dt])
+    A = g.tensor(
+        name="A",
+        dim=[1, M, K],
+        stride=_a_stride_batched(M, K, "k"),
+        data_type=_CUDNN_DTYPE[a_dt],
+    )
+    B = g.tensor(
+        name="B",
+        dim=[1, K, N],
+        stride=_b_stride_batched(N, K, "k"),
+        data_type=_CUDNN_DTYPE[b_dt],
+    )
     C = g.matmul(A=A, B=B, name="mm")
     C.set_output(True)
     C.set_data_type(cudnn.data_type.HALF)
@@ -1274,13 +1337,8 @@ def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
     assert int((diff > 1e-1).sum().item()) == 0, f"{config_name} {a_dt} x {b_dt}: max|diff|={diff.max().item():.4g}"
 
 
-# ---------------------------------------------------------------------------
-# INT8 × INT8 → INT32 (integer tensor-core MMA)
-# ---------------------------------------------------------------------------
-#
-# tcgen05 `.kind::i8` multiplies signed 8-bit integers into an int32
-# accumulator; the epilogue widens int32 → fp32 for the output. Bit-exact vs an
-# fp32 reference (the small-magnitude products are exactly representable).
+# INT8 × INT8 → INT32 (integer tensor-core MMA). Epilogue widens int32 → fp32;
+# bit-exact vs an fp32 reference (small-magnitude products are exact).
 
 _INT8_CONFIGS = [
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
@@ -1290,9 +1348,8 @@ _INT8_CONFIGS = [
 ]
 
 
-# Output dtype → (cudnn enum, torch dtype, input value range). INT8 supports
-# fp32/bf16/fp16/int32/fp8. fp8 needs tiny inputs so the int32 accumulator lands
-# inside fp8's range; the others use a wider range (still exact in that dtype).
+# Output dtype → (cudnn enum, torch dtype, input value range). fp8 needs tiny
+# inputs so the int32 accumulator stays in fp8's range; others use a wider range.
 _INT8_OUT_DTYPES = {
     "fp32": (cudnn.data_type.FLOAT, torch.float32, 8),
     "bf16": (cudnn.data_type.BFLOAT16, torch.bfloat16, 8),
@@ -1305,10 +1362,8 @@ _INT8_OUT_DTYPES = {
 @pytest.mark.parametrize("config_name", _INT8_CONFIGS, ids=[_config_id(n) for n in _INT8_CONFIGS])
 @pytest.mark.parametrize("out_dt", list(_INT8_OUT_DTYPES))
 def test_int8_matmul(config_name: str, out_dt: str) -> None:
-    """INT8 × INT8 → INT32 accumulate, output ∈ {fp32, bf16, fp16, int32, fp8}.
-
-    Bit-exact vs an integer reference rounded to the output dtype (values kept
-    small enough that the rounded reference is itself exact / matches RN)."""
+    """INT8×INT8→INT32, output ∈ {fp32,bf16,fp16,int32,fp8}; bit-exact vs a
+    rounded integer reference (values small enough that the rounding is exact)."""
     sm = _current_sm()
     if sm is not None and not any(lo <= sm < hi for lo, hi in _INT8_SM_RANGES):
         pytest.skip(f"int8 matmul unsupported on sm_{sm} (SM 100/110 only)")
@@ -1347,9 +1402,7 @@ def test_int8_matmul(config_name: str, out_dt: str) -> None:
     assert diff == 0.0, f"{config_name} -> {out_dt}: max|diff|={diff} (expected bit-exact)"
 
 
-# ---------------------------------------------------------------------------
 # M-major batched output.
-# ---------------------------------------------------------------------------
 _M_MAJOR_BATCHED_CASES: tuple[tuple[str, str, str], ...] = (
     ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", "bf16", "bf16"),
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma", "bf16", "fp16"),
@@ -1385,12 +1438,8 @@ def test_m_major_output_batched(_compile_cache, config_name: str, in_dt: str, ou
     torch.testing.assert_close(c, _reference(a, b, out_dt), atol=_tolerance(in_dt, out_dt), rtol=0)
 
 
-# ---------------------------------------------------------------------------
-# Standalone CLI shim — forwards remaining argv to pytest on this file
-# ---------------------------------------------------------------------------
+# Standalone CLI shim — forwards remaining argv to pytest on this file.
 
 
 if __name__ == "__main__":
-    # Allow `python test_matmul_sweep.py [pytest args]` so the older shell
-    # wrappers (`all_tests/my_run_test.sh`) keep working without porting them.
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))

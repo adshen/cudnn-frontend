@@ -1,14 +1,6 @@
-"""Make ``cudnn.TBD.gemm`` importable for this test tree.
-
-The GEMM engine lives in the cudnn-frontend source tree at
-``python/cudnn/TBD/gemm``, but ``import cudnn`` resolves to the *installed*
-cuDNN frontend wheel (site-packages), which does not carry the ``TBD`` subtree.
-Append the source ``python/cudnn`` directory to the installed ``cudnn``
-package's ``__path__`` so submodule lookup finds ``cudnn.TBD.gemm`` there.
-
-Once the engine ships as part of the built cuDNN frontend package this shim is
-unnecessary (the subpackage is then on the installed ``__path__`` already).
-"""
+"""Make ``cudnn.TBD.gemm`` importable: append the source ``python/cudnn`` dir
+to the installed ``cudnn`` package's ``__path__`` (the wheel lacks the ``TBD``
+subtree). Unnecessary once the engine ships in the built frontend package."""
 
 from __future__ import annotations
 

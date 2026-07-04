@@ -1,18 +1,7 @@
 """Compiler driver: cudnn graph -> rendered GEMM kernel.py -> compiled callable.
 
-Phase 5: stitches together graph_analyzer, epilogue_codegen, and the kernel
-template. Workflow:
-
-  1. analyze() the FusedGraph -> FusionChain
-  2. generate() the codegen snippets
-  3. render the template (`sm100_matmul_1ctamma.py` for
-     cta_group=1 or `sm100_matmul_2ctamma.py` for cta_group=2,
-     picked via TileConfig.template_file) by replacing the `# @@INJECT_*@@`
-     markers
-  4. write the rendered module to a content-addressed dir under
-     CUDNN_GEMM_KERNEL_CACHE (defaults to $XDG_CACHE_HOME/cudnn_gemm/kernel_cache,
-     i.e. ~/.cache/cudnn_gemm/kernel_cache — never inside the project tree)
-  5. dynamic-import the rendered module and return its `compile(K)` callable
+Ties together graph_analyzer + epilogue_codegen + a kernel template: analyze,
+codegen, render the template's @@INJECT_*@@ markers, cache-write, import, compile.
 """
 
 from __future__ import annotations
@@ -28,6 +17,7 @@ from typing import Callable
 
 import cudnn
 
+from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, DTYPE_TO_MMA_KIND
 from .epilogue_codegen import EpilogueSnippets, generate
 from .fusion_ir import ZERO_PRESERVING_OPS, FusionChain, TensorRef
 from .graph_analyzer import (
@@ -46,11 +36,8 @@ _TEMPLATE_DIR = Path(__file__).parent / "kernel_templates"
 
 
 def _aux_fake_shape_code(aux: TensorRef) -> str:
-    """Python expression for the shape tuple of an aux fake tensor.
-
-    Uses sym_l / sym_m / sym_n where the aux dim should match the matmul.
-    Concrete 1s elsewhere.
-    """
+    """Shape-tuple expression for an aux fake tensor (sym_l/m/n where the dim
+    matches the matmul, concrete 1s elsewhere)."""
     if len(aux.dim) == 3:
         batch = "1" if aux.dim[0] == 1 else "sym_l"
         if aux.bcast_mode == "scalar":
@@ -80,8 +67,8 @@ def _aux_fake_stride_order(aux: TensorRef) -> str:
 
 
 def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
-    # Rank-1 aux tensors are represented as rank-2 broadcastable fake tensors
-    # during compile, so their raw rank-1 stride is not a valid fake stride.
+    # Rank-1 aux is represented as a rank-2 broadcastable fake at compile, so
+    # its raw rank-1 stride is not a valid fake stride.
     if len(aux.dim) not in (2, 3):
         return False
     stride1_dims = [i for i, stride in enumerate(aux.stride) if stride == 1]
@@ -91,56 +78,14 @@ def _aux_can_use_explicit_fake_stride(aux: TensorRef) -> bool:
     return len(nontrivial) == 1
 
 
-_DTYPE_TO_DSL = {
-    "bf16": "cutlass.BFloat16",
-    "fp16": "cutlass.Float16",
-    "fp32": "cutlass.Float32",
-    "int8": "cutlass.Int8",
-    # FN = "finite, no NaN" variant — what sm100 tcgen05 actually accepts.
-    "fp8_e4m3": "cutlass.Float8E4M3FN",
-    "fp8_e5m2": "cutlass.Float8E5M2",
-    "fp8_e8m0": "cutlass.Float8E8M0FNU",
-    # FP4 (e2m1) is always handled packed 2-per-byte as Float4E2M1FNx2.
-    "fp4_e2m1": "cutlass.Float4E2M1FNx2",
-    "uint8": "cutlass.Uint8",
-    "int32": "cutlass.Int32",
-    "int64": "cutlass.Int64",
-}
-
-# cutlass dtype names (used for SMEM allocation / fake-tensor element type).
-_DTYPE_TO_CUTLASS = {
-    "bf16": "cutlass.BFloat16",
-    "fp16": "cutlass.Float16",
-    "fp32": "cutlass.Float32",
-    "int8": "cutlass.Int8",
-    "fp8_e4m3": "cutlass.Float8E4M3FN",
-    "fp8_e5m2": "cutlass.Float8E5M2",
-    "fp8_e8m0": "cutlass.Float8E8M0FNU",
-    "fp4_e2m1": "cutlass.Float4E2M1FNx2",
-    "uint8": "cutlass.Uint8",
-    "int32": "cutlass.Int32",
-    "int64": "cutlass.Int64",
-}
-
-# Tcgen05 MMA family enum (keyed by the MMA *input* dtype).
-_DTYPE_TO_MMA_KIND = {
-    "bf16": "nvvm.Tcgen05MMAKind.F16",
-    "fp16": "nvvm.Tcgen05MMAKind.F16",
-    "fp8_e4m3": "nvvm.Tcgen05MMAKind.F8F6F4",
-    "fp8_e5m2": "nvvm.Tcgen05MMAKind.F8F6F4",
-    "int8": "nvvm.Tcgen05MMAKind.INT8",
-}
-
-
 def _aux_fake_block(aux_tensors: list[TensorRef], *, dynamic_strides: bool = False) -> str:
-    """Build the lines that declare `fake_<name>` for each aux tensor. Joined
-    with bare ``\\n`` — the marker-replacement layer re-applies the marker
-    line's indent to every replacement line, so baking indent in here would
-    double it."""
+    """Declare `fake_<name>` for each aux tensor. No baked indent — the
+    marker-replacement layer re-applies the marker line's indent (baking it here
+    would double it)."""
     lines = []
     for aux in aux_tensors:
         shape = _aux_fake_shape_code(aux)
-        dtype = _DTYPE_TO_DSL[aux.dtype]
+        dtype = DTYPE_TO_CUTLASS[aux.dtype]
         if dynamic_strides and _aux_can_use_explicit_fake_stride(aux):
             stride = "(" + ", ".join(str(s) for s in aux.stride) + ")"
             lines.append(f"fake_{aux.name} = make_fake_tensor({dtype}, {shape}, " f"stride={stride}, assumed_align=16)")
@@ -151,8 +96,7 @@ def _aux_fake_block(aux_tensors: list[TensorRef], *, dynamic_strides: bool = Fal
 
 
 def _aux_signature_block(aux_tensors: list[TensorRef]) -> str:
-    """Comma-separated params (one per line) for a signature list. No baked
-    indent — see ``_aux_fake_block`` for the rationale."""
+    """Comma-separated signature params (one per line). No baked indent."""
     if not aux_tensors:
         return ""
     return ",\n".join(f"{aux.name}: cute.Tensor" for aux in aux_tensors) + ","
@@ -307,11 +251,9 @@ def _reduction_stride_compile_symbols(chain: FusionChain) -> str:
 def _mainloop_chain_zero_preserving(ops) -> bool:
     """True iff applying this mainloop op chain to 0 provably yields 0.
 
-    Each op is zero-preserving iff it is in ``ZERO_PRESERVING_OPS`` (the single
-    source of truth in fusion_ir; an unlisted op is conservatively treated as
-    NON-zero-preserving). Once the running value is no longer provably zero the
-    chain is reported not-zero-preserving — which only makes the K-OOB mask fire
-    more often (still correct, just slightly more work)."""
+    Per-op zero-preservation is judged by ``ZERO_PRESERVING_OPS`` (fusion_ir,
+    single source of truth); an unlisted op is conservatively NON-preserving.
+    A false negative only fires the K-OOB mask more often (still correct)."""
     zero = True
     for op in ops:
         if not zero:
@@ -321,34 +263,24 @@ def _mainloop_chain_zero_preserving(ops) -> bool:
 
 
 def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int) -> str:
-    """Override module-level tile + dtype constants for the requested config/chain.
-
-    The template has default values immediately above the marker; this snippet
-    is appended (assignments to the same names) and the last assignment wins.
-    Tile constants are dtype-agnostic in :class:`TileConfig` (K stored in
-    bytes); here we resolve them into *element* counts using the chain's A
-    dtype. Dtype constants (`ab_dtype`, `mma_a_dtype`, `ab_tma_dtype`,
-    `mma_kind`, ...) are derived from `chain.matmul.{a,b}_dtype` and
-    `chain.output_dtype`.
+    """Emit module-level tile + dtype constants for the config/chain, appended
+    below the template's defaults (last assignment wins). TileConfig geometry is
+    dtype-agnostic (K in bytes); resolved to element counts via the chain's A
+    dtype. Dtype constants derive from chain.matmul.{a,b}_dtype + output_dtype.
     """
-    # a_dt / b_dt: global-memory dtypes (what TMA loads from GMEM).
-    # mma_a_dt / mma_b_dt: the dtype the MMA instruction uses — equal to the
-    # global dtype (no implicit cast).
+    # a_dt/b_dt: GMEM dtypes (what TMA loads). mma_a_dt/mma_b_dt: the MMA
+    # instruction dtype — equal to the GMEM dtype (no implicit cast).
     a_dt = chain.matmul.a_dtype
     b_dt = chain.matmul.b_dtype
     mma_a_dt = _mma_a_dtype(chain)
     mma_b_dt = _mma_b_dtype(chain)
     accum_dt = chain.matmul.accum_dtype
     out_dt = chain.output_dtype
-    # elem_bytes drives K_TILE, swizzle, and MMA instruction sizing — always
-    # the MMA dtype bytes (e.g. 2 for BF16 even when global A is fp32).
-    elem_bytes = _DTYPE_BYTES[mma_a_dt]
-    # SMEM-row swizzle is determined by K-tile width in bytes (the inner-most
-    # SMEM row). Templates allocate (M, K_bytes) and (N, K_bytes) tiles, so:
-    #   K_bytes = 128 -> SWIZZLE_128B, TMA s128b, stride_byte_offset = 8 * 128
-    #   K_bytes =  64 -> SWIZZLE_64B,  TMA s64b,  stride_byte_offset = 8 *  64
-    #   K_bytes =  32 -> SWIZZLE_32B,  TMA s32b,  stride_byte_offset = 8 *  32
-    # 8 rows-per-stride-chunk comes from the 8×16B tcgen05 core matrix.
+    # Always the MMA dtype bytes (e.g. 2 for BF16 even when GMEM A is fp32);
+    # drives K_TILE, swizzle, and MMA instruction sizing.
+    elem_bytes = DTYPE_BYTES[mma_a_dt]
+    # SMEM-row swizzle keyed by K-tile width in bytes; stride_byte_offset =
+    # 8 * K_bytes (8 rows/chunk from the 8×16B tcgen05 core matrix).
     _SWIZZLE_TABLE = {
         128: ("SWIZZLE_128B", "s128b"),
         64: ("SWIZZLE_64B", "s64b"),
@@ -391,9 +323,8 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int) 
         f"# Tile config: {cfg.name}",
         f"mma_inst_shape_mnk = {cfg.mma_inst_mnk(elem_bytes, cta_group)}",
         f"cgrp_tile_mnk = {cfg.cgrp_tile_mnk(elem_bytes)}",
-        # Template uses `cta_tile_mnk` for per-CTA SMEM/TMA box dims, which
-        # is the SMEM tile (B's N halved under 2-CTA MMA), not the logical
-        # per-CTA tile exposed by TileConfig.
+        # Template `cta_tile_mnk` = per-CTA SMEM/TMA box dims (B's N halved under
+        # 2-CTA MMA), NOT the logical per-CTA tile from TileConfig.
         f"cta_tile_mnk = {cfg.cta_smem_tile_mnk(elem_bytes, cta_group)}",
         f"epi_tile_mn = {cfg.epi_tile_mn}",
         f"threads_per_cta = {cfg.threads_per_cta}",
@@ -422,42 +353,28 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int) 
         f"ab_tma_swizzle = _tma.TensorMapSwizzle.{tma_swizzle_name}",
         "",
         f"# Dtype family: A={a_dt}->MMA{mma_a_dt}, B={b_dt}->MMA{mma_b_dt}, out={out_dt} (K_BYTES={cfg.cta_tile_k_bytes})",
-        # ab_dtype: MMA operand dtype (what SMEM holds / MMA reads).
-        f"ab_dtype = {_DTYPE_TO_CUTLASS[mma_a_dt]}",
-        f"cd_dtype = {_DTYPE_TO_CUTLASS[out_dt]}",
-        f"mma_a_dtype = {_DTYPE_TO_DSL[mma_a_dt]}",
-        f"mma_b_dtype = {_DTYPE_TO_DSL[mma_b_dt]}",
-        # Accumulator dtype: int32 for INT8 MMA, fp32 otherwise. The idesc is
-        # built directly from mma_a/b/c_dtype (Int8/Int32 included — GEMM's
-        # InstrDesc.build now maps integer input formats). `acc_widen_to_fp32`
-        # tells the epilogue to convert the int32 TMEM load to fp32 before the
-        # (fp32-only) op chain + cast. We DON'T widen when the output is int32
-        # (raw accumulator): widening through fp32 would lose precision past
-        # 2**24, so int32 output passes the accumulator straight through.
-        f"mma_c_dtype = {_DTYPE_TO_DSL[accum_dt]}",
+        # ab_dtype: MMA operand dtype (SMEM holds / MMA reads).
+        f"ab_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
+        f"cd_dtype = {DTYPE_TO_CUTLASS[out_dt]}",
+        f"mma_a_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
+        f"mma_b_dtype = {DTYPE_TO_CUTLASS[mma_b_dt]}",
+        f"mma_c_dtype = {DTYPE_TO_CUTLASS[accum_dt]}",
         f"acc_widen_to_fp32 = {accum_dt == 'int32' and out_dt != 'int32'}",
-        # ab_tma_dtype: the A/B TMA-descriptor element dtype. Used by all
-        # templates (matmul + mainloop) for both A and B — TMA only cares about
-        # the element byte width, which is identical across an a/b dtype pair.
-        f"ab_tma_dtype = {_DTYPE_TO_DSL[mma_a_dt]}",
-        f"cd_tma_dtype = {_DTYPE_TO_DSL[out_dt]}",
-        f"mma_kind = {_DTYPE_TO_MMA_KIND[mma_a_dt]}",
+        # ab_tma_dtype: A/B TMA-descriptor element dtype (same for A and B — TMA
+        # only cares about element byte width, identical across an a/b pair).
+        f"ab_tma_dtype = {DTYPE_TO_CUTLASS[mma_a_dt]}",
+        f"cd_tma_dtype = {DTYPE_TO_CUTLASS[out_dt]}",
+        f"mma_kind = {DTYPE_TO_MMA_KIND[mma_a_dt]}",
         f"cd_out_is_m_major = {chain.matmul.out_major == 'm'}",
-        # M-major TMA-store C-descriptor inner-M box = swizzle span(128 B) /
-        # elem_bytes (inner box bytes == swizzle span).
-        f"cd_mmajor_atom_m = {128 // _DTYPE_BYTES[out_dt]}",
+        # M-major TMA-store C-descriptor inner-M box = 128 B swizzle span / elem_bytes.
+        f"cd_mmajor_atom_m = {128 // DTYPE_BYTES[out_dt]}",
     ]
     # Persistent kernel always: double-TMEM + L2 N-super-block swizzle.
     lines.append(f"acc_stages = {cfg.acc_stages}")
     lines.append(f"tile_swizzle_n = {cfg.tile_swizzle_n}")
-    # Multi-GEMM (parallel matmuls sharing the epilogue). Always emitted so the
-    # template can reference these unconditionally; single-GEMM = (1, 1, 1).
-    # gemm_a_idx[g] / gemm_b_idx[g] pick GEMM g's operand from the distinct A / B
-    # pools. Each GEMM owns its own TMEM accumulator region (cta_tile_n cols), so
-    # one acc_stage spans `num_gemms * cta_tile_n` cols; we keep double-buffering
-    # (acc_stages=2) only when both stages fit the arch TMEM budget, else drop to
-    # a single acc stage. (cta_group is always 1 here — the only multi-GEMM
-    # template — so cta_tile_n == the per-CTA N.)
+    # Multi-GEMM (parallel matmuls sharing the epilogue). Always emitted;
+    # single-GEMM = (1, 1, 1). gemm_a_idx[g]/gemm_b_idx[g] pick GEMM g's operand
+    # from the distinct A/B pools. acc_stages resolved below per TMEM budget.
     lines.append(f"num_gemms = {chain.num_gemms}")
     lines.append(f"num_a_operands = {chain.num_a_operands}")
     lines.append(f"num_b_operands = {chain.num_b_operands}")
@@ -474,9 +391,8 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int) 
             )
         acc_stages_mg = 2 if 2 * region <= total_tmem else 1
         lines.append(f"acc_stages = {acc_stages_mg}  # multi-GEMM: {chain.num_gemms}×{cfg.cta_tile_n} cols/stage")
-        # ab_stages must account for one SMEM buffer per DISTINCT operand
-        # (num_a A-tiles + num_b B-tiles per stage), not the single A+B that
-        # smem_max_ab_stages assumes.
+        # ab_stages: one SMEM buffer per DISTINCT operand (num_a A + num_b B per
+        # stage), not the single A+B that smem_max_ab_stages assumes.
         from .tile_config import _SM100_SMEM_BUDGET_BYTES, _AB_STAGES_CAP
 
         # Per-CTA SMEM B-tile N is halved under 2-CTA MMA (the pair splits B's N).
@@ -490,28 +406,25 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int) 
                 f"multi-GEMM: {chain.num_a_operands} A + {chain.num_b_operands} B " f"operand tiles per stage exceed SMEM budget at this geometry"
             )
         lines.append(f"ab_stages = {ab_stages_mg}  # multi-GEMM: {chain.num_a_operands}A+{chain.num_b_operands}B per stage")
-    # MoE grouped matmul: the grouped persistent scheduler launches a FIXED
-    # number of clusters (≈ NUM_SMS / cluster_size) and strides through tiles by
-    # this count. The host grid and the kernel's persistent stride share it.
+    # MoE grouped matmul: grouped persistent scheduler launches a FIXED cluster
+    # count (≈ NUM_SMS / cluster_size); host grid and kernel stride share it.
     if chain.has_moe:
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
-        # first_token_offset element dtype (int32 / int64) — drives the compile()
-        # fake tensor; the scheduler casts reads to Int32 internally.
-        lines.append(f"offset_cutlass_dtype = {_DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
-    # Mainloop fusion (Phase 6): the 12-warp template adds 4 mainloop-fusion
-    # warps (+128 threads). Override threads_per_cta and expose the warp count.
-    # Emitted *after* the earlier `threads_per_cta` line so the override wins.
+        # first_token_offset dtype (int32/int64) drives the compile() fake; the
+        # scheduler casts reads to Int32 internally.
+        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+    # Mainloop fusion: the 12-warp template adds 4 mainloop warps (+128 threads).
+    # Emitted after the earlier threads_per_cta so the override wins.
     if chain.has_mainloop_fusion:
         lines.append("num_mainloop_warps = 4")
         lines.append("threads_per_cta = 384")
         # Per-operand fusion flags (const_expr-gated in the template).
         lines.append(f"mainloop_fuse_a = {chain.has_mainloop_fusion_a}")
         lines.append(f"mainloop_fuse_b = {chain.has_mainloop_fusion_b}")
-        # K-OOB mask: when BOTH operands are fused and NEITHER chain maps
-        # 0 -> 0, the TMA K-tail zero-fill is corrupted by the transform
-        # (e.g. cos(0)=1) and the OOB K-elements would add f_a(0)*f_b(0) to
-        # every accumulator. The mainloop then zeros A's OOB K-elements (using
-        # the swizzle-aware load/store below) so the product with B's OOB is 0.
+        # K-OOB mask: when BOTH operands are fused and NEITHER chain maps 0->0,
+        # the transform corrupts the TMA K-tail zero-fill (e.g. cos(0)=1) → OOB
+        # K adds f_a(0)*f_b(0) to every accumulator. Then zero A's OOB K (via the
+        # swizzle-aware load/store below) so the product with B's OOB is 0.
         koob_fix = (
             chain.has_mainloop_fusion_a
             and chain.has_mainloop_fusion_b
@@ -519,50 +432,40 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int) 
             and not _mainloop_chain_zero_preserving(chain.mainloop_b_ops)
         )
         lines.append(f"mainloop_koob_fix = {koob_fix}")
-        # CuTe XOR swizzle matching the MMA-dtype SMEM layout
-        # (s128b=Swizzle(3,4,3), s64b=(2,4,3), s32b=(1,4,3)).
-        # bbits = log2(K_MMA_bytes / 16) = log2(K_BYTES / 16).
+        # CuTe XOR swizzle matching the MMA-dtype SMEM layout; bbits =
+        # log2(K_BYTES/16) (s128b=Swizzle(3,4,3), s64b=(2,4,3), s32b=(1,4,3)).
         _bbits = (cfg.cta_tile_k_bytes // 16).bit_length() - 1
         lines.append(f"ab_swizzle = cutlass.Swizzle({_bbits}, 4, 3)")
-        # Mixed-input mainloop (dtype cast): a fused operand may be LOADED at a
-        # narrower dtype than the MMA reads (e.g. int8 A -> bf16 MMA). The TMA
-        # loads the narrow tile into a separate LOAD SMEM buffer; the mainloop
-        # warps widen it into the wide MMA SMEM buffer (store_swizzled, so the
-        # MMA's swizzle is respected). load==MMA ⇒ no cast (in-place path).
+        # Mixed-input mainloop (dtype cast): a fused operand may be LOADED
+        # narrower than the MMA reads (e.g. int8 A -> bf16 MMA). TMA loads the
+        # narrow tile into a separate LOAD SMEM buffer; the mainloop warps widen
+        # it into the wide MMA buffer via store_swizzled. load==MMA ⇒ no cast.
         lines.append(f"mainloop_a_cast = {chain.mainloop_a_cast}")
         lines.append(f"mainloop_b_cast = {chain.mainloop_b_cast}")
         load_a_dt = chain.mainloop_a_load_dtype or chain.matmul.a_dtype
         load_b_dt = chain.mainloop_b_load_dtype or chain.matmul.b_dtype
-        lines.append(f"ab_load_a_dtype = {_DTYPE_TO_DSL[load_a_dt]}")
-        lines.append(f"ab_load_b_dtype = {_DTYPE_TO_DSL[load_b_dt]}")
+        lines.append(f"ab_load_a_dtype = {DTYPE_TO_CUTLASS[load_a_dt]}")
+        lines.append(f"ab_load_b_dtype = {DTYPE_TO_CUTLASS[load_b_dt]}")
 
-    # Epilogue store vector width — largest power-of-2 in {32,16,8,4} that
-    # divides the C row stride in bytes. Picked so that st.global.v{1,2,4,8}.b32
-    # natural-alignment requirements always hold across every row.
+    # Epilogue store vector width (see _compute_output_vec_bytes).
     vec_bytes_epi = _compute_output_vec_bytes(chain)
     lines.append(f"vec_bytes_epi = {vec_bytes_epi}")
-    # Matmul-output tap (Phase 1 multi-output): when set, an extra GMEM
-    # output buffer holds the raw fp32 accumulator cast to `tap_dtype`.
-    # Phase 2 multi-output: per-tap `vec_bytes_tap_<i>` constants are emitted
-    # via `EpilogueSnippets.tap_constants` and appended in `_render_template`.
-    # Epilogue store mode: TMA-store-via-SMEM-buffer (preferred — wide bulk
-    # transfer with no per-thread STG overhead) vs per-thread STG (fallback).
-    # See _use_tma_store_epi() for gating logic.
+    # Epilogue store mode: TMA-store-via-SMEM (preferred) vs per-thread STG
+    # (fallback). See _use_tma_store_epi() for gating.
     use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, cfg, vec_bytes_epi, cta_group)
     lines.append(f"use_tma_store_epi = {use_tma}")
-    # Final ab_stages override: account for the TMA-D SMEM buffer (fixed bytes,
-    # when the TMA-store epilogue is active) AND a mixed-input mainloop's narrow
-    # LOAD buffer (per-stage bytes, beside the wide MMA tile). Otherwise leave
-    # the plain max.
+    # Final ab_stages override: account for the TMA-D SMEM buffer (fixed, when
+    # TMA-store is active) AND a mixed-input mainloop's narrow LOAD buffer
+    # (per-stage). Otherwise leave the plain max.
     smem_d_bytes = _smem_d_bytes(cfg, chain) if use_tma else 0
     cast_extra_per_stage = 0
     if chain.has_mainloop_fusion and (chain.mainloop_a_cast or chain.mainloop_b_cast):
         smem_n = cfg.cta_tile_n // cta_group
-        k_elems = cfg.cta_tile_k_bytes // _DTYPE_BYTES[chain.matmul.a_dtype]
+        k_elems = cfg.cta_tile_k_bytes // DTYPE_BYTES[chain.matmul.a_dtype]
         if chain.mainloop_a_cast:
-            cast_extra_per_stage += cfg.cta_tile_m * k_elems * _DTYPE_BYTES[chain.mainloop_a_load_dtype]
+            cast_extra_per_stage += cfg.cta_tile_m * k_elems * DTYPE_BYTES[chain.mainloop_a_load_dtype]
         if chain.mainloop_b_cast:
-            cast_extra_per_stage += smem_n * k_elems * _DTYPE_BYTES[chain.mainloop_b_load_dtype]
+            cast_extra_per_stage += smem_n * k_elems * DTYPE_BYTES[chain.mainloop_b_load_dtype]
     if smem_d_bytes > 0 or cast_extra_per_stage > 0:
         new_ab = cfg.max_ab_stages(
             cta_group,
@@ -574,9 +477,8 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int) 
 
 
 def _tmem_cols_for_arch(arch: str) -> int:
-    """TMEM column count for a config/template arch family. The block-scale
-    renderer keys off this (not the active GPU) so the kernel budgets the right
-    column count even when rendered on a different / no GPU (render-only, CI)."""
+    """TMEM column count for an arch family. Keyed off the config arch (not the
+    active GPU) so render-only / CI (different / no GPU) budgets correctly."""
     if arch == "sm100":
         return 512
     raise NotImplementedError(f"TMEM column count not known for arch {arch!r}; add it to " f"_tmem_cols_for_arch")
@@ -597,11 +499,9 @@ def _current_sm() -> int | None:
 
 
 def _grid_num_clusters(cfg: TileConfig) -> int:
-    """Fixed persistent cluster count for the MoE grouped-matmul scheduler:
-    roughly ``NUM_SMS / cluster_size`` so one cluster lands per SM-group. The
-    exact value only affects occupancy, not correctness (the host grid and the
-    kernel's persistent stride share it). Falls back to 148 (sm100 B200) when no
-    GPU is visible (render-only / CI)."""
+    """Fixed persistent cluster count for the MoE scheduler (≈ NUM_SMS /
+    cluster_size). Affects occupancy only, not correctness. Falls back to 148
+    (sm100 B200) with no GPU visible (render-only / CI)."""
     cluster_size = cfg.cgrp_size_m * cfg.cgrp_size_n
     sm_count = 148
     try:
@@ -622,12 +522,17 @@ def _template_arch_family(template_file: str) -> str:
     return m.group(1)
 
 
-def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, *, use_tma_store_epi: bool = False) -> str:
-    """Emit module-level constants for the block-scaled-matmul template.
+def _render_block_scale_tile_constants(
+    cfg: TileConfig,
+    chain: FusionChain,
+    cta_group: int,
+    *,
+    use_tma_store_epi: bool = False,
+) -> str:
+    """Emit module-level constants for the block-scale matmul template.
 
-    Unlike the generic matmul path this does NOT go through the dtype-byte
-    machinery (FP4 is 0.5 bytes / element). It resolves everything from the
-    chain's BlockScaleSpec + the geometry config, including the SF SMEM/TMEM
+    Bypasses the generic dtype-byte machinery (FP4 is 0.5 B/elem); resolves
+    everything from the chain's BlockScaleSpec + geometry, incl. SF SMEM/TMEM
     sizing and the SMEM→TMEM (utccp) copy schedules.
     """
     from .tile_config import validate_block_scale_config
@@ -635,7 +540,7 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
     bs = chain.block_scale
     assert bs is not None
     is_fp4 = bs.is_fp4
-    # Data K per tile, in elements. K_BYTES is fixed at 128 (validated).
+    # Data K per tile, in elements. K_BYTES fixed at 128 (validated).
     data_elem_bits = 4 if is_fp4 else 8
     cta_k_elems = cfg.cta_tile_k_bytes * 8 // data_elem_bits  # fp4: 256, fp8: 128
     validate_block_scale_config(cfg, bs.block_size, cta_k_elems)
@@ -648,19 +553,15 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
     num_kblocks = cta_k_elems // mma_inst_k_elems
 
     # --- Operand major (K- / M- / N-major) -----------------------------------
-    # FP4 (nvfp4 / mxfp4) is K-major only — the sub-byte (Float4E2M1FNx2)
-    # packing makes an M/N-contiguous descriptor mis-stride. mxfp8 (1 B/elem)
-    # may be M-major (A) / N-major (B). The scale-factor layout is unchanged
-    # regardless of the data major.
+    # FP4 (nvfp4/mxfp4) is K-major only — sub-byte (Float4E2M1FNx2) packing
+    # mis-strides an M/N-contiguous descriptor. mxfp8 (1 B/elem) may be M-major
+    # (A) / N-major (B). SF layout is unchanged regardless of data major.
     a_major = chain.matmul.a_major
     b_major = chain.matmul.b_major
     if is_fp4 and (a_major != "k" or b_major != "k"):
         raise ValueError(f"FP4 block-scaled inputs must be K-major (got A={a_major}-major, " f"B={b_major}-major); only mxfp8 supports M/N-major operands.")
-    # Major-dependent SMEM descriptor params, mirroring the generic matmul
-    # path's _smem_desc_params. K-major: leading=16 B, stride=8*K_bytes,
-    # k_step=32 B (the s128b MMA K-inst), group=1. M/N-major (mxfp8, 1 B/elem):
-    # the contiguous MN dim is loaded in `mn_group_elems`-wide swizzle chunks.
-    ab_elem_bytes = 1  # FP8; FP4 is rejected above for non-K
+    # Major-dependent SMEM descriptor params, mirroring _smem_desc_params.
+    ab_elem_bytes = 1  # FP8; FP4 rejected above for non-K
     mn_group_elems = cfg.cta_tile_k_bytes // ab_elem_bytes
     cta_smem_m = cta_m
     cta_smem_n = cta_n // cta_group
@@ -696,15 +597,7 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
     sf_k4 = sf_k // 4  # 4 SF-K per utccp atom
     nb_m = cta_m // 128
     nb_n = cta_n // 128
-    # --- SF scheme: small FIXED TMEM "word" per block + per-word utccp refresh.
-    # SF lives in a tiny fixed TMEM region (NUM_BLOCKS × REGISTERS_PER_BLOCK
-    # cols), refreshed by utccp before the MMA(s) that read it — the MMA reads
-    # the same fixed word and selects the active scale via the idesc
-    # a_sf_id/b_sf_id field. A 128×4 utccp atom = 4 TMEM cols holding 4 K-scales.
-    # One MMA K-inst consumes `scales_per_inst = mma_inst_k/block_size` scales
-    # (<= 4 here): the word is ONE atom (4 cols) and `insts_per_word =
-    # 4/scales_per_inst` consecutive K-insts share it (a_sf_id = j*scales_per_inst).
-    # TMEM footprint stays block-size-independent and tiny, freeing TMEM for acc.
+
     _REGISTERS_PER_ATOM = 4  # cols per 128×4 utccp atom
     scales_per_inst = mma_inst_k_elems // bs.block_size
     word_scales = max(_REGISTERS_PER_ATOM, scales_per_inst)  # cols per block-word
@@ -715,51 +608,42 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
     sfa_tmem_cols = nb_m * _REGISTERS_PER_BLOCK  # fixed SF word width (SFA)
     sfb_tmem_cols = nb_n * _REGISTERS_PER_BLOCK  # fixed SF word width (SFB)
     # utccp SMEM-source offsets (16-byte units). One 128×4 atom = 512 B = 32;
-    # consecutive K-atoms are one atom apart; each M/N-block of 128 rows is
-    # `sf_k4` atoms further along the SF SMEM tile.
+    # consecutive K-atoms 1 atom apart; each M/N-block of 128 rows is sf_k4 atoms
+    # further along the SF SMEM tile.
     sf_atom_desc_stride = 32  # K-atom stride
     sf_block_desc_stride = 32 * sf_k4  # M/N-block stride
 
     # SF SMEM bytes per stage (sf_dtype 1 byte; whole k-tile loaded by TMA).
     sfa_smem_bytes = cta_m * sf_k
     sfb_smem_bytes = cta_n * sf_k
-    # SF TMA box (fp16-recast trick): inner dim 256 fp16 (=512 B = one
-    # 128×4 SF atom block, hardcoded in the template), box-K = sf_k4 atoms.
+    # SF TMA box (fp16-recast trick): inner 256 fp16 (=512 B = one 128×4 SF atom
+    # block, hardcoded in the template), box-K = sf_k4 atoms.
     sf_tma_box_k = sf_k4
 
     # --- TMEM budget → acc_stages (+ optional overlap trick) -----------------
-    # acc accumulator needs `cta_n` cols/stage; SF needs `sf_total_cols`. With
-    # two NON-overlapping acc buffers we'd use 2*cta_n + sf. When that doesn't
-    # fit (e.g. cta_n=256), use the OVERLAP trick: the two acc buffers overlap by
-    # `acc_overlap_cols` (a multiple of the 32-col epilogue load), so the acc
-    # region spans only `2*cta_n - overlap`. The epilogue loads the overlap
-    # subtile FIRST and arrives acc_empty early, so the MMA of the next tile can
-    # reuse the overlap region while the epilogue drains the rest — preserving
-    # the double-TMEM pipelining at acc_stages=1's single mbar.
-    # Key off the config's ARCH (not the active GPU) so the kernel budgets the
-    # right TMEM column count even when rendered on a different / no GPU.
+    # acc needs cta_n cols/stage; SF needs sf_total_cols. Two non-overlapping acc
+    # buffers = 2*cta_n + sf. When that doesn't fit (e.g. cta_n=256) use the
+    # OVERLAP trick: the two acc buffers overlap by acc_overlap_cols (multiple of
+    # the 32-col epilogue load); the epilogue drains the overlap subtile FIRST
+    # and arrives acc_empty early, so the next MMA reuses it — preserving
+    # double-TMEM pipelining at a single mbar. Arch-keyed (not active GPU).
     total_tmem = _tmem_cols_for_arch(cfg.arch)
 
     def _align16(x: int) -> int:
         return (x + 15) & ~15
 
-    # SF is a single fixed word PER DISTINCT OPERAND (a shared A → one SFA word,
-    # read by every GEMM that uses it), refreshed by the utccp once per 128x4
-    # atom right before the MMA that reads it.
     # --- TMEM acc-stage + overlap (per-GEMM budget; arch- & count-agnostic) ---
-    # Each GEMM's accumulator gets its OWN, NON-overlapping TMEM region; the two
-    # tile-stage buffers OVERLAP *within* that region. Budget SF first, split the
-    # rest evenly across GEMMs, then run the ordinary single-GEMM stage/overlap
-    # decision on that per-GEMM budget:
+    # SF = one fixed word PER DISTINCT OPERAND (shared A → one SFA word).
+    # Each GEMM's acc gets its OWN region; the 2 tile-stage buffers overlap
+    # WITHIN it. Budget SF, split the rest across GEMMs, then run the single-GEMM
+    # stage/overlap decision per GEMM:
     #   per_gemm = (total_tmem - sf) // num_gemms          (>= cta_n, else reject)
-    #   2*cta_n <= per_gemm        -> acc_stages = 2 (full per-GEMM double-buffer)
+    #   2*cta_n <= per_gemm        -> acc_stages = 2 (double-buffer)
     #   else overlap = ceil32(2*cta_n - per_gemm):
     #         overlap < cta_n      -> acc_stages = 1 + overlap (parity toggle)
     #         else                 -> acc_stages = 1, no overlap
-    # GEMM g occupies [g*acc_gemm_stride, (g+1)*acc_gemm_stride); within it stage s
-    # is at +s*acc_stage_stride. SF follows all GEMM regions. Single-GEMM collapses
-    # to the legacy behaviour; the formula is independent of num_gemms and total
-    # TMEM (sm100=512).
+    # GEMM g occupies [g*acc_gemm_stride, (g+1)*acc_gemm_stride); stage s at
+    # +s*acc_stage_stride. Single-GEMM collapses to legacy behaviour.
     num_gemms = chain.num_gemms
     na, nb = chain.num_a_operands, chain.num_b_operands
     sf_total_cols = na * sfa_tmem_cols + nb * sfb_tmem_cols
@@ -792,8 +676,7 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
     acc_region_cols = cta_n  # per-stage stride WITHIN a GEMM
 
     sf_region_base = _align16(num_gemms * acc_gemm_stride)
-    # Per-distinct-operand SF word col bases. Single-GEMM → length-1 lists, the
-    # first matching the legacy sfa_col_base / sfb_col_base.
+    # Per-distinct-operand SF word col bases (single-GEMM → length-1 lists).
     sfa_col_bases = [sf_region_base + i * sfa_tmem_cols for i in range(na)]
     sfb_col_bases = [sf_region_base + na * sfa_tmem_cols + j * sfb_tmem_cols for j in range(nb)]
     sfa_col_base = sfa_col_bases[0]
@@ -809,8 +692,8 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
     from .tile_config import _SM100_SMEM_BUDGET_BYTES, _AB_STAGES_CAP
 
     fixed = 2 * acc_stages * 8 + 8
-    # TMA-store epilogue stages output subtiles through a fixed SMEM-D buffer;
-    # reserve it before sizing the AB pipeline (else SMEM overflows the cap).
+    # TMA-store stages output through a fixed SMEM-D buffer; reserve it before
+    # sizing the AB pipeline (else SMEM overflows the cap).
     if use_tma_store_epi:
         fixed += _smem_d_bytes(cfg, chain)
     ab_stages = max(1, min((_SM100_SMEM_BUDGET_BYTES - fixed) // per_stage, _AB_STAGES_CAP))
@@ -818,17 +701,15 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
     out_dt = chain.output_dtype
     vec_bytes_epi = _compute_output_vec_bytes(chain)
 
-    # Instruction-descriptor operand dtype. fp4 (mxf4nvf4) MMA: the template
-    # uses the Tcgen05MxInstrDesc with the E5M2 piggy-back. fp8 (mxf8f6f4) MMA:
-    # the real fp8 dtype.
+    # Instruction-descriptor operand dtype. fp4 MMA uses Tcgen05MxInstrDesc with
+    # the E5M2 piggy-back; fp8 uses the real fp8 dtype.
     if is_fp4:
         idesc_a = idesc_b = "cutlass.Float8E5M2"
     else:
-        idesc_a = _DTYPE_TO_DSL[bs.a_dtype]
-        idesc_b = _DTYPE_TO_DSL[bs.b_dtype]
+        idesc_a = DTYPE_TO_CUTLASS[bs.a_dtype]
+        idesc_b = DTYPE_TO_CUTLASS[bs.b_dtype]
 
-    # FP4 needs the explicit B4X16 (4-bit packed) TMA format; FP8 uses the
-    # auto-derived byte format (tma_format=None → default).
+    # FP4 needs explicit B4X16 (4-bit packed) TMA format; FP8 auto-derives.
     ab_tma_format = "_tma.TensorMapDataFormat.B4X16" if is_fp4 else "None"
 
     lines = [
@@ -853,16 +734,16 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
         f"acc_stage_stride = {acc_stage_stride}",
         f"acc_overlap_subtiles = {acc_overlap_subtiles}",
         # Multi-GEMM (parallel block-scale matmuls sharing the epilogue). Always
-        # emitted; single-GEMM = (1,1,1). Each GEMM owns cta_n acc cols within an
-        # acc_stage (acc_region_cols total); each distinct operand owns one SF word.
+        # emitted; single-GEMM = (1,1,1). Each GEMM owns cta_n acc cols/stage;
+        # each distinct operand owns one SF word.
         f"num_gemms = {num_gemms}",
         f"num_a_operands = {na}",
         f"num_b_operands = {nb}",
         f"gemm_a_idx = {tuple(a for a, _ in chain.gemm_operands)}",
         f"gemm_b_idx = {tuple(b for _, b in chain.gemm_operands)}",
         f"acc_region_cols = {acc_region_cols}",
-        # Per-GEMM TMEM region size: GEMM g's acc lives at base + g*acc_gemm_stride
-        # (regions are disjoint; the 2 tile-stage buffers overlap *within* a region).
+        # GEMM g's acc lives at base + g*acc_gemm_stride (disjoint regions; the 2
+        # tile-stage buffers overlap WITHIN a region).
         f"acc_gemm_stride = {acc_gemm_stride}",
         f"sfa_col_bases = {tuple(sfa_col_bases)}",
         f"sfb_col_bases = {tuple(sfb_col_bases)}",
@@ -871,16 +752,15 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
         f"multicast_b = {cfg.multicast_b(cta_group)}",
         "",
         f"# packed data SMEM",
-        f"ab_dtype = {_DTYPE_TO_CUTLASS[bs.a_dtype]}",
+        f"ab_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
         f"ab_packed_per_row = {ab_packed_per_row}",
         f"sA_packed_elems = {sA_packed_elems}",
         f"sB_packed_elems = {sB_packed_elems}",
-        f"ab_tma_dtype = {_DTYPE_TO_DSL[bs.a_dtype]}",
+        f"ab_tma_dtype = {DTYPE_TO_CUTLASS[bs.a_dtype]}",
         # TMA-descriptor element dtype. FP4 uses the NATIVE 4-bit Float4E2M1FN
-        # (not the packed-pair Float4E2M1FNx2) so cute scales the descriptor's
-        # strides/box by width=4 itself — no manual stride halving, matching the
-        # block-scale reference. FP8 is 1 B/elem, same as ab_tma_dtype.
-        f"ab_tma_desc_dtype = {'cutlass.Float4E2M1FN' if is_fp4 else _DTYPE_TO_DSL[bs.a_dtype]}",
+        # (not the packed-pair Float4E2M1FNx2) so cute scales the descriptor by
+        # width=4 itself (no manual stride halving). FP8 same as ab_tma_dtype.
+        f"ab_tma_desc_dtype = {'cutlass.Float4E2M1FN' if is_fp4 else DTYPE_TO_CUTLASS[bs.a_dtype]}",
         f"ab_tma_format = {ab_tma_format}",
         "ab_tma_swizzle = _tma.TensorMapSwizzle.s128b",
         "ab_smem_swizzle = cutlass.primitives.Tcgen05SmemSwizzle.SWIZZLE_128B",
@@ -892,27 +772,23 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
         f"b_smem_desc_stride_byte_offset = {b_sbo}",
         f"b_smem_k_step_bytes = {b_k_step}",
         f"b_tma_group_elems = {b_tma_group_elems}",
-        # A/B operand major. FP4 is K-major only (rejected above otherwise);
-        # mxfp8 may be M-major (A) / N-major (B), handled by the templates'
-        # a_is_m_major / b_is_n_major TMA + descriptor branches. SF layout is
-        # unchanged regardless.
+        # A/B operand major. FP4 K-major only (rejected above); mxfp8 may be
+        # M-major (A) / N-major (B). SF layout is unchanged regardless.
         f"a_is_m_major = {a_major == 'm'}",
         f"b_is_n_major = {b_major == 'n'}",
-        # MMA-instruction-descriptor major flags (1 = MN-major operand). The
-        # block-scale idesc needs these so tcgen05 interprets the SMEM matrix
-        # descriptor with the right operand orientation.
+        # MMA-idesc major flags (1 = MN-major operand) so tcgen05 reads the SMEM
+        # matrix descriptor with the right operand orientation.
         f"mma_a_major = {1 if a_major == 'm' else 0}",
         f"mma_b_major = {1 if b_major == 'n' else 0}",
         "",
         f"# output",
-        f"cd_dtype = {_DTYPE_TO_CUTLASS[out_dt]}",
-        f"cd_tma_dtype = {_DTYPE_TO_DSL[out_dt]}",
+        f"cd_dtype = {DTYPE_TO_CUTLASS[out_dt]}",
+        f"cd_tma_dtype = {DTYPE_TO_CUTLASS[out_dt]}",
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"use_tma_store_epi = {use_tma_store_epi}",
         f"cd_out_is_m_major = {chain.matmul.out_major == 'm'}",
-        # M-major TMA-store C-descriptor inner-M box = swizzle span(128 B) /
-        # elem_bytes (inner box bytes == swizzle span).
-        f"cd_mmajor_atom_m = {128 // _DTYPE_BYTES[out_dt]}",
+        # M-major TMA-store C-descriptor inner-M box = 128 B swizzle span / elem_bytes.
+        f"cd_mmajor_atom_m = {128 // DTYPE_BYTES[out_dt]}",
         "",
         f"# block-scale MMA",
         f"mma_block_scale_kind = nvvm.MMABlockScaleKind.{bs.mma_block_scale_kind}",
@@ -925,7 +801,7 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
         "",
         f"# scale factors",
         f"block_size = {bs.block_size}",
-        f"sf_cutlass_dtype = {_DTYPE_TO_CUTLASS[bs.sf_dtype]}",
+        f"sf_cutlass_dtype = {DTYPE_TO_CUTLASS[bs.sf_dtype]}",
         f"sf_k = {sf_k}",
         f"sf_scales_per_inst = {scales_per_inst}",
         f"sf_insts_per_atom = {insts_per_word}",
@@ -946,44 +822,27 @@ def _render_block_scale_tile_constants(cfg: TileConfig, chain: FusionChain, cta_
         f"sfa_tma_box_mn = {nb_m}",
         f"sfb_tma_box_mn = {nb_n}",
     ]
-    # MoE grouped block-scale matmul: the grouped persistent scheduler launches a
-    # FIXED number of clusters (≈ NUM_SMS / cluster_size) and strides through
-    # tiles by this count; the host grid and the kernel's stride share it. The
-    # first_token_offset element dtype (int32/int64) drives the compile() fake.
+    # MoE grouped block-scale: grouped persistent scheduler launches a FIXED
+    # cluster count (≈ NUM_SMS / cluster_size); host grid and stride share it.
+    # first_token_offset dtype (int32/int64) drives the compile() fake.
     if chain.has_moe:
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
-        lines.append(f"offset_cutlass_dtype = {_DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
-        # A's per-row byte stride = k * ab_data_elem_bits / 8 (FP4: 4 bits/elem →
-        # k/2 bytes). The descriptor-replacement base offset for a routed group is
-        # group_begin rows × this. (NOT ab_dtype.width — that is the *packed*
-        # Float4E2M1FNx2 = 8-bit type.)
+        lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        # A's per-row byte stride = k * ab_data_elem_bits / 8 (FP4: k/2 bytes);
+        # routed-group base offset = group_begin rows × this. NOT ab_dtype.width
+        # (that is the packed Float4E2M1FNx2 8-bit type).
         lines.append(f"ab_data_elem_bits = {data_elem_bits}")
     return "\n".join(lines)
 
 
 def _resolve_path_blocks(src: str, use_tma_store_epi: bool) -> str:
-    """Strip mode-specific blocks from the kernel template *before* the
-    `@@INJECT_*@@` markers are filled in.
+    """Strip the dead epilogue-mode block from the template before markers fill.
 
-    Why this exists: `cutlass.const_expr` in cute selects which branch's IR
-    to emit, but **both** branches are still type-checked at parse time.
-    The TMA and STG epilogue paths intentionally bind ``vec_f32`` to vectors
-    of different shapes (full t2r_inst_repx vs a vsize-element slice), so
-    cute would flag the assignment in the dynamic ``if col_j + vsize <= N:``
-    inside the STG branch as a type-change when the TMA branch also
-    declares ``vec_f32``. Stripping the dead branch at render time avoids
-    the type-consistency requirement entirely.
-
-    Marker syntax (one block per pair, no nesting):
-
-        # @@TMA_STORE_ONLY:BEGIN@@
-        ...TMA-only code, including any @@INJECT_*@@ markers...
-        # @@TMA_STORE_ONLY:END@@
-
-        # @@STG_ONLY:BEGIN@@
-        ...STG-only code, including any @@INJECT_*@@ markers...
-        # @@STG_ONLY:END@@
-    """
+    `cutlass.const_expr` picks a branch's IR, but cute type-checks BOTH branches
+    at parse time. The TMA vs STG paths bind ``vec_f32`` to different shapes, so
+    leaving both would trip cute's type-consistency check; stripping the dead
+    branch avoids it. Block syntax: `# @@{TMA_STORE,STG}_ONLY:BEGIN@@ ... :END@@`
+    (one per pair, no nesting)."""
     keep_marker = "TMA_STORE_ONLY" if use_tma_store_epi else "STG_ONLY"
     drop_marker = "STG_ONLY" if use_tma_store_epi else "TMA_STORE_ONLY"
     keep_pat = re.compile(
@@ -1000,11 +859,8 @@ def _resolve_path_blocks(src: str, use_tma_store_epi: bool) -> str:
 
 
 def _mainloop_template_file(base_template_file: str) -> str:
-    """Map the ordinary template filename to its mainloop-fusion variant.
-
-    ``sm100_matmul_1ctamma.py`` ->
-    ``sm100_matmul_mainloop_1ctamma.py``.
-    """
+    """Map a template filename to its mainloop-fusion variant
+    (``sm100_matmul_1ctamma.py`` -> ``sm100_matmul_mainloop_1ctamma.py``)."""
     return base_template_file.replace("_matmul_", "_matmul_mainloop_")
 
 
@@ -1015,16 +871,15 @@ def _render_template(
     cta_group: int,
     scheduler: str,
 ) -> str:
-    # Template file is selected by the kernel registry (single source of truth)
-    # from the pure-geometry config + the requested execution strategy
-    # (cta_group / scheduler); mainloop / graph_type come from the chain.
+    # Template selected by the kernel registry from the pure-geometry config +
+    # execution strategy (cta_group/scheduler); mainloop/graph_type from chain.
     from .kernel_registry import select_template
 
     tmpl = select_template(chain, config, cta_group, scheduler)
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
-    # Strip the unused epilogue-store path *first* so its @@INJECT_EPILOGUE@@
-    # marker doesn't survive into the marker-replacement step.
+    # Strip the unused epilogue path FIRST so its @@INJECT_EPILOGUE@@ marker
+    # doesn't survive into the marker-replacement step.
     vec_bytes_epi = _compute_output_vec_bytes(chain)
     use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group)
     src = _resolve_path_blocks(src, use_tma)
@@ -1032,9 +887,8 @@ def _render_template(
     aux_tensors = chain.aux_tensors
 
     # ---- Multi-GEMM A/B operand plumbing (1ctamma only) ------------------
-    # One TMA descriptor + SMEM buffer + runtime tensor per DISTINCT operand
-    # (deduped by the analyzer). Single-GEMM = 1 A + 1 B (suffix _0), so the
-    # rendered loops have length 1 and behave exactly like the legacy code.
+    # One TMA descriptor + SMEM buffer + runtime tensor per DISTINCT operand.
+    # Single-GEMM = 1 A + 1 B (suffix _0) → length-1 loops == legacy behavior.
     na, nb = chain.num_a_operands, chain.num_b_operands
     kernel_ab_desc_params = (
         ",\n".join(
@@ -1055,8 +909,8 @@ def _render_template(
     # the template (vec_f32); the rest (vec_f32_1, ...) are injected here.
     stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}][j * vsize : (j + 1) * vsize]" for g in range(1, chain.num_gemms)) or "pass"
     # MoE multi-GEMM: the kernel also takes the raw A (token) tensor per distinct
-    # A operand (to compute the per-group patched base address). These are the
-    # same runtime tensors the host uses to build the A descriptors (a_0, ...).
+    # A operand (for the per-group patched base address) — same tensors the host
+    # uses to build the A descriptors.
     moe_kernel_ma_params = ",\n".join(f"mA_{i}: cute.Tensor" for i in range(na))
     if moe_kernel_ma_params:
         moe_kernel_ma_params += ","
@@ -1078,8 +932,8 @@ def _render_template(
     tile_constants = _render_tile_constants(config, chain, cta_group)
     if snippets.tap_constants:
         tile_constants += "\n" + "\n".join(snippets.tap_constants)
-    # Multi-output tap plumbing (Phase 2). Empty lists → markers expand to
-    # nothing; the kernel signature shrinks back to the single-output form.
+    # Multi-output tap plumbing. Empty lists → markers expand to nothing (kernel
+    # signature shrinks back to single-output form).
     kernel_tap_params = ",\n".join(snippets.tap_kernel_params)
     if kernel_tap_params:
         kernel_tap_params += ","
@@ -1100,12 +954,9 @@ def _render_template(
     red_compile_stride_decls = _reduction_stride_compile_decls(chain)
     red_compile_stride_symbols = _reduction_stride_compile_symbols(chain)
 
-    # The @@INJECT_*@@ markers appear inside a comment-only line so we just
-    # locate the *line* containing the marker and replace it. A marker may
-    # appear multiple times at different indent levels (e.g. @@INJECT_EPILOGUE@@
-    # inside both the TMA and STG epilogue branches); use a per-match
-    # substitution callback so each occurrence gets re-indented at its own
-    # column rather than the first one's.
+    # @@INJECT_*@@ markers sit on comment-only lines; replace the whole line. A
+    # marker may appear at several indent levels (e.g. @@INJECT_EPILOGUE@@ in
+    # both epilogue branches), so re-indent each match at its own column.
     def _replace_marker_line(marker: str, replacement: str) -> None:
         nonlocal src
         pattern = re.compile(rf"^([ \t]*)# *@@{marker}@@[ \t]*\n", flags=re.MULTILINE)
@@ -1147,8 +998,7 @@ def _render_template(
         elif chain.reductions or chain.block_quant is not None:
             raise RuntimeError(f"template missing marker @@{marker}@@")
     # Multi-GEMM A/B operand plumbing — only the 1ctamma template carries these
-    # markers (the only multi-GEMM-capable template this pass). Other templates
-    # keep their fixed single-A/single-B signature.
+    # markers; other templates keep their fixed single-A/single-B signature.
     if "@@INJECT_KERNEL_AB_DESC_PARAMS@@" in src:
         _replace_marker_line("INJECT_KERNEL_AB_DESC_PARAMS", kernel_ab_desc_params)
         _replace_marker_line("INJECT_AB_DESC_LISTS", ab_desc_lists)
@@ -1157,13 +1007,12 @@ def _render_template(
         _replace_marker_line("INJECT_HOST_KERNEL_DESC_PASS", host_kernel_desc_pass)
         _replace_marker_line("INJECT_COMPILE_AB_FAKES", compile_ab_fakes)
         _replace_marker_line("INJECT_COMPILE_AB_PASS", compile_ab_pass)
-    # Per-GEMM STG vector bindings — present on every STG-epilogue template
-    # (mainloop included; single-GEMM → `pass`). Filled ungated so the mainloop
-    # epilogue can share the matmul's per-GEMM read/store pipeline verbatim.
+    # Per-GEMM STG vector bindings — on every STG-epilogue template (mainloop
+    # included; single-GEMM → `pass`).
     if "@@INJECT_STG_VEC_BINDINGS@@" in src:
         _replace_marker_line("INJECT_STG_VEC_BINDINGS", stg_vec_bindings)
-    # MoE-specific raw-A-tensor plumbing — only the MoE grouped-matmul templates
-    # carry these (the kernel patches each A descriptor per routed group).
+    # MoE raw-A-tensor plumbing — only MoE grouped-matmul templates carry these
+    # (the kernel patches each A descriptor per routed group).
     if "@@INJECT_MOE_KERNEL_MA_PARAMS@@" in src:
         _replace_marker_line("INJECT_MOE_KERNEL_MA_PARAMS", moe_kernel_ma_params)
         _replace_marker_line("INJECT_MOE_MA_LIST", moe_ma_list)
@@ -1173,10 +1022,8 @@ def _render_template(
         _replace_marker_line("INJECT_MAINLOOP_A", snippets.mainloop_transform_a)
         _replace_marker_line("INJECT_MAINLOOP_B", snippets.mainloop_transform_b)
 
-    # Tag the kernel function name with the template + geometry so nsys gives
-    # each (template, config) a distinct GPU kernel symbol, e.g.
-    # `_kernel_sm100_matmul_2ctamma_128x256x128_128x256x32_cluster2x1_...`.
-    # cta_group / static come from the template stem, the geometry from config.
+    # Tag the kernel fn name with template + geometry so nsys gives each
+    # (template, config) a distinct GPU kernel symbol.
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
     src = re.sub(r"\b_kernel\(", f"_kernel_{tag}(", src)
 
@@ -1190,10 +1037,9 @@ def _render_block_scale_template(
     cta_group: int,
     scheduler: str,
 ) -> str:
-    """Render the block-scaled-matmul kernel template. Picks the TMA-store
-    epilogue when `_use_tma_store_epi` allows (single tensor output, bf16/fp16,
-    cta_tile_m=128, ...) and STG otherwise; SF TMA descriptors are hardcoded
-    in the template (not injected). Epilogue aux/tap markers still work."""
+    """Render the block-scale matmul template. Picks TMA-store when
+    _use_tma_store_epi allows, else STG; SF TMA descriptors are hardcoded in the
+    template (not injected). Epilogue aux/tap markers still work."""
     from .kernel_registry import select_template
 
     tmpl = select_template(chain, config, cta_group, scheduler)
@@ -1234,11 +1080,9 @@ def _render_block_scale_template(
     red_compile_stride_symbols = _reduction_stride_compile_symbols(chain)
 
     # ---- Multi-GEMM A/B + SF operand plumbing (block-scale) ----------------
-    # One (packed data + SF) descriptor pair per DISTINCT operand. Single-GEMM =
-    # 1 A + 1 B (suffix _0). The SF travels with its data operand.
-    # Operand order is GROUPED BY KIND — all A data, all B data, all SFA, all
-    # SFB — so single-GEMM (na=nb=1) is exactly (a, b, sfa, sfb): the legacy
-    # block-scale runtime-call order (CompiledFusedGemm passes a, b, sfa, sfb).
+    # One (packed data + SF) descriptor pair per DISTINCT operand (SF travels
+    # with its data). GROUPED BY KIND — all A, all B, all SFA, all SFB — so
+    # single-GEMM (na=nb=1) is exactly (a, b, sfa, sfb), the legacy call order.
     na, nb = chain.num_a_operands, chain.num_b_operands
     _G = "cutlass.GridConstant[_tma.TensorMap]"
     kernel_ab_desc_params = (
@@ -1296,8 +1140,8 @@ def _render_block_scale_template(
         + ","
     )
     stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}][j * vsize : (j + 1) * vsize]" for g in range(1, chain.num_gemms)) or "pass"
-    # MoE block-scale multi-GEMM: the kernel also takes the raw A (token) tensor
-    # per distinct A operand for the per-routed-group descriptor patch.
+    # MoE block-scale: raw A (token) tensor per distinct A operand for the
+    # per-routed-group descriptor patch.
     moe_kernel_ma_params = ",\n".join(f"mA_{i}: cute.Tensor" for i in range(na))
     if moe_kernel_ma_params:
         moe_kernel_ma_params += ","
@@ -1346,8 +1190,8 @@ def _render_block_scale_template(
             _replace_marker_line(marker, replacement)
         elif chain.reductions or chain.block_quant is not None:
             raise RuntimeError(f"block-scale template missing marker @@{marker}@@")
-    # Multi-GEMM A/B + SF operand plumbing — present only on the block-scale
-    # templates that carry these markers (gated; MoE block-scale lacks them).
+    # Multi-GEMM A/B + SF operand plumbing — only block-scale templates that
+    # carry these markers (MoE block-scale lacks them).
     if "@@INJECT_KERNEL_AB_DESC_PARAMS@@" in src:
         _replace_marker_line("INJECT_KERNEL_AB_DESC_PARAMS", kernel_ab_desc_params)
         _replace_marker_line("INJECT_AB_DESC_LISTS", ab_desc_lists)
@@ -1377,9 +1221,8 @@ def _render_block_scale_template(
 def _cache_dir() -> Path:
     base = os.environ.get("CUDNN_GEMM_KERNEL_CACHE")
     if not base:
-        # Default to a per-user cache OUTSIDE the source tree / installed package
-        # so we never write a cache dir into the project (or site-packages).
-        # Honor XDG_CACHE_HOME, else ~/.cache.
+        # Per-user cache OUTSIDE the source tree / installed package (never write
+        # into the project or site-packages). Honor XDG_CACHE_HOME, else ~/.cache.
         xdg = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
         base = os.path.join(xdg, "cudnn_gemm", "kernel_cache")
     p = Path(base)
@@ -1390,12 +1233,10 @@ def _cache_dir() -> Path:
 def _ensure_dsl_array_offset() -> None:
     """Re-enable ``cutlass.Array`` pointer-offset arithmetic (``arr + n``).
 
-    The cute DSL removed ``Array.__add__`` (to avoid confusion with element-wise
-    vector math), but the kernel templates use it pervasively for mbar / SMEM
-    pointers, always meaning "sub-Array at element offset n". Bind it to the
-    DSL's sanctioned replacement, ``subview(n)`` (still supports ``.data_ptr()``
-    / indexing / nvvm ops). Lazy + idempotent so importing this package never
-    requires the DSL to be installed — only the actual JIT-compile path does."""
+    The DSL dropped ``Array.__add__``, but the templates use it pervasively for
+    mbar/SMEM pointers meaning "sub-Array at element offset n"; bind it to the
+    sanctioned ``subview(n)``. Lazy + idempotent so import never needs the DSL
+    installed — only the JIT-compile path does."""
     import cutlass
 
     if not getattr(cutlass.Array, "_gemm_offset_add", False):
@@ -1435,15 +1276,9 @@ def _import_kernel(src: str) -> object:
 def _is_layout_ambiguous(t: object) -> bool:
     """True iff cute's auto-deduce of ``leading_dim`` would fault on this tensor.
 
-    cute's algorithm (from ``cute.runtime._Tensor.mark_layout_dynamic`` docs):
-
-    * exactly one dim has stride 1                                 -> OK
-    * multiple dims have stride 1, exactly one of them has size>1  -> OK
-    * otherwise                                                    -> raises
-
-    The third case is what we want to detect — most commonly a (1, 1) scalar
-    aux tensor with stride (1, 1), where both dims have stride 1 and neither
-    has size > 1.
+    cute is OK with exactly one stride-1 dim, or multiple stride-1 dims where
+    exactly one has size>1; otherwise it raises. The fault case is most commonly
+    a (1, 1) scalar aux with stride (1, 1) (two stride-1 dims, none size>1).
     """
     strides = getattr(t, "stride", None)
     shape = getattr(t, "shape", None)
@@ -1457,23 +1292,15 @@ def _is_layout_ambiguous(t: object) -> bool:
     stride1_dims = [i for i, s in enumerate(strides) if s == 1]
     if len(stride1_dims) <= 1:
         return False
-    # Multiple dims have stride 1 -> only safe if exactly one has size > 1.
+    # Multiple stride-1 dims -> safe only if exactly one has size > 1.
     big = [i for i in stride1_dims if sizes[i] > 1]
     return len(big) != 1
 
 
 # Project convention for explicit leading_dim, applied when cute's auto-deduce
-# would fault. Indexed by position in CompiledFusedGemm.__call__'s signature.
-# All matmul tensors are rank-3 at the runtime API; per-element leading-dim
-# refers to the inner (M, K)/(N, K)/(M, N) plane (batch axis is permuted to
-# the outermost dim before the kernel sees it).
-# A runtime tensors are always shaped (batch, M, K); K-major has contiguous K,
-# M-major has contiguous M through a transposed view.
-# B runtime tensors are always shaped (batch, N, K); K-major has contiguous K,
-# N-major has contiguous N through a transposed view. Per project convention
-# we treat B's leading dim as -2 when cute needs an explicit leading_dim.
-# C: (batch, M, N) row-major, contiguous dim is N (-1).
-# aux: broadcasts onto the (..., M, N) output, C-like -> -1.
+# would fault. Batch is permuted to the outermost dim before the kernel sees it,
+# so these refer to the inner plane: A (batch,M,K) -> -1, B (batch,N,K) -> -2,
+# C (batch,M,N) row-major -> -1, aux (broadcasts onto (...,M,N), C-like) -> -1.
 _LEADING_DIM_A = -1
 _LEADING_DIM_B = -2
 _LEADING_DIM_C = -1
@@ -1481,16 +1308,14 @@ _LEADING_DIM_AUX = -1
 
 
 def _maybe_wrap_layout(t: object, leading_dim: int) -> object:
-    """If ``t``'s layout would defeat cute's auto-deduce, pre-wrap it via
-    DLPack + explicit ``mark_layout_dynamic(leading_dim)``. The returned cute
-    ``_Tensor`` exposes ``__c_pointers__``, so the JIT executor's argument
-    loop bypasses ``TensorAdapter`` (which always calls the parameterless
-    overload and would fault here). For non-ambiguous tensors we pass
-    through unchanged to keep the fast path."""
+    """If ``t``'s layout defeats cute's auto-deduce, pre-wrap via DLPack +
+    explicit ``mark_layout_dynamic(leading_dim)`` (the result exposes
+    ``__c_pointers__`` so the JIT executor bypasses ``TensorAdapter``, which
+    would fault here). Non-ambiguous tensors pass through (fast path)."""
     if not _is_layout_ambiguous(t):
         return t
-    # Lazy import — cute is only needed on the runtime fault path, and the
-    # smoke tier of `cudnn.TBD.gemm.verify` runs without GPU.
+    # Lazy import — cute is only needed on the runtime fault path (verify's
+    # smoke tier runs without a GPU).
     from cutlass.cute.runtime import from_dlpack
 
     return from_dlpack(t).mark_layout_dynamic(leading_dim)
@@ -1546,38 +1371,19 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs) -> None:
 class CompiledFusedGemm:
     """One compiled fused-GEMM, directly callable with runtime tensors.
 
-    M, N, K are all symbolic in the rendered kernel — this single object
-    handles any valid problem size, including shapes that are NOT multiples
-    of the cluster tile. The TMA descriptor's default OOB-fill behavior
-    zero-fills any element loaded past `global_dims`, so partial K-tail /
-    M-tail / N-tail tiles contribute 0 to the FP32 accumulator. The STG
-    epilogue path additionally gates per-element on `row < M` and
-    `col + vsize <= N` to avoid spurious writes, and the TMA-store path
-    relies on TMA hardware dropping OOB coordinates.
+    M, N, K are symbolic in the kernel — this one object handles any valid
+    problem size (including non-cluster-tile multiples). TMA OOB-fill zero-fills
+    elements past `global_dims`, so K/M/N tail tiles contribute 0 to the fp32
+    accumulator; the STG path also gates per-element on `row < M` /
+    `col + vsize <= N`, the TMA-store path relies on HW dropping OOB coords.
 
-    Construct via :func:`jit_from_cudnn_graph`, then invoke like a regular
-    function::
+    Construct via :func:`jit_from_cudnn_graph`, then call with a variant-pack
+    dict. See ``_maybe_wrap_layout`` for the leading-dim policy (A=-1, B=-2,
+    C=-1, aux=-1).
 
-        compiled = jit_from_cudnn_graph(g)
-        # tensors are rank-3 (batch_a/M/K, batch_b/K/N, batch/M/N)
-        compiled(a, b, c, (M, N, K))            # run
-        compiled(a2, b2, c2, (M2, N2, K2))      # same compiled binary
-        print(compiled.chain.summary())          # inspection
-
-    Layout-ambiguity policy (see ``_maybe_wrap_layout``). For any tensor
-    where cute's auto-deduce of ``leading_dim`` would fault (multiple
-    stride-1 dims and no dim with size > 1 — i.e., a scalar (1,1) aux),
-    we pre-wrap with explicit ``leading_dim`` per project convention:
-    A=-1, B=-2, C=-1, aux=-1. Tensors that auto-deduce cleanly pass
-    through unchanged to keep the fast path.
-
-    Note on the TMA OOB-fill enum naming. The CUDA driver API exposes
-    `CUtensorMapFloatOOBfill` with values NONE (=0) and NAN_REQUEST_ZERO_FMA
-    (=1). The "NONE" name is misleading — empirically (and per the driver's
-    `cudaTmaDescOobFillMode::TENSOR_ZFILL = 0` naming), bit 0
-    means zero-fill, not "undefined". Setting `nan_request_zero_fma` on
-    sm100 is actively harmful: tcgen05.mma propagates the NaN straight
-    through the accumulator.
+    Do NOT set `oob_fill=nan_request_zero_fma` on sm100: the "NONE" enum name is
+    misleading (bit 0 = zero-fill), and NaN-request is harmful because
+    tcgen05.mma propagates the NaN straight through the accumulator.
     """
 
     chain: FusionChain
@@ -1609,9 +1415,8 @@ class CompiledFusedGemm:
         b_bufs = [pull(t, "B operand") for t in b.b_operands]
         out_bufs = [pull(t, "output") for t in b.outputs]
         aux_bufs = [pull(t, f"aux {self.aux_names[i]!r}") for i, t in enumerate(b.aux)]
-        # (M, N, K) from buffer shapes: A is (batch, M, K) — for FP4-packed A the
-        # K dim is stored at K/2 elements/byte, so scale it back up. M, N come
-        # from the terminal output (batch, M, N).
+        # (M, N, K) from buffer shapes: A=(batch,M,K) (FP4-packed A stores K/2
+        # elem/byte → scale back up), M/N from the terminal output (batch,M,N).
         k_factor = 2 if self.chain.matmul.a_dtype == "fp4_e2m1" else 1
         M = a_bufs[0].shape[1]
         K = a_bufs[0].shape[2] * k_factor
@@ -1635,18 +1440,16 @@ class CompiledFusedGemm:
         return self._call_positional(a_bufs[0], b_bufs[0], c_arg, mnk, *aux_bufs)
 
     def _call_positional(self, *args):
-        # Internal launcher (driven by __call__ after it resolves the variant
-        # pack). Single-GEMM args: (a, b, c, (M,N,K), *aux). Multi-GEMM: the
-        # first arg is a list of per-GEMM (a, b) tensor pairs, deduped by tensor
-        # identity into the distinct-A / distinct-B slots fixed at JIT.
+        # Internal launcher (called by __call__ after variant-pack resolve).
+        # Single-GEMM: (a, b, c, (M,N,K), *aux). Multi-GEMM: first arg is a list
+        # of per-GEMM (a, b) pairs deduped into the JIT-fixed distinct slots.
         if self.chain.is_multi_gemm:
             if self.block_scale:
                 return self._call_block_scale_multi_gemm(*args)
             return self._call_multi_gemm(*args)
         a, b, c, mnk, *aux = args
-        # `c` may be a single Tensor (single-output, current default) or a
-        # list/tuple of Tensors in the order declared by `self.chain.outputs`
-        # — slot 0 = terminal, slot 1 = matmul tap (if any).
+        # `c` is a single Tensor or a list/tuple in `self.chain.outputs` order
+        # (slot 0 = terminal, slot 1 = matmul tap if any).
         outputs_spec = self.chain.outputs
         if isinstance(c, (list, tuple)):
             cs = list(c)
@@ -1676,9 +1479,8 @@ class CompiledFusedGemm:
         _initialize_reduction_outputs(self.chain, cs)
 
         base_problem = (mnk[0], mnk[1], mnk[2], cs[0].shape[0])
-        # Block-scaled matmul: the first two aux are the scale factors SFA/SFB
-        # (in the 128x4-blocked layout). They go right after a/b in the kernel
-        # signature; remaining aux are epilogue-fusion tensors.
+        # Block-scale: first two aux are the SFA/SFB scale factors (128x4-blocked
+        # layout), placed right after a/b; the rest are epilogue-fusion tensors.
         sf_args: tuple = ()
         if self.block_scale:
             if len(aux) < 2:
@@ -1701,10 +1503,8 @@ class CompiledFusedGemm:
                 *side_output_strides,
             )
         elif self.chain.has_mainloop_fusion:
-            # Mainloop: pass the C strides so the epilogue / C TMA descriptor
-            # honor arbitrary (padded) output row strides, exactly like matmul
-            # (A/B still loaded packed). cs[0] is permuted to (M, N, L), so its
-            # stride is (c_stride_m, c_stride_n, c_stride_l).
+            # Mainloop: pass C strides so the epilogue / C TMA descriptor honor
+            # arbitrary (padded) output row strides (A/B still loaded packed).
             problem_size = (*base_problem, *tuple(cs[0].stride()))
         elif side_output_strides:
             problem_size = (*base_problem, *side_output_strides)
@@ -1713,11 +1513,11 @@ class CompiledFusedGemm:
         a = _maybe_wrap_layout(a, _LEADING_DIM_A)
         b = _maybe_wrap_layout(b, _LEADING_DIM_B)
         cs = [
-            _wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C) for spec, ci in zip(outputs_spec, cs)
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
+            for spec, ci in zip(outputs_spec, cs)
         ]
         aux = tuple(_maybe_wrap_layout(t, _LEADING_DIM_AUX) for t in aux)
-        # cute.compile fixes the kernel signature at JIT time with one
-        # parameter per output, so the runtime call passes them flat:
+        # cute.compile fixes one param per output at JIT time, so pass them flat:
         #   plain:       (a, b, c_terminal, c_tap_0, ..., mnk, *aux)
         #   block-scale: (a, b, sfa, sfb, c_terminal, ..., mnk, *aux)
         return self._launchable(a, b, *sf_args, *cs, problem_size, *aux)
@@ -1725,10 +1525,9 @@ class CompiledFusedGemm:
     def _call_multi_gemm(self, gemm_pairs, c, mnk, *aux):
         """Multi-GEMM call: ``compiled([(A,B0),(A,B1),...], c, (M,N,K), *aux)``.
 
-        Dedup the per-GEMM (a, b) pairs by tensor identity into the distinct
-        A / B slots fixed at JIT time, verify the sharing pattern matches the
-        compiled chain, then pass ``(a_0..a_na-1, b_0..b_nb-1, c, mnk4, *aux)``
-        in the order the rendered kernel signature expects."""
+        Dedup the (a, b) pairs by tensor identity into the JIT-fixed distinct A/B
+        slots, verify the sharing pattern matches the chain, then pass
+        ``(a_0.., b_0.., c, mnk4, *aux)`` in kernel-signature order."""
         chain = self.chain
         if not isinstance(gemm_pairs, (list, tuple)) or not all(isinstance(p, (list, tuple)) and len(p) == 2 for p in gemm_pairs):
             raise ValueError("multi-GEMM call expects a list of (a, b) tensor pairs as the " f"first argument; got {type(gemm_pairs).__name__}")
@@ -1738,7 +1537,10 @@ class CompiledFusedGemm:
         a_slots: list = [None] * na
         b_slots: list = [None] * nb
         for (A_g, B_g), (ai, bi) in zip(gemm_pairs, chain.gemm_operands):
-            for slots, idx, t, role in ((a_slots, ai, A_g, "A"), (b_slots, bi, B_g, "B")):
+            for slots, idx, t, role in (
+                (a_slots, ai, A_g, "A"),
+                (b_slots, bi, B_g, "B"),
+            ):
                 if slots[idx] is None:
                     slots[idx] = t
                 elif slots[idx].data_ptr() != t.data_ptr():
@@ -1785,7 +1587,7 @@ class CompiledFusedGemm:
         a_wrapped = [_maybe_wrap_layout(t, _LEADING_DIM_A) for t in a_permuted]
         b_wrapped = [_maybe_wrap_layout(t, _LEADING_DIM_B) for t in b_permuted]
         cs_wrapped = [
-            _wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C)
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_permuted)
         ]
         aux = tuple(_maybe_wrap_layout(t, _LEADING_DIM_AUX) for t in aux)
@@ -1795,11 +1597,9 @@ class CompiledFusedGemm:
         """Block-scale multi-GEMM call:
         ``compiled([((A,SFA),(B0,SFB0)), ((A,SFA),(B1,SFB1))], c, (M,N,K), *epi_aux)``.
 
-        Each operand is a (packed_data, scale_factor) pair; dedup by the
-        packed-data tensor identity (the SF travels with its data → a shared
-        dequant collapses to one distinct operand). Pass
-        ``(a_0, sfa_0, .., b_0, sfb_0, .., c, mnk4, *epi_aux)`` in the order the
-        rendered block-scale kernel signature expects."""
+        Each operand is a (packed_data, SF) pair; dedup by packed-data identity
+        (SF travels with its data → a shared dequant collapses to one operand).
+        Grouped by kind in the kernel signature (a.., b.., sfa.., sfb..)."""
         chain = self.chain
         ok = (
             isinstance(gemm_pairs, (list, tuple))
@@ -1814,7 +1614,10 @@ class CompiledFusedGemm:
         a_slots: list = [None] * na  # (packed_a, sfa)
         b_slots: list = [None] * nb
         for ((A_g, SFA_g), (B_g, SFB_g)), (ai, bi) in zip(gemm_pairs, chain.gemm_operands):
-            for slots, idx, data, sf, role in ((a_slots, ai, A_g, SFA_g, "A"), (b_slots, bi, B_g, SFB_g, "B")):
+            for slots, idx, data, sf, role in (
+                (a_slots, ai, A_g, SFA_g, "A"),
+                (b_slots, bi, B_g, SFB_g, "B"),
+            ):
                 if slots[idx] is None:
                     slots[idx] = (data, sf)
                 elif slots[idx][0].data_ptr() != data.data_ptr():
@@ -1822,9 +1625,8 @@ class CompiledFusedGemm:
         if any(s is None for s in a_slots) or any(s is None for s in b_slots):
             raise ValueError("block-scale multi-GEMM: not every distinct operand slot was filled")
 
-        # Outputs in chain.outputs slot order: slot 0 = terminal, slots 1.. =
-        # taps (the no-epilogue case has one output per GEMM: GEMM 0 terminal,
-        # GEMMs >0 taps). A fused epilogue has a single (terminal) output.
+        # chain.outputs order: slot 0 = terminal, slots 1.. = taps. No-epilogue
+        # → one output per GEMM (GEMM 0 terminal, rest taps); fused → one output.
         outputs_spec = chain.outputs
         cs = list(c) if isinstance(c, (list, tuple)) else [c]
         if len(cs) != len(outputs_spec):
@@ -1840,8 +1642,7 @@ class CompiledFusedGemm:
                 )
         _initialize_reduction_outputs(chain, cs)
         base_problem = (mnk[0], mnk[1], mnk[2], cs[0].shape[0])
-        # Grouped by kind: all A data, all B data, all SFA, all SFB (matches the
-        # block-scale kernel signature; single-GEMM collapses to a, b, sfa, sfb).
+        # Grouped by kind (all A, all B, all SFA, all SFB); single-GEMM → a,b,sfa,sfb.
         a_permuted = [d.permute(1, 2, 0) for d, _ in a_slots]
         b_permuted = [d.permute(1, 2, 0) for d, _ in b_slots]
         c_permuted = [ci.permute(1, 2, 0) for ci in cs]
@@ -1864,30 +1665,16 @@ class CompiledFusedGemm:
         sfa_w = [_maybe_wrap_layout(s.permute(1, 2, 0), _LEADING_DIM_AUX) for _, s in a_slots]
         sfb_w = [_maybe_wrap_layout(s.permute(1, 2, 0), _LEADING_DIM_AUX) for _, s in b_slots]
         cs_w = [
-            _wrap_raw_tensor(t) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(t, _LEADING_DIM_C)
+            (_wrap_raw_tensor(t) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(t, _LEADING_DIM_C))
             for spec, t in zip(outputs_spec, c_permuted)
         ]
         aux = tuple(_maybe_wrap_layout(t, _LEADING_DIM_AUX) for t in aux)
         return self._launchable(*a_w, *b_w, *sfa_w, *sfb_w, *cs_w, problem_size, *aux)
 
 
-_DTYPE_BYTES = {
-    "bf16": 2,
-    "fp16": 2,
-    "fp32": 4,
-    "int8": 1,
-    "fp8_e4m3": 1,
-    "fp8_e5m2": 1,
-    "fp8_e8m0": 1,
-    "uint8": 1,
-    "int32": 4,
-    "int64": 8,
-}
-
-
 def _mma_a_dtype(chain: FusionChain) -> str:
-    """MMA-instruction A dtype = the graph-declared operand dtype (mainloop
-    transforms are dtype-preserving; there is no implicit cast)."""
+    """MMA A dtype = the graph-declared operand dtype (no implicit cast;
+    mainloop transforms are dtype-preserving)."""
     return chain.matmul.a_dtype
 
 
@@ -1897,11 +1684,9 @@ def _mma_b_dtype(chain: FusionChain) -> str:
 
 
 def _check_supported(chain: FusionChain, config: TileConfig) -> None:
-    """Reject a plain-matmul (input/acc dtype combo × active arch) the project
-    can't run. Delegates to the unified MMA-type support table in
-    ``kernel_registry`` (single source of truth — formerly the local
-    ``_PIPELINE_DTYPE_ARCH`` table) and raises on rejection. ``config`` is taken
-    for call-site symmetry but unused (mma-type support is config-independent)."""
+    """Reject a plain-matmul (input/acc dtype combo × active arch) we can't run.
+    Delegates to ``kernel_registry``'s unified MMA-type support table (single
+    source of truth). ``config`` is unused (support is config-independent)."""
     from .kernel_registry import GraphType, mma_arch_reject
 
     reason = mma_arch_reject(chain, GraphType.MATMUL)
@@ -1910,11 +1695,11 @@ def _check_supported(chain: FusionChain, config: TileConfig) -> None:
 
 
 def _check_dtype_config_compat(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
-    """Reject (chain, config) pairs where the config's K_BYTES is not a
-    multiple of the MMA dtype's element width. ``cta_group`` (the template's)
-    sets the per-CTA SMEM N for the N-major-B swizzle-group check."""
+    """Reject (chain, config) where the config K_BYTES isn't a multiple of the
+    MMA dtype's element width. ``cta_group`` sets per-CTA SMEM N for the
+    N-major-B swizzle-group check."""
     mma_dt = _mma_a_dtype(chain)
-    elem_bytes = _DTYPE_BYTES.get(mma_dt)
+    elem_bytes = DTYPE_BYTES.get(mma_dt)
     if elem_bytes is None:
         raise ValueError(f"unsupported MMA a_dtype {mma_dt!r}")
     if config.cta_tile_k_bytes % elem_bytes != 0:
@@ -1955,8 +1740,8 @@ def _check_input_alignment(chain: FusionChain) -> None:
     M = chain.matmul.M
     N = chain.matmul.N
     K = chain.matmul.K
-    a_elem_bytes = _DTYPE_BYTES[chain.matmul.a_dtype]
-    b_elem_bytes = _DTYPE_BYTES[chain.matmul.b_dtype]
+    a_elem_bytes = DTYPE_BYTES[chain.matmul.a_dtype]
+    b_elem_bytes = DTYPE_BYTES[chain.matmul.b_dtype]
     a_major_extent = K if chain.matmul.a_major == "k" else M
     b_major_extent = K if chain.matmul.b_major == "k" else N
     bad: list[str] = []
@@ -1975,64 +1760,44 @@ def _check_input_alignment(chain: FusionChain) -> None:
         )
 
 
-# How many SMEM-D slots to double-buffer (lets the TMA store of one subtile
-# overlap the sts of the next). 2 is the minimum useful value. More slots
-# would help only if the TMA-store latency exceeds the sts cost of one
-# subtile, which on B200 isn't generally the case.
+# SMEM-D double-buffer depth (TMA store of one subtile overlaps the sts of the
+# next). 2 is the minimum useful value; more helps only if TMA-store latency
+# exceeds one subtile's sts cost, not generally the case on B200.
 _EPI_SMEM_STAGES = 2
 
 
 def _smem_d_bytes(cfg, chain) -> int:
-    """SMEM-D buffer size in bytes for the TMA-store epilogue.
-
-    Holds `_EPI_SMEM_STAGES` slots of `cta_tile_m × epi_tile_mn[1]` elements
-    (one subtile per slot). The 16-byte alignment pad mirrors the existing
-    smem_a/b allocations.
-    """
-    elem_bytes = _DTYPE_BYTES[chain.output_dtype]
+    """SMEM-D buffer bytes for the TMA-store epilogue: `_EPI_SMEM_STAGES` slots
+    of `cta_tile_m × epi_tile_mn[1]` elements + a 16-byte alignment pad."""
+    elem_bytes = DTYPE_BYTES[chain.output_dtype]
     return _EPI_SMEM_STAGES * cfg.cta_tile_m * cfg.epi_tile_mn[1] * elem_bytes + 16
 
 
 def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
-    """Phase-1 gate for the TMA-store epilogue path.
-
-    Requirements:
-      - **single tensor output**: no aux tensors. Aux fusion ops do
-        per-column / per-element loads with a vector width tied to the
-        STG vsize, which doesn't line up with the full t2r_inst_repx
-        vector that the TMA path stages into SMEM. Unary-only fusions
-        (relu, gelu, ...) are allowed because they're shape-polymorphic.
-      - **output row stride ≥ 16 bytes for N-major output**: PTX `cp.async.bulk.tensor`
-        requires the SMEM source layout to be aligned with the TMA
-        descriptor's swizzle (s64b for the typical 32-col BF16 subtile).
-        With < 16-byte stride the descriptor cannot be constructed.
-      - **cta_tile_m == 128**: Phase 1 only wires the 128-rows-per-CTA
-        thread→row layout. cta_tile_m=64 (cluster-m=128 2×2 DP) uses a
-        different epilogue layout (lane<16 active) and is left for later.
-      - **out dtype ∈ {bf16, fp16}**: matches the s64b swizzle we hard-code
-        for the 32-col subtile (32 × 2 bytes = 64 bytes/row).
-      - **M-major (col-major) output, 16B-aligned M**: via 16x256b TMEM-load +
-        stmatrix.trans + tma_store.
+    """Gate for the TMA-store epilogue path. Requires:
+    - single tensor output (no aux): aux ops load at STG vsize, misaligned
+      with the full t2r_inst_repx vector the TMA path stages to SMEM.
+    - N-major output row stride ≥ 16 bytes: cp.async.bulk.tensor needs the
+      SMEM source aligned to the descriptor swizzle (else undeclarable).
+    - cta_tile_m == 128: only the 128-rows/CTA thread→row layout is wired.
+    - out dtype ∈ {bf16, fp16}: matches the hard-coded s64b 32-col swizzle.
+    - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store).
     """
     if chain.has_moe:
-        # MoE scatters output rows by routed group (epilogue gates on
-        # group_begin / row < group_end). The TMA-store path writes contiguous
-        # tiles with no group offset, so MoE is STG-only — independent of the
-        # jit path's _FORCE_STG_EPI.
+        # MoE scatters output rows by routed group; the TMA-store path writes
+        # contiguous tiles with no group offset → STG-only.
         return False
     if chain.is_multi_gemm:
-        # Multi-GEMM stages multiple accumulators into one fused output; the
-        # TMA-store path has no multi-accumulator hook → STG only.
+        # No multi-accumulator hook in the TMA-store path → STG only.
         return False
     if chain.aux_tensors:
         return False
     if chain.matmul.output_tap:
-        # Multi-output: the matmul-tap STG path runs alongside the terminal
-        # store in the per-vector inner loop. The TMA-store path stages full
-        # t2r_inst_repx subtiles and doesn't have a hook for the tap.
+        # The matmul-tap STG runs in the per-vector inner loop; the TMA path
+        # stages full t2r_inst_repx subtiles with no tap hook.
         return False
     if chain.reductions:
-        # Reduction taps use per-element atomic updates from the STG epilogue.
+        # Reduction taps are per-element atomic updates from the STG epilogue.
         return False
     if chain.block_quant is not None:
         # Quant scale is a per-vector side output from the STG epilogue.
@@ -2043,31 +1808,23 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
         return False
     if chain.output_dtype not in ("bf16", "fp16"):
         return False
-    # The TMA descriptor uses a fixed 32-col subtile (epi_tile_mn[1]==32 in
-    # every catalog entry). Under cta_group=2 each CTA holds half of B's N,
-    # so its per-CTA col count is cta_tile_n//2 — needs ≥ 32 to make a full
-    # subtile fit. cta_tile_n=32 with cta_group=2 (per-CTA n=16) would split
-    # a 32-col tile across two CTAs, which the current TMA path doesn't
-    # support; fall back to STG there.
+    # Fixed 32-col subtile; under cta_group=2 each CTA holds cta_tile_n//2 cols,
+    # so cta_tile_n<64 (per-CTA n<32) would split a subtile across CTAs —
+    # unsupported by the TMA path, fall back to STG.
     if cta_group == 2 and cfg.cta_tile_n < 64:
         return False
-    # m major output which meets the alignment requirement.
     if chain.matmul.out_major == "m":
-        m_align = 16 // _DTYPE_BYTES[chain.output_dtype]
+        m_align = 16 // DTYPE_BYTES[chain.output_dtype]
         return chain.matmul.M % m_align == 0
     return True
 
 
 def _compute_output_vec_bytes(chain: FusionChain) -> int:
-    """Largest power-of-2 in {32, 16, 8, 4} that divides the C row stride in
-    bytes. This becomes the epilogue store width: 32 → st.global.v8.b32,
-    16 → v4.b32, 8 → v2.b32, 4 → b32. Every row of C must satisfy the PTX
-    natural-alignment requirement for the chosen store width, and the row
-    stride is what governs row-to-row alignment for all rows beyond 0.
-
-    For m-major output, each row is strided by M, so vsize=1 → scalar-store
-    fallback or stmatrix.trans + tma_store"""
-    elem_bytes = _DTYPE_BYTES[chain.output_dtype]
+    """Epilogue store width: largest power-of-2 in {32,16,8,4} that divides the C
+    row stride in bytes (32→v8.b32, 16→v4, 8→v2, 4→b32). The row stride governs
+    row-to-row PTX natural alignment. M-major output → elem_bytes (scalar / TMA
+    store)."""
+    elem_bytes = DTYPE_BYTES[chain.output_dtype]
     if chain.matmul.out_major == "m":
         return elem_bytes
     stride_bytes = chain.matmul.N * elem_bytes
@@ -2103,7 +1860,7 @@ def _check_block_quant_supported(
         raise NotImplementedError("block_scale_quantize epilogue is not supported with mainloop fusion")
     if chain.matmul.out_major != "n":
         raise NotImplementedError("block_scale_quantize epilogue currently supports only N-major output")
-    elem_bytes = _DTYPE_BYTES[chain.output_dtype]
+    elem_bytes = DTYPE_BYTES[chain.output_dtype]
     vsize = vec_bytes_epi // elem_bytes
     if q.block_size != vsize:
         raise NotImplementedError(
@@ -2137,14 +1894,12 @@ def probe_supported(
     cta_group: int = 2,
     scheduler: str = "clc",
 ) -> None:
-    """Cheap eligibility check — the gates :func:`jit_from_cudnn_graph` runs, but
-    WITHOUT ``cute.compile``. Raises ``NotImplementedError`` / ``ValueError`` if
-    the GEMM engine cannot run the graph. Used by the TBD engine probe to decide
-    whether to list ``TBD_eng0`` in the plan list (see cudnn.TBD.heuristics).
+    """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT
+    ``cute.compile``. Raises if the engine can't run the graph. Used by the TBD
+    engine probe to decide whether to list ``TBD_eng0`` (see cudnn.TBD.heuristics).
 
-    Block-scale / MoE have their per-side gates inside the specialized ``_jit_*``
-    compile paths; analysis succeeding is treated as eligible for those and the
-    full validation surfaces at compile time (when the engine is selected)."""
+    Block-scale / MoE gate inside their ``_jit_*`` compile paths; here a
+    successful analysis is treated as eligible (full validation at compile)."""
     chain, _binding = analyze_with_binding(graph)
     if chain.has_moe or chain.has_block_scale:
         return  # specialized paths validate at compile
@@ -2173,34 +1928,29 @@ def jit_from_cudnn_graph(
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel.
 
-    Eagerly performs analyze → codegen → render → import → cute.compile.
-    The returned :class:`CompiledFusedGemm` is directly callable.
+    Eagerly analyze → codegen → render → import → cute.compile; returns a
+    directly-callable :class:`CompiledFusedGemm`.
 
-    `graph` is a ``cudnn.pygraph`` built with the standard frontend API
-    after ``import cudnn.TBD.gemm`` (the import installs the op-recording hook).
-    `config` is a PURE-GEOMETRY tile shape from `tile_config.CATALOG`. The
-    execution strategy is chosen here: ``cta_group`` ∈ {1, 2} (1-CTA vs 2-CTA
-    MMA) and ``scheduler`` ∈ {"clc", "static"} pick the kernel template
-    (mainloop fusion is auto-detected from the graph). Defaults match the
-    previous DEFAULT_CONFIG (2-CTA MMA + CLC). Set ``force_stg_epi=True`` to
-    skip the TMA-store path even when its gate would accept.
+    `graph` is a ``cudnn.pygraph`` built after ``import cudnn.TBD.gemm`` (the
+    import installs the op-recording hook). `config` is a PURE-GEOMETRY tile from
+    `tile_config.CATALOG`. Execution strategy: ``cta_group`` ∈ {1, 2} and
+    ``scheduler`` ∈ {"clc", "static"} pick the template (mainloop auto-detected).
+    ``force_stg_epi=True`` skips the TMA-store path even when its gate accepts.
     """
     chain, binding = analyze_with_binding(graph)
-    # MoE grouped block-scale matmul = both pattern-matches at once (dequant +
-    # moe_grouped_matmul). Must be checked BEFORE the single-feature gates.
+    # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
+    # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:
         return _jit_moe_block_scale(chain, config, cta_group, scheduler, binding=binding)
-    # Block-scale matmul is gated independently (its own per-side case table);
-    # route to it before the plain-matmul gate.
+    # Block-scale is gated independently (own per-side case table).
     if chain.has_block_scale:
         return _jit_block_scale(chain, config, cta_group, scheduler, binding=binding)
-    # MoE grouped matmul: own graph type / template (grouped persistent scheduler
-    # + per-group A TMA descriptor replacement). Gated via the MOE mma table.
+    # MoE grouped matmul: own template (grouped persistent scheduler + per-group
+    # A TMA descriptor replacement).
     if chain.has_moe:
         return _jit_moe(chain, config, cta_group, scheduler, binding=binding)
-    # Multi-GEMM is only implemented in the 1ctamma CLC template this pass.
-    # select_template deliberately skips capability gates (single-point
-    # probing), so reject an unsupported strategy here with a clear message
+    # Multi-GEMM is only in the 1ctamma CLC template. select_template skips
+    # capability gates, so reject unsupported strategy here with a clear message
     # rather than fault deep in cute on a missing vec_f32_<g> binding.
     if chain.is_multi_gemm:
         from .kernel_registry import select_template
@@ -2216,9 +1966,8 @@ def jit_from_cudnn_graph(
     _check_supported(chain, config)
     _check_dtype_config_compat(chain, config, cta_group)
     _check_input_alignment(chain)
-    # Side effect: this also raises if output alignment < 4 bytes (the floor
-    # supported by PTX scalar st.b32). Called eagerly so callers see the
-    # rejection at JIT time, before _render_template re-computes it.
+    # Eager: also raises if output alignment < 4 bytes (PTX st.b32 floor), so
+    # callers see the rejection at JIT time.
     _compute_output_vec_bytes(chain)
     global _FORCE_STG_EPI
     prev_force = _FORCE_STG_EPI
@@ -2229,7 +1978,7 @@ def jit_from_cudnn_graph(
         snippets = generate(
             chain,
             vec_bytes_epi=vec_bytes_epi,
-            output_elem_bytes=_DTYPE_BYTES[chain.output_dtype],
+            output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         )
         src = _render_template(chain, snippets, config, cta_group, scheduler)
     finally:
@@ -2241,23 +1990,20 @@ def jit_from_cudnn_graph(
         config=config,
         aux_names=[aux.name for aux in chain.aux_tensors],
         generated_path=_cache_dir() / f"gen_{digest}" / "generated_kernel.py",
-        _launchable=mod.compile(),  # one-shot cute.compile (lru_cached inside mod)
+        _launchable=mod.compile(),  # one-shot cute.compile (lru_cached in mod)
         binding=binding,
     )
 
 
 # --- sm100_block_scale_matmul: arch/dtype support -------------------------
-# The supported per-side cases (data/SF dtype, block size, reorder, dequant
-# compute/out) now live in the unified `kernel_registry.MMA_TYPE_SUPPORT` table
-# — the single source of truth, merged with the plain-matmul dtype table. This
-# gate delegates to it.
+# Supported per-side cases live in `kernel_registry.MMA_TYPE_SUPPORT` (single
+# source of truth); this gate delegates to it.
 
 
 def _check_block_scale_supported(chain: FusionChain) -> None:
-    """Reject any block-scale matmul the `sm100_block_scale_matmul` template
-    can't run — a FULL per-side match (data dtype, SF dtype, block size, reorder
-    layout, dequant compute/out) + active arch, judged by
-    `kernel_registry.MMA_TYPE_SUPPORT`. Raises on rejection."""
+    """Reject a block-scale matmul the template can't run — FULL per-side match
+    (data/SF dtype, block size, reorder, dequant compute/out) + active arch, via
+    `kernel_registry.MMA_TYPE_SUPPORT`."""
     from .kernel_registry import GraphType, mma_arch_reject
 
     reason = mma_arch_reject(chain, GraphType.BLOCK_SCALE_MATMUL)
@@ -2266,9 +2012,9 @@ def _check_block_scale_supported(chain: FusionChain) -> None:
 
 
 def _resolve_moe_variant_pack(compiled, variant_pack: dict):
-    """Resolve a MoE variant-pack dict into the buffers the positional MoE call
-    needs, inferring (S, N, K) from buffer shapes. Returns
-    ``(a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, (S, N, K))``."""
+    """Resolve a MoE variant-pack dict into the positional-call buffers,
+    inferring (S, N, K) from shapes. Returns ``(a_bufs, b_bufs, out_bufs,
+    aux_bufs, fto, sfa, sfb, (S, N, K))``."""
     b = compiled.binding
     if b is None:
         raise NotImplementedError("variant-pack call is not yet wired up for this graph type")
@@ -2297,22 +2043,16 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
 class CompiledMoeGemm:
     """A compiled MoE grouped matmul forward pass, directly callable.
 
-    Runtime call::
-
-        compiled = jit_from_cudnn_graph(g)           # g built with moe_grouped_matmul
-        compiled(token, weight, first_token_offset, output, (S, N, K, E))
-
-    Layouts (rank-3, matching the cuDNN frontend / project conventions):
-      * ``token``  — (1, S, K) row-major  (A; single token plane).
-      * ``weight`` — (E, N, K) row-major  (B; per-expert, same N-K convention as
-        the plain-matmul B operand). The cuDNN ``[E, H, N]`` column-major-in-H×N
-        weight is bit-identical to this ``(E, N, K)`` row-major layout in memory.
+    Layouts (rank-3):
+      * ``token``  — (1, S, K) row-major (A).
+      * ``weight`` — (E, N, K) row-major (B, per-expert; bit-identical to cuDNN's
+        ``[E, H, N]`` column-major-in-H×N layout).
       * ``first_token_offset`` — (E,) int32: group g spans token rows
-        ``[first_token_offset[g], first_token_offset[g+1])`` (last group → S).
+        ``[fto[g], fto[g+1])`` (last group → S).
       * ``output`` — (1, S, N) row-major.
 
-    The per-CTA A-descriptor workspace is allocated and owned here (the user API
-    stays clean); it is reused across calls and grown if the grid changes."""
+    The per-CTA A-descriptor workspace is allocated/owned here, reused across
+    calls and grown if the grid changes."""
 
     chain: FusionChain
     config: TileConfig
@@ -2324,8 +2064,8 @@ class CompiledMoeGemm:
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
 
     def _make_workspace(self, n_slots, device):
-        """Lazily allocate the per-CTA A-descriptor GMEM workspace (16 int64 per
-        slot, 128-byte aligned). ``n_slots`` = grid_ctas * num_a_operands."""
+        """Lazily allocate the per-CTA A-descriptor GMEM workspace (16 int64/slot,
+        128-byte aligned). ``n_slots`` = grid_ctas * num_a_operands."""
         import torch
 
         if self._workspace is None:
@@ -2355,7 +2095,11 @@ class CompiledMoeGemm:
             raise ValueError(
                 f"this MoE graph has {len(outputs_spec)} output(s) " f"({[o.source for o in outputs_spec]}); got {len(outputs)}. " "Pass outputs in slot order."
             )
-        for name, t, rank in (("token", token, 3), ("weight", weight, 3), ("first_token_offset", first_token_offset, 1)):
+        for name, t, rank in (
+            ("token", token, 3),
+            ("weight", weight, 3),
+            ("first_token_offset", first_token_offset, 1),
+        ):
             if len(t.shape) != rank:
                 raise ValueError(f"MoE {name} must be rank-{rank}; got shape {tuple(t.shape)}")
         for spec, t in zip(outputs_spec, outputs):
@@ -2364,9 +2108,8 @@ class CompiledMoeGemm:
                     f"MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, self.chain, (S, N, K))}; " f"got {tuple(t.shape)}"
                 )
         _initialize_reduction_outputs(self.chain, outputs)
-        # num_experts = weight's batch (E); num_groups = first_token_offset length
-        # (BxE — may exceed E; group g uses expert g % E). Derived from the
-        # runtime tensors, so the call is robust to BxE > E.
+        # num_experts = weight batch (E); num_groups = first_token_offset len
+        # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
         num_experts = int(weight.shape[0])
         num_groups = int(first_token_offset.shape[0])
         # Permute to the kernel's (S,K,1)/(N,K,E)/(S,N,1) layout.
@@ -2395,11 +2138,10 @@ class CompiledMoeGemm:
         a = _maybe_wrap_layout(a_perm, _LEADING_DIM_A)
         b = _maybe_wrap_layout(b_perm, _LEADING_DIM_B)
         cs = [
-            _wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C)
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
         ]
-        # A-descriptor workspace: grid_num_clusters * cluster_m * cluster_n slots
-        # of 16 int64 (128-byte tensormap), 128-byte aligned.
+        # A-descriptor workspace: one 128-byte tensormap slot per CTA.
         workspace = self._make_workspace(self._grid_ctas, token.device)
         return self._launchable(
             a,
@@ -2423,10 +2165,9 @@ class CompiledMoeGemm:
         """Multi-GEMM MoE call:
         ``compiled([(tok, w0), (tok, w1), ...], fto, out, (S, N, K[, ...]), *aux)``.
 
-        Each pair is a (token, weight) tuple; tokens/weights are deduped by
-        tensor identity into the distinct A/B slots fixed at JIT time (a shared
-        token → one distinct A operand). All grouped matmuls share ``fto``.
-        ``out`` is the single fused (terminal) output."""
+        (token, weight) pairs deduped by tensor identity into the JIT-fixed A/B
+        slots (shared token → one A operand). All matmuls share ``fto``; ``out``
+        is the single fused (terminal) output."""
         import torch
 
         chain = self.chain
@@ -2442,7 +2183,10 @@ class CompiledMoeGemm:
         a_slots: list = [None] * na
         b_slots: list = [None] * nb
         for (tok, w), (ai, bi) in zip(gemm_pairs, chain.gemm_operands):
-            for slots, idx, t, role in ((a_slots, ai, tok, "token"), (b_slots, bi, w, "weight")):
+            for slots, idx, t, role in (
+                (a_slots, ai, tok, "token"),
+                (b_slots, bi, w, "weight"),
+            ):
                 if slots[idx] is None:
                     slots[idx] = t
                 elif slots[idx].data_ptr() != t.data_ptr():
@@ -2459,7 +2203,10 @@ class CompiledMoeGemm:
         if len(outs) != len(outputs_spec):
             raise ValueError(f"fused multi-GEMM MoE has {len(outputs_spec)} output(s); got {len(outs)}")
         out = outs[0]
-        for name, t, rank in (("output", out, 3), ("first_token_offset", first_token_offset, 1)):
+        for name, t, rank in (
+            ("output", out, 3),
+            ("first_token_offset", first_token_offset, 1),
+        ):
             if len(t.shape) != rank:
                 raise ValueError(f"MoE {name} must be rank-{rank}; got shape {tuple(t.shape)}")
         for role, slots in (("token", a_slots), ("weight", b_slots)):
@@ -2498,7 +2245,7 @@ class CompiledMoeGemm:
         a_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_A) for t in a_slots]
         b_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_B) for t in b_slots]
         cs = [
-            _wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C)
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
         ]
         aux = tuple(_maybe_wrap_layout(t, _LEADING_DIM_AUX) for t in aux)
@@ -2548,7 +2295,7 @@ def _jit_moe(
         snippets = generate(
             chain,
             vec_bytes_epi=vec_bytes_epi,
-            output_elem_bytes=_DTYPE_BYTES[chain.output_dtype],
+            output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         )
         src = _render_template(chain, snippets, config, cta_group, scheduler)
     finally:
@@ -2578,13 +2325,11 @@ def _jit_block_scale(
 ) -> CompiledFusedGemm:
     """JIT path for block-scaled (FP4 / FP8 + per-block SF) matmul.
 
-    Bypasses the generic dtype-byte alignment checks (FP4 is 0.5 B/elem) and
-    routes to the block-scale template via :func:`_render_block_scale_template`.
-    Validation of the (config, block_size) pair happens inside the tile-constant
-    renderer (``validate_block_scale_config``)."""
-    # Reject anything the block-scale template can't run — exact per-side match
-    # against the supported cases (+ family arch). This subsumes the both-sided
-    # requirement (single-sided matches no case).
+    Bypasses the generic dtype-byte checks (FP4 is 0.5 B/elem); routes to the
+    block-scale template. (config, block_size) validation happens in the
+    tile-constant renderer (``validate_block_scale_config``)."""
+    # Exact per-side match against the supported cases (+ arch); subsumes the
+    # both-sided requirement (single-sided matches no case).
     _check_block_scale_supported(chain)
     if chain.reductions:
         if config.arch != "sm100":
@@ -2592,8 +2337,7 @@ def _jit_block_scale(
         for red in chain.reductions:
             if red.compute_dtype != "fp32" or red.dtype != "fp32":
                 raise NotImplementedError("block-scale reduction supports only fp32 compute/output")
-    # Per-template active-GPU SM gate: reject early on a GPU outside the
-    # template's range rather than fault at launch. No-op when no GPU is visible.
+    # Per-template active-GPU SM gate (no-op when no GPU is visible).
     from .kernel_registry import select_template
 
     _tmpl = select_template(chain, config, cta_group, scheduler)
@@ -2610,7 +2354,7 @@ def _jit_block_scale(
     snippets = generate(
         chain,
         vec_bytes_epi=vec_bytes_epi,
-        output_elem_bytes=_DTYPE_BYTES[chain.output_dtype],
+        output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
     )
     src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler)
     mod = _import_kernel(src)
@@ -2630,24 +2374,18 @@ def _jit_block_scale(
 class CompiledMoeBlockScaleGemm:
     """A compiled MoE grouped *block-scale* (FP4/FP8 + per-block SF) matmul fwd.
 
-    Runtime call::
-
-        compiled = jit_from_cudnn_graph(g)   # g built with block_scale_dequantize
-                                             #   on token+weight → moe_grouped_matmul
-        compiled(token, weight, sfa, sfb, first_token_offset, output, (S, N, K, E))
-
-    Layouts (rank-3, matching the cuDNN frontend / project conventions):
-      * ``token``  — (1, S, Kp) packed FP4/FP8  (A; single token plane).
-      * ``weight`` — (E, N, Kp) packed FP4/FP8  (B; per-expert).
-      * ``sfa``    — token scale factors, F8_128x4-reordered + padded to 128 rows
-        PER GROUP, then concatenated (Σ ceil(group_m/128) blocks).
-      * ``sfb``    — weight scale factors, F8_128x4-reordered, per-expert.
+    Layouts (rank-3):
+      * ``token``  — (1, S, Kp) packed FP4/FP8 (A).
+      * ``weight`` — (E, N, Kp) packed FP4/FP8 (B, per-expert).
+      * ``sfa``    — token SF, F8_128x4-reordered + padded to 128 rows PER GROUP,
+        then concatenated (Σ ceil(group_m/128) blocks).
+      * ``sfb``    — weight SF, F8_128x4-reordered, per-expert.
       * ``first_token_offset`` — (num_groups,) int32/int64; group g spans token
-        rows ``[fto[g], fto[g+1])`` (last → S). Group sizes are arbitrary (need
-        NOT be 128-aligned); the scheduler tracks each group's start SF-block.
+        rows ``[fto[g], fto[g+1])`` (last → S). Group sizes arbitrary (NOT
+        128-aligned); the scheduler tracks each group's start SF-block.
       * ``output`` — (1, S, N) row-major.
 
-    The per-CTA A-descriptor workspace is allocated/owned here (clean user API)."""
+    The per-CTA A-descriptor workspace is allocated/owned here."""
 
     chain: FusionChain
     config: TileConfig
@@ -2690,7 +2428,13 @@ class CompiledMoeBlockScaleGemm:
                 f"({[o.source for o in outputs_spec]}); got {len(outputs)}. "
                 "Pass outputs in slot order."
             )
-        for name, t, rank in (("token", token, 3), ("weight", weight, 3), ("sfa", sfa, 3), ("sfb", sfb, 3), ("first_token_offset", first_token_offset, 1)):
+        for name, t, rank in (
+            ("token", token, 3),
+            ("weight", weight, 3),
+            ("sfa", sfa, 3),
+            ("sfb", sfb, 3),
+            ("first_token_offset", first_token_offset, 1),
+        ):
             if len(t.shape) != rank:
                 raise ValueError(f"MoE block-scale {name} must be rank-{rank}; " f"got shape {tuple(t.shape)}")
         for spec, t in zip(outputs_spec, outputs):
@@ -2701,14 +2445,12 @@ class CompiledMoeBlockScaleGemm:
                     f"got {tuple(t.shape)}"
                 )
         _initialize_reduction_outputs(self.chain, outputs)
-        # num_experts = weight's batch (E); num_groups = first_token_offset length
-        # (BxE — may exceed E; group g uses expert g % E). Derived from runtime
-        # tensors, so the call is robust to BxE > E.
+        # num_experts = weight batch (E); num_groups = first_token_offset len
+        # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
         num_experts = int(weight.shape[0])
         num_groups = int(first_token_offset.shape[0])
-        # Permute to the kernel's inner-plane layouts (batch axis last). The host
-        # rebuilds the SF descriptors from .iterator only, so the SF permute just
-        # needs to preserve the base pointer.
+        # Permute to inner-plane layouts (batch last). The host rebuilds SF
+        # descriptors from .iterator, so the SF permute just preserves the base ptr.
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -2734,7 +2476,7 @@ class CompiledMoeBlockScaleGemm:
         a = _maybe_wrap_layout(a_perm, _LEADING_DIM_A)
         b = _maybe_wrap_layout(b_perm, _LEADING_DIM_B)
         cs = [
-            _wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C)
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
         ]
         msfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
@@ -2765,10 +2507,9 @@ class CompiledMoeBlockScaleGemm:
         ``compiled([((tok,sfa),(w0,sfb0)), ((tok,sfa),(w1,sfb1)), ...], fto,
         out, (S, N, K[, ...]), *aux)``.
 
-        Each GEMM is a ((token, sfa), (weight, sfb)) pair; dedup by the PACKED
-        data tensor identity (SF travels with its data → a shared token+sfa
-        collapses to one distinct A operand). All grouped matmuls share ``fto``;
-        ``out`` is the single fused (terminal) output."""
+        Each GEMM is a ((token, sfa), (weight, sfb)) pair; dedup by PACKED-data
+        identity (SF travels with its data → shared token+sfa collapses to one A
+        operand). All matmuls share ``fto``; ``out`` is the fused output."""
         import torch
 
         chain = self.chain
@@ -2789,7 +2530,10 @@ class CompiledMoeBlockScaleGemm:
         a_slots: list = [None] * na  # (packed token, sfa)
         b_slots: list = [None] * nb  # (packed weight, sfb)
         for ((tok, sfa), (w, sfb)), (ai, bi) in zip(gemm_pairs, chain.gemm_operands):
-            for slots, idx, data, sf, role in ((a_slots, ai, tok, sfa, "token"), (b_slots, bi, w, sfb, "weight")):
+            for slots, idx, data, sf, role in (
+                (a_slots, ai, tok, sfa, "token"),
+                (b_slots, bi, w, sfb, "weight"),
+            ):
                 if slots[idx] is None:
                     slots[idx] = (data, sf)
                 elif slots[idx][0].data_ptr() != data.data_ptr():
@@ -2802,7 +2546,10 @@ class CompiledMoeBlockScaleGemm:
         if len(outs) != len(outputs_spec):
             raise ValueError(f"fused multi-GEMM MoE block-scale has {len(outputs_spec)} output(s); got {len(outs)}")
         out = outs[0]
-        for name, t, rank in (("output", out, 3), ("first_token_offset", first_token_offset, 1)):
+        for name, t, rank in (
+            ("output", out, 3),
+            ("first_token_offset", first_token_offset, 1),
+        ):
             if len(t.shape) != rank:
                 raise ValueError(f"MoE block-scale {name} must be rank-{rank}; got {tuple(t.shape)}")
         for spec, ci in zip(outputs_spec, outs):
@@ -2832,14 +2579,13 @@ class CompiledMoeBlockScaleGemm:
             *tuple(c_perms[0].stride()),
             *side_output_strides,
         )
-        # Grouped by kind — all A data, all B data, all SFA, all SFB — matching
-        # the rendered _host signature (single-GEMM → a,b,sfa,sfb).
+        # Grouped by kind (all A, all B, all SFA, all SFB); single-GEMM → a,b,sfa,sfb.
         a_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_A) for (t, _sf) in a_slots]
         b_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_B) for (t, _sf) in b_slots]
         sfa_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in a_slots]
         sfb_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in b_slots]
         cs = [
-            _wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C)
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
         ]
         aux = tuple(_maybe_wrap_layout(t, _LEADING_DIM_AUX) for t in aux)
@@ -2868,9 +2614,8 @@ def _jit_moe_block_scale(
 ) -> CompiledMoeBlockScaleGemm:
     """JIT path for a MoE grouped block-scale matmul (dequant + moe_grouped).
 
-    Combines the block-scale SF machinery (own per-side case table) with the MoE
-    grouped persistent scheduler + per-group A TMA descriptor replacement. STG
-    epilogue only (forced inside :func:`_render_block_scale_template`)."""
+    Block-scale SF machinery + MoE grouped persistent scheduler + per-group A
+    TMA descriptor replacement. STG epilogue only."""
     from .kernel_registry import (
         GraphType,
         mma_arch_reject,
@@ -2890,7 +2635,7 @@ def _jit_moe_block_scale(
         for red in chain.reductions:
             if red.compute_dtype != "fp32" or red.dtype != "fp32":
                 raise NotImplementedError("MoE block-scale reduction supports only fp32 compute/output")
-    # Per-template active-GPU SM gate.
+    # Per-template active-GPU SM gate (no-op when no GPU is visible).
     _tmpl = select_template(chain, config, cta_group, scheduler)
     _arch_reason = _tmpl.arch_active_reject()
     if _arch_reason is not None:
@@ -2901,7 +2646,7 @@ def _jit_moe_block_scale(
     snippets = generate(
         chain,
         vec_bytes_epi=vec_bytes_epi,
-        output_elem_bytes=_DTYPE_BYTES[chain.output_dtype],
+        output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
     )
     src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler)
     mod = _import_kernel(src)

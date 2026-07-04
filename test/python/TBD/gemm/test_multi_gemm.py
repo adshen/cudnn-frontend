@@ -1,9 +1,5 @@
 """Multi-GEMM: K parallel matmuls (shared shape/layout, shared-or-distinct
-operands) feeding one shared pointwise epilogue.
-
-Analyzer / codegen tests run without a GPU; end-to-end correctness tests are
-GPU-gated. Single-GEMM behavior must stay unchanged.
-"""
+operands) feeding one shared pointwise epilogue. Single-GEMM must stay unchanged."""
 
 from __future__ import annotations
 
@@ -19,10 +15,7 @@ from cudnn.TBD.gemm.tile_config import CATALOG, DEFAULT_CONFIG, by_name
 
 
 class _Plan:
-    """Test handle that JIT-compiles a recorded graph with a forced tile config
-    via ``jit_from_cudnn_graph`` (sweeps pin a specific config directly rather
-    than letting the TBD engine auto-select). Exposes chain / binding / block_scale /
-    aux_names and is callable with a variant pack."""
+    """JIT-compiles a recorded graph with a forced tile config; callable with a variant pack."""
 
     def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
         self.g = graph
@@ -44,9 +37,8 @@ def _plan(graph, config=None, cta_group=2, scheduler="clc"):
 
 
 def _vp_mg(compiled, gemm_pairs, outs, *aux):
-    """Variant-pack dict for a multi-GEMM call. Dedups the per-GEMM (a, b)
-    pairs by tensor identity into the binding's distinct A / B slots (first
-    appearance order == binding order); fills outputs + aux from the binding."""
+    """Multi-GEMM variant-pack dict: dedup per-GEMM (a, b) pairs by identity into
+    the binding's distinct A/B slots (first-appearance order); + outputs + aux."""
     bd = compiled.binding
     a_seen, b_seen = [], []
     for ag, bg in gemm_pairs:
@@ -82,13 +74,11 @@ def _B(g, K, N, name="B"):
 _N128_CFG = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
 
 
-# ---------------------------------------------------------------------------
-# Analyzer + codegen (no GPU)
-# ---------------------------------------------------------------------------
+# --- Analyzer + codegen (no GPU) ---
 
 
 def test_single_gemm_unchanged() -> None:
-    """A single matmul still analyzes as num_gemms==1 with the legacy defaults."""
+    """A single matmul still analyzes as num_gemms==1."""
     M, N, K = 256, 256, 128
     g = _graph()
     A, B = _A(g, M, K), _B(g, K, N)
@@ -100,7 +90,7 @@ def test_single_gemm_unchanged() -> None:
     assert chain.num_a_operands == 1 and chain.num_b_operands == 1
     assert chain.gemm_operands == [(0, 0)]
     assert not chain.is_multi_gemm
-    # codegen references the legacy `vec_f32` root, never `vec_f32_1`.
+    # single-GEMM codegen uses the legacy `vec_f32` root, never `vec_f32_1`
     epi = generate(chain).epilogue
     assert "vec_f32_1" not in epi
 
@@ -122,16 +112,14 @@ def test_dual_gemm_shared_a_detected() -> None:
     assert chain.num_gemms == 2
     assert chain.num_a_operands == 1 and chain.num_b_operands == 2
     assert chain.gemm_operands == [(0, 0), (0, 1)]
-    # The mul that re-merges the branches is a fan-in over GEMM 0 (via silu)
-    # and GEMM 1 directly. Producing-op refs: op-0 result (>=0) and GEMM 1
-    # (gemm_source(1) == -2).
+    # the re-merging mul is a fan-in over GEMM 0 (via silu) and GEMM 1 directly
     from cudnn.TBD.gemm.fusion_ir import gemm_source
 
     mul_op = chain.ops[1]
     assert mul_op.op == "mul"
     assert mul_op.parent_idx == 0  # silu result (op 0)
     assert mul_op.parent_idx_b == gemm_source(1)  # GEMM 1 output (-2)
-    # codegen binds both GEMM roots into the shared chain.
+    # codegen binds both GEMM roots into the shared chain
     epi = generate(chain).epilogue
     assert "vec_f32" in epi and "vec_f32_1" in epi
 
@@ -202,7 +190,7 @@ def test_heterogeneous_gemms_rejected() -> None:
     B0 = _B(g, 128, 256, "B0")
     B1 = _B(g, 128, 128, "B1")  # different N
     C0 = g.matmul(A=A, B=B0, name="m0")
-    # mm1 needs its own A of matching K; use a separate A with N differing → shape mismatch
+    # mm1 needs its own A of matching K → shape mismatch across the two GEMMs
     A2 = _A(g, 256, 128, "A2")
     C1 = g.matmul(A=A2, B=B1, name="m1")
     Y = g.add(a=C0, b=C1, name="a")
@@ -217,8 +205,7 @@ _N256_C2_CFG = next(
 
 
 def test_multi_gemm_2ctamma_compiles() -> None:
-    """Multi-GEMM is supported on all four matmul templates; here the 2-CTA-MMA
-    CLC template (cluster2x1) compiles a dual-GEMM graph."""
+    """The 2-CTA-MMA CLC template (cluster2x1) compiles a dual-GEMM graph."""
     M, N, K = 256, 256, 128
     g = _graph()
     A = _A(g, M, K)
@@ -232,9 +219,7 @@ def test_multi_gemm_2ctamma_compiles() -> None:
 
 
 def test_multi_gemm_mainloop_template_rejected() -> None:
-    """A multi-GEMM graph never selects a mainloop template (no markers there);
-    the registry guard rejects an unsupported strategy. (Constructed via the
-    registry funnel since a multi-GEMM chain can't also be a mainloop chain.)"""
+    """A multi-GEMM graph never selects a mainloop template (registry guard rejects it)."""
     from cudnn.TBD.gemm.graph_analyzer import analyze
     from cudnn.TBD.gemm.kernel_registry import TEMPLATES
 
@@ -252,9 +237,7 @@ def test_multi_gemm_mainloop_template_rejected() -> None:
     assert mainloop_tmpl.accepts(chain, _N256_C2_CFG) is not None
 
 
-# ---------------------------------------------------------------------------
-# End-to-end correctness (GPU)
-# ---------------------------------------------------------------------------
+# --- End-to-end correctness (GPU) ---
 
 _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
@@ -486,7 +469,12 @@ def test_multi_gemm_reduction_scalar_int32(mode, ref_dims) -> None:
     ref_term = torch.einsum("bmk,bnk->bmn", a.cpu().to(torch.int64), b0.cpu().to(torch.int64))
     ref_term += torch.einsum("bmk,bnk->bmn", a.cpu().to(torch.int64), b1.cpu().to(torch.int64))
     torch.testing.assert_close(c_term.cpu().to(torch.int64), ref_term, atol=0, rtol=0)
-    _assert_red_close(c_red.cpu().to(torch.int64), _reduction_ref(ref_term, mode, ref_dims).to(torch.int64), mode, exact=True)
+    _assert_red_close(
+        c_red.cpu().to(torch.int64),
+        _reduction_ref(ref_term, mode, ref_dims).to(torch.int64),
+        mode,
+        exact=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -519,7 +507,10 @@ def test_multi_gemm_reduction_strided_output_fp32(mode, red_dims, red_stride, re
     "mode,ref_fn",
     (
         (cudnn.reduction_mode.ADD, lambda x: x.sum(dim=(0, 1, 2), keepdim=True)),
-        (cudnn.reduction_mode.AMAX, lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True)),
+        (
+            cudnn.reduction_mode.AMAX,
+            lambda x: x.abs().amax(dim=(0, 1, 2), keepdim=True),
+        ),
     ),
     ids=("add", "amax"),
 )

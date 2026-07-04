@@ -1,27 +1,9 @@
 """Analyze a user-built ``cudnn.pygraph`` and produce a ``FusionChain``.
 
-The user-facing API is **pure cuDNN frontend** — they write::
-
-    import cudnn
-    import cudnn.TBD.gemm                          # triggers install_recorder() at import
-
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, ...)
-    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
-    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
-    C = g.matmul(A=A, B=B, name="mm")
-    Y = g.relu(input=C, name="r")
-    Y.set_output(True)
-
-    compiled = cudnn.TBD.gemm.compiler.jit_from_cudnn_graph(g)
-
-There is no custom ``FusedGraph`` wrapper. Importing ``cudnn.TBD.gemm`` monkey-patches
-``cudnn.pygraph``'s tensor / matmul / pointwise op methods so they record the
-op chain on the graph instance (``g._cudnn_gemm_state``) while still delegating
-to the real cuDNN backend. ``analyze(g)`` reads that state.
-
-This means: any ``cudnn.pygraph`` constructed AFTER ``import cudnn.TBD.gemm`` is
-automatically analyzable. Graphs built BEFORE the import are not — call
-``cudnn.TBD.gemm.install_recorder()`` early if you need to be safe.
+Importing ``cudnn.TBD.gemm`` monkey-patches ``cudnn.pygraph``'s tensor / matmul /
+pointwise methods to record the op chain while delegating to the real backend, so
+any graph built AFTER the import is analyzable (call ``install_recorder()`` early
+otherwise). ``analyze(g)`` reads that recorded state.
 """
 
 from __future__ import annotations
@@ -49,27 +31,10 @@ from .fusion_ir import (
     gemm_source,
 )
 
-# ---------------------------------------------------------------------------
 # Dtype + op tables
-# ---------------------------------------------------------------------------
 
-
-_DTYPE_FROM_CUDNN: dict[Any, Dtype] = {
-    cudnn.data_type.BFLOAT16: "bf16",
-    cudnn.data_type.HALF: "fp16",
-    cudnn.data_type.FLOAT: "fp32",
-    cudnn.data_type.INT8: "int8",
-    cudnn.data_type.FP8_E4M3: "fp8_e4m3",
-    cudnn.data_type.FP8_E5M2: "fp8_e5m2",
-    cudnn.data_type.FP8_E8M0: "fp8_e8m0",
-    cudnn.data_type.FP4_E2M1: "fp4_e2m1",
-    cudnn.data_type.INT8: "int8",
-    cudnn.data_type.UINT8: "uint8",
-    cudnn.data_type.INT32: "int32",
-    cudnn.data_type.INT64: "int64",
-}
-
-_CUDNN_FROM_DTYPE: dict[Dtype, Any] = {v: k for k, v in _DTYPE_FROM_CUDNN.items()}
+from .dtypes import CUDNN_FROM_DTYPE as _CUDNN_FROM_DTYPE
+from .dtypes import DTYPE_FROM_CUDNN as _DTYPE_FROM_CUDNN
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -110,9 +75,7 @@ _BINARY_OP_MAP: dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Internal recording state, attached to each cudnn.pygraph instance
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -123,24 +86,17 @@ class _RecordedOp:
     output: int
     output_tensor: Any  # strong ref so id() stays valid
     compute_dtype: Dtype | None = None  # per-op compute_data_type override (None → graph default)
-    # block_scale_dequantize: the [non-K, K] block size (e.g. [1, 16] for A,
-    # [16, 1] for B). None for every other op.
+    # block_scale_dequantize: the [non-K, K] block size (e.g. [1,16] for A). None otherwise.
     block_size: tuple[int, ...] | None = None
     is_negative_scale: bool = False
-    # block_scale_quantize: output is the quantized tensor; scale_output is
-    # the scale-factor side-output returned by cuDNN.
+    # block_scale_quantize: quantized output + the SF side-output from cuDNN.
     scale_output: int | None = None
     scale_output_tensor: Any = None
     quant_axis: int | None = None
     quant_transpose: bool = False
-    # moe_grouped_matmul: the operation mode ("none" / "gather" / "scatter").
-    # None for every other op.
-    moe_mode: str | None = None
-    # reduction: canonical reduction mode ("add" / "amax" / "max" / "min").
-    # None for every other op.
-    reduction_mode: str | None = None
-    # Optional cuDNN FE groupOffset input for grouped reductions. For MoE this
-    # is expected to be the same tensor as first_token_offset.
+    moe_mode: str | None = None  # moe_grouped_matmul mode; None otherwise
+    reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
+    # Optional groupOffset input for grouped reductions (MoE: == first_token_offset).
     group_offset: int | None = None
 
 
@@ -151,28 +107,19 @@ class _TensorMeta:
     stride: tuple[int, ...]
     dtype: Dtype
     is_input: bool = False
-    # cuDNN tensor reordering layout name (e.g. "F8_128x4") or None for the
-    # default (NONE). Captured so the block-scale SF reorder layout is visible
-    # to the analyzer / compile-stage support check.
+    # SF reorder layout name (e.g. "F8_128x4") or None for the default (NONE).
     reordering: str | None = None
-    # Strong ref to the cuDNN tensor object itself. For graph inputs this is the
-    # tensor returned by g.tensor(...); op outputs carry it on _RecordedOp too.
-    # Used to bind each role to its cuDNN tensor (uid / name / object) so the
-    # compiled kernel can be called with a variant-pack dict instead of
-    # order-sensitive positional args.
+    # Strong ref to the cuDNN tensor object, used to bind each role for the
+    # variant-pack dict (uid / name / object) instead of positional args.
     tensor: Any = None
 
 
-# pybind11's cudnn.pygraph doesn't allow setting arbitrary attributes on
-# instances, so we keep per-graph recording state in a WeakKeyDictionary keyed
-# by the graph object itself. Entries auto-evict when graphs are GC'd, and
-# we never collide via id() reuse across short-lived graphs.
+# pybind11's cudnn.pygraph forbids arbitrary instance attrs, so per-graph state
+# lives in a WeakKeyDictionary keyed by the graph (auto-evicts on GC; no id() reuse).
 _GRAPH_STATES: "weakref.WeakKeyDictionary[cudnn.pygraph, dict]" = weakref.WeakKeyDictionary()
 
-# cuDNN ``set_output(True)`` / ``set_data_type(...)`` are tensor-instance methods
-# with no corresponding getter, so we class-patch them and stash the resulting
-# flags here (keyed by id(tensor)). Cleared at each pygraph __init__ to keep
-# state from leaking across short-lived scripts.
+# set_output / set_data_type are setters with no getter, so we class-patch them
+# and stash the flags here (keyed by id(tensor)). Cleared each pygraph __init__.
 _TENSOR_OUTPUT_FLAG: dict[int, bool] = {}
 _TENSOR_EXPLICIT_DTYPE: dict[int, Any] = {}
 _TENSOR_DIM_OVERRIDE: dict[int, tuple[int, ...]] = {}
@@ -186,10 +133,8 @@ def _ensure_state(graph: cudnn.pygraph) -> dict:
             "ops": [],
             "tensor_meta": {},
             "io_dtype": "bf16",
-            # cuDNN graph-level defaults. ``intermediate_dtype`` is the
-            # data_type a virtual (unmaterialized) tensor takes when the user
-            # doesn't call set_data_type on it; ``compute_dtype`` is the
-            # default math precision for every op that doesn't override it.
+            # Graph-level defaults: intermediate_dtype = a virtual tensor's dtype
+            # when no set_data_type; compute_dtype = default op math precision.
             "intermediate_dtype": "fp32",
             "compute_dtype": "fp32",
         }
@@ -201,22 +146,18 @@ def _get_state(graph: cudnn.pygraph) -> dict | None:
     return _GRAPH_STATES.get(graph)
 
 
-# ---------------------------------------------------------------------------
 # Variant-pack binding — maps each graph role to its cuDNN tensor
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class GemmBinding:
-    """Maps each graph role to the cuDNN tensor that fills it, so a compiled
-    kernel can be called with a variant-pack dict (keyed by cuDNN tensor object,
-    uid, or name) instead of order-sensitive positional args.
+    """Maps each graph role to its cuDNN tensor so a compiled kernel takes a
+    variant-pack dict (keyed by tensor object / uid / name) not positional args.
 
-    Operand lists are in the distinct-slot order the rendered kernel expects;
-    ``outputs`` is in :pyattr:`FusionChain.outputs` slot order (terminal, then
-    taps); ``aux`` is in :pyattr:`FusionChain.aux_tensors` order. Block-scale
-    fills ``sfa_operands`` / ``sfb_operands`` parallel to ``a_operands`` /
-    ``b_operands``; MoE fills ``first_token_offset``."""
+    Operand lists are in kernel distinct-slot order; ``outputs`` in
+    :pyattr:`FusionChain.outputs` slot order (terminal, then taps); ``aux`` in
+    :pyattr:`FusionChain.aux_tensors` order. Block-scale fills ``sfa/sfb_operands``
+    parallel to ``a/b_operands``; MoE fills ``first_token_offset``."""
 
     a_operands: list[Any] = field(default_factory=list)
     b_operands: list[Any] = field(default_factory=list)
@@ -251,9 +192,8 @@ def _make_multi_binding(
     block_scale: bool,
     first_token_offset=None,
 ) -> GemmBinding:
-    """Build a GemmBinding for the multi-operand builders (multi-GEMM / MoE),
-    pulling the cuDNN tensor for each distinct A/B slot (+ its SF for the
-    block-scale case) out of ``meta``."""
+    """Build a GemmBinding for the multi-operand builders (multi-GEMM / MoE):
+    the cuDNN tensor per distinct A/B slot (+ its SF for block-scale) from ``meta``."""
 
     def _sf(caps: dict, ids) -> list:
         objs = []
@@ -286,17 +226,15 @@ def _safe_uid(t: Any) -> int | None:
         uid = t.get_uid()
     except Exception:  # noqa: BLE001
         return None
-    # cuDNN leaves uid = -1 (or 0) until build_operation_graph(); only trust a
-    # positive uid as a lookup key.
+    # uid is -1/0 until build_operation_graph(); only a positive uid is a valid key.
     return uid if isinstance(uid, int) and uid > 0 else None
 
 
 def resolve_variant_pack(variant_pack: dict, binding: GemmBinding) -> dict[int, Any]:
     """Resolve a ``{key: buffer}`` variant pack to ``{id(bound_tensor): buffer}``.
 
-    Keys may be the cuDNN tensor object (by identity), its uid (int, only once
-    ``build_operation_graph()`` has assigned positive uids), or its name (str).
-    Raises on an unknown key or a key that doesn't match any bound role."""
+    Keys may be the cuDNN tensor object, its uid (once positive), or its name.
+    Raises on an unknown / unmatched key."""
     if not isinstance(variant_pack, dict):
         raise TypeError("compiled kernels are called with a variant-pack dict " "{cudnn_tensor | uid | name: buffer}; got " f"{type(variant_pack).__name__}")
     bound = binding.bound_tensors()
@@ -335,9 +273,7 @@ def resolve_variant_pack(variant_pack: dict, binding: GemmBinding) -> dict[int, 
     return resolved
 
 
-# ---------------------------------------------------------------------------
 # Monkey-patch installer
-# ---------------------------------------------------------------------------
 
 
 _INSTALLED = False
@@ -345,12 +281,8 @@ _ORIGINALS: dict[str, Any] = {}
 
 
 def _bind(args: tuple, kwargs: dict, names: tuple[str, ...]) -> dict:
-    """Merge positional + keyword args into a ``name -> value`` dict.
-
-    The recorder patches must accept exactly what the real cuDNN API accepts —
-    both positional (``g.matmul(A, B)``) and keyword (``g.matmul(A=A, B=B)``).
-    Delegation always passes ``*args, **kwargs`` verbatim; this helper only
-    reconstructs the named values for the best-effort op recording."""
+    """Merge positional + keyword args into a ``name -> value`` dict for op
+    recording (delegation still passes ``*args, **kwargs`` verbatim)."""
     bound = dict(kwargs)
     for i, val in enumerate(args):
         if i < len(names):
@@ -367,7 +299,7 @@ def _patched_init(self, *args, **kwargs):
     state["io_dtype"] = _DTYPE_FROM_CUDNN.get(io_dt, "bf16")
     state["intermediate_dtype"] = _DTYPE_FROM_CUDNN.get(inter_dt, "fp32")
     state["compute_dtype"] = _DTYPE_FROM_CUDNN.get(comp_dt, "fp32")
-    # Fresh graph → clear any stale tensor-level flags from earlier graphs.
+    # Fresh graph → clear stale tensor-level flags from earlier graphs.
     _TENSOR_OUTPUT_FLAG.clear()
     _TENSOR_EXPLICIT_DTYPE.clear()
     _TENSOR_DIM_OVERRIDE.clear()
@@ -376,24 +308,21 @@ def _patched_init(self, *args, **kwargs):
 
 def _patched_tensor(self, *args, **kwargs):
     state = _ensure_state(self)
-    # GEMM keyword style omits data_type → default to the graph io dtype. Only
-    # inject for the pure-keyword call (host callers always pass data_type, often
-    # as a torch dtype — leave those untouched).
+    # GEMM keyword style omits data_type → default to io dtype. Only inject for
+    # the pure-keyword call (host callers pass a torch dtype — leave untouched).
     if not args and kwargs.get("data_type") is None:
         kwargs = {**kwargs, "data_type": _CUDNN_FROM_DTYPE[state["io_dtype"]]}
     t = _ORIGINALS["tensor"](self, *args, **kwargs)
     try:
         b = _bind(args, kwargs, ("name", "dim", "stride", "data_type"))
-        # Capture the SF reorder layout (e.g. F8_128x4) when set. The enum's
-        # .name is "NONE" for the default; store None in that case.
+        # SF reorder layout (e.g. F8_128x4) when set; enum .name is "NONE" default → None.
         rt = b.get("reordering_type")
         reordering = rt.name if (rt is not None and getattr(rt, "name", "NONE") != "NONE") else None
         state["tensor_meta"][id(t)] = _TensorMeta(
             name=b.get("name"),
             dim=tuple(b["dim"]),
             stride=tuple(b["stride"]),
-            # .get → None for torch dtypes (host graphs, never analyzed); cuDNN
-            # enums (GEMM graphs) map to our literal.
+            # .get → None for torch dtypes (host graphs); cuDNN enums map to our literal.
             dtype=_DTYPE_FROM_CUDNN.get(b.get("data_type")),
             is_input=True,
             reordering=reordering,
@@ -405,9 +334,7 @@ def _patched_tensor(self, *args, **kwargs):
 
 
 def _opt_compute_dtype(kwargs: dict) -> Dtype | None:
-    """Pull a per-op ``compute_data_type`` override out of the kwargs the user
-    passed to a cuDNN op, mapping it to our Dtype literal. None → "use the
-    graph default" (resolved in _build_chain)."""
+    """Per-op ``compute_data_type`` override → Dtype literal; None → graph default."""
     dt = kwargs.get("compute_data_type")
     if dt is None:
         return None
@@ -420,7 +347,16 @@ def _patched_matmul(self, *args, **kwargs):
         b = _bind(args, kwargs, ("A", "B"))
         name = b.get("name", "")
         state = _ensure_state(self)
-        state["ops"].append(_RecordedOp("matmul", name, [id(b["A"]), id(b["B"])], id(out), out, compute_dtype=_opt_compute_dtype(kwargs)))
+        state["ops"].append(
+            _RecordedOp(
+                "matmul",
+                name,
+                [id(b["A"]), id(b["B"])],
+                id(out),
+                out,
+                compute_dtype=_opt_compute_dtype(kwargs),
+            )
+        )
         state["tensor_meta"][id(out)] = _TensorMeta(name=f"{name}::OUT_0", dim=(), stride=(), dtype="fp32")
     except Exception:  # noqa: BLE001
         pass
@@ -433,10 +369,8 @@ def _patched_block_scale_dequantize(self, *args, **kwargs):
         b = _bind(args, kwargs, ("input", "descale", "block_size", "is_negative_scale"))
         name = b.get("name", "")
         state = _ensure_state(self)
-        # The dequant output is virtual fp32 (per the graph json). dim/stride are
-        # the same logical (batch, M, K) / (batch, K, N) as the packed input — the
-        # matmul reads it as if dequantized. Record fp32 so downstream rank checks
-        # see a 3D operand carrying the input's dims.
+        # Dequant output is virtual fp32 with the packed input's dim/stride, so
+        # downstream rank checks see a 3D operand carrying the input's dims.
         in_meta = state["tensor_meta"].get(id(b["input"]))
         state["ops"].append(
             _RecordedOp(
@@ -534,7 +468,18 @@ _REDUCTION_MODE_FROM_CUDNN: dict[Any, str] = {
 def _patched_moe_grouped_matmul(self, *args, **kwargs):
     out = _ORIGINALS["moe_grouped_matmul"](self, *args, **kwargs)
     try:
-        b = _bind(args, kwargs, ("token", "weight", "first_token_offset", "token_index", "token_ks", "mode"))
+        b = _bind(
+            args,
+            kwargs,
+            (
+                "token",
+                "weight",
+                "first_token_offset",
+                "token_index",
+                "token_ks",
+                "mode",
+            ),
+        )
         name = b.get("name", "")
         mode = b.get("mode", cudnn.moe_grouped_matmul_mode.NONE)
         state = _ensure_state(self)
@@ -563,9 +508,8 @@ def _patched_reduction(self, *args, **kwargs):
         name = b.get("name", "")
         group_offset = b.get("group_offset")
         state = _ensure_state(self)
-        # Record every reduction (mode mapped to our literal, or None when GEMM
-        # doesn't support it). Unsupported modes are rejected later, in analyze()
-        # — never here, so a non-GEMM graph using an unsupported mode still builds.
+        # Record every reduction (mode → literal, or None if unsupported). Reject
+        # unsupported modes later in analyze() so a non-GEMM graph still builds.
         state["ops"].append(
             _RecordedOp(
                 "reduction",
@@ -591,7 +535,16 @@ def _make_unary_patch(cudnn_name: str):
             b = _bind(args, kwargs, ("input",))
             name = b.get("name", "")
             state = _ensure_state(self)
-            state["ops"].append(_RecordedOp(cudnn_name, name, [id(b["input"])], id(out), out, compute_dtype=_opt_compute_dtype(kwargs)))
+            state["ops"].append(
+                _RecordedOp(
+                    cudnn_name,
+                    name,
+                    [id(b["input"])],
+                    id(out),
+                    out,
+                    compute_dtype=_opt_compute_dtype(kwargs),
+                )
+            )
             state["tensor_meta"][id(out)] = _TensorMeta(name=f"{name}::OUT_0", dim=(), stride=(), dtype="fp32")
         except Exception:  # noqa: BLE001
             pass
@@ -607,7 +560,16 @@ def _make_binary_patch(cudnn_name: str, *, a_kw: str = "a", b_kw: str = "b"):
             bnd = _bind(args, kwargs, (a_kw, b_kw))
             name = bnd.get("name", "")
             state = _ensure_state(self)
-            state["ops"].append(_RecordedOp(cudnn_name, name, [id(bnd[a_kw]), id(bnd[b_kw])], id(out), out, compute_dtype=_opt_compute_dtype(kwargs)))
+            state["ops"].append(
+                _RecordedOp(
+                    cudnn_name,
+                    name,
+                    [id(bnd[a_kw]), id(bnd[b_kw])],
+                    id(out),
+                    out,
+                    compute_dtype=_opt_compute_dtype(kwargs),
+                )
+            )
             state["tensor_meta"][id(out)] = _TensorMeta(name=f"{name}::OUT_0", dim=(), stride=(), dtype="fp32")
         except Exception:  # noqa: BLE001
             pass
@@ -636,22 +598,17 @@ def _patched_tensor_set_reordering_type(self, rt):
     return _ORIGINALS["tensor.set_reordering_type"](self, rt)
 
 
-# ---------------------------------------------------------------------------
-# GEMM engine (named "TBD_eng0") — registered with the shared cudnn.TBD dispatch
-# (see cudnn/TBD/heuristics.py). ``probe_gemm_plan`` decides eligibility (no
-# compile); ``build_gemm_plan`` JIT-compiles when the engine is selected. The
-# engine selects its own config; forced-config callers use jit_from_cudnn_graph.
-# ---------------------------------------------------------------------------
+# GEMM engine ("TBD_eng0"), registered with the shared cudnn.TBD dispatch (see
+# cudnn/TBD/heuristics.py). probe_gemm_plan = eligibility (no compile);
+# build_gemm_plan = JIT when selected. Forced-config callers use jit_from_cudnn_graph.
 
 
 def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
-    """Cheap eligibility check for the ``TBD_eng0`` GEMM engine — analyze + the
-    support gates, NO ``cute.compile``. Returns True if the GEMM engine should be
-    listed in the plan list for this graph. Never raises (a probe must not break
-    the native path)."""
+    """Cheap eligibility check for the GEMM engine (analyze + support gates, NO
+    ``cute.compile``). Never raises (a probe must not break the native path)."""
     state = _get_state(graph)
     if state is None or not state.get("ops"):
-        return False  # graph wasn't recorded by the hook → not a GEMM candidate
+        return False  # not recorded by the hook → not a GEMM candidate
     from .compiler import probe_supported
 
     try:
@@ -659,7 +616,10 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
     except (NotImplementedError, ValueError):
         return False
     except Exception:  # noqa: BLE001
-        _LOG.debug("cudnn.TBD.gemm: probe_supported raised unexpectedly; ineligible", exc_info=True)
+        _LOG.debug(
+            "cudnn.TBD.gemm: probe_supported raised unexpectedly; ineligible",
+            exc_info=True,
+        )
         return False
     return True
 
@@ -667,10 +627,9 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
 def build_gemm_plan(graph: cudnn.pygraph):
     """Analyze + JIT the recorded graph into a compiled GEMM plan.
 
-    Returns a callable :class:`CompiledFusedGemm` on success; raises
-    ``NotImplementedError`` / ``ValueError`` (type + message preserved) when the
-    engine rejects the graph — same as calling ``jit_from_cudnn_graph`` directly.
-    Raises ``ValueError`` if the graph was never recorded (import-order error)."""
+    Returns a callable :class:`CompiledFusedGemm`; raises ``NotImplementedError`` /
+    ``ValueError`` (type + message preserved) on rejection, or ``ValueError`` if
+    the graph was never recorded (import-order error)."""
     state = _get_state(graph)
     if state is None or not state.get("ops"):
         raise ValueError(
@@ -680,8 +639,11 @@ def build_gemm_plan(graph: cudnn.pygraph):
             "reconstructed after the fact."
         )
     from .compiler import jit_from_cudnn_graph
+    from .tile_config import select_config
 
-    return jit_from_cudnn_graph(graph)
+    chain = analyze(graph)
+    config, cta_group, scheduler = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms)
+    return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group, scheduler=scheduler)
 
 
 def install_recorder() -> None:
@@ -726,8 +688,8 @@ def install_recorder() -> None:
         else:
             setattr(cudnn.pygraph, cudnn_name, _make_binary_patch(cudnn_name))
 
-    # Tensor-class patches: set_output / set_data_type have no getters in
-    # cudnn-frontend, so we wrap the setters and stash the flags in side-tables.
+    # set_output / set_data_type have no getters, so wrap the setters and stash
+    # the flags in side-tables.
     from cudnn import _compiled_module as _cudnn_module
 
     tensor_cls = _cudnn_module.tensor
@@ -743,9 +705,7 @@ def install_recorder() -> None:
     _INSTALLED = True
 
 
-# ---------------------------------------------------------------------------
 # Analyzer
-# ---------------------------------------------------------------------------
 
 
 def _infer_bcast_mode(matmul_out_dim: tuple[int, ...], aux_dim: tuple[int, ...]) -> str:
@@ -799,14 +759,11 @@ def _resolve_out_dtype(
     io_dtype: Dtype,
     intermediate_dtype: Dtype,
 ) -> Dtype:
-    """Declared data_type of a chain tensor, by cuDNN's rules:
-      1. explicit ``set_data_type(...)``  → that dtype
-      2. else, if it's a materialized output (``set_output(True)``) → io_dtype
-      3. else (pure virtual / intermediate) → intermediate_dtype
+    """Declared data_type of a chain tensor: explicit set_data_type, else io_dtype
+    if a materialized output, else intermediate_dtype.
 
-    The running value is rounded to this dtype before downstream ops read it,
-    so a narrow declared dtype loses precision on purpose (matches cuDNN even
-    for virtual tensors)."""
+    The running value is rounded to this dtype before downstream ops read it, so a
+    narrow declared dtype loses precision on purpose (matches cuDNN, even virtual)."""
     explicit = _TENSOR_EXPLICIT_DTYPE.get(out_id)
     if explicit is not None and explicit in _DTYPE_FROM_CUDNN:
         return _DTYPE_FROM_CUDNN[explicit]
@@ -830,16 +787,12 @@ def _build_moe_chain(
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
 ) -> FusionChain:
-    """Build a FusionChain for a MoE grouped matmul forward pass.
+    """Build a FusionChain for one MoE grouped matmul forward pass.
 
-    ``out[first_token_offset[g] : first_token_offset[g+1]] =
-        token[range] @ weight[g % E].T`` per routed group g.
-
-    POC scope: one ``moe_grouped_matmul`` per graph, ``mode == "none"`` only,
-    with an optional terminal ``block_scale_quantize`` epilogue. token = A
-    ``(1, M=T, K=H)``, weight = B ``(E, K=H, N)``; the per-expert selection is
-    carried in :class:`MoeSpec` (num_experts), NOT via the MatmulSpec batch
-    machinery (output is a single ``(1, T, N)`` plane)."""
+    ``out[fto[g]:fto[g+1]] = token[range] @ weight[g % E].T`` per routed group g.
+    POC scope: one moe op, mode=="none", optional terminal block_scale_quantize.
+    token = A (1,M=T,K=H), weight = B (E,K=H,N); per-expert selection is in
+    :class:`MoeSpec`, NOT the MatmulSpec batch (output is a single (1,T,N) plane)."""
     from .fusion_ir import MoeSpec
 
     if len(moe_ops) != 1 or len([o for o in ops if o.cudnn_name == "matmul"]):
@@ -849,19 +802,14 @@ def _build_moe_chain(
         raise NotImplementedError(f"MoE grouped matmul mode {moe.moe_mode!r} is out of POC scope; " "only mode=NONE is supported (gather / scatter rejected)")
     token_id, weight_id, fto_id = moe.inputs
     fto_meta = meta.get(fto_id)
-    # first_token_offset dtype (int32 / int64) — both are valid cuDNN inputs;
-    # baked into the kernel. Default int32 if the tensor wasn't a graph input.
+    # first_token_offset dtype (int32/int64 both valid; baked in). Default int32.
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
     num_groups = int(fto_meta.dim[0]) if fto_meta is not None and fto_meta.dim else 1
 
-    # ----- Block-scaled MoE detection (structural pattern-match) -------------
-    # If the moe op's token / weight come from block_scale_dequantize nodes, fold
-    # the dequant(s) + moe into one block-scale MoE matmul: redirect token/weight
-    # to the packed (FP4 / FP8) data tensors and capture their SFA/SFB. Mirrors
-    # the plain-matmul block-scale detection in _build_chain; NO validation here
-    # (the compiler decides which combos run). The dims/major come from the
-    # dequant-output meta (which inherits the packed input's dim/stride); the MMA
-    # input dtype is the packed data dtype (captured below).
+    # Block-scaled MoE detection (structural): if token/weight come from
+    # block_scale_dequantize nodes, fold dequant(s) + moe into one block-scale
+    # matmul (redirect to packed data tensors, capture SFA/SFB). NO validation
+    # here (the compiler decides which combos run); mirrors _build_chain.
     from .fusion_ir import BlockScaleSpec
 
     dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
@@ -873,7 +821,14 @@ def _build_moe_chain(
         def _capture_side(operand_id: int):
             deq = dequant_by_output.get(operand_id)
             if deq is None:
-                return dict(data_dtype=meta[operand_id].dtype, block_size_2d=None, sf_dtype=None, sf_reorder=None, deq_compute=None, deq_out=None)
+                return dict(
+                    data_dtype=meta[operand_id].dtype,
+                    block_size_2d=None,
+                    sf_dtype=None,
+                    sf_reorder=None,
+                    deq_compute=None,
+                    deq_out=None,
+                )
             data_id, sf_id = deq.inputs
             sf_meta = meta[sf_id]
             deq_compute = deq.compute_dtype if deq.compute_dtype is not None else compute_dtype
@@ -909,7 +864,7 @@ def _build_moe_chain(
     weight_meta = meta[weight_id]
     if len(token_meta.dim) != 3 or len(weight_meta.dim) != 3:
         raise ValueError(f"moe operands must be 3D; got token={token_meta.dim} " f"weight={weight_meta.dim}")
-    # token [1, T, H] → A=(1, M=T, K=H). weight [E, H, N] → B=(E, K=H, N).
+    # token [1,T,H] → A=(1,M=T,K=H). weight [E,H,N] → B=(E,K=H,N).
     _bt, M, Ka = token_meta.dim
     E, Kb, N = weight_meta.dim
     if Ka != Kb:
@@ -936,7 +891,6 @@ def _build_moe_chain(
 
     mm_compute = moe.compute_dtype if moe.compute_dtype is not None else compute_dtype
     matmul_out_dtype = _resolve_out_dtype(moe.output, moe.output_tensor, io_dtype, intermediate_dtype)
-    # b_major over the inner (K, N) plane of the weight tensor.
     matmul_spec = MatmulSpec(
         M=int(M),
         N=int(N),
@@ -1069,10 +1023,9 @@ def _build_moe_chain(
         reductions=reductions,
         block_quant=block_quant,
     )
-    # Binding: token/weight resolve through any block_scale_dequantize to the
-    # packed data tensors (the user passes the packed token/weight); the SF is
-    # the dequant's 2nd input. The terminal output is either the raw MoE output
-    # or the quantized tensor, with the quant scale as a side output.
+    # Binding: token/weight resolve through any dequant to the packed data tensors
+    # (SF = dequant's 2nd input); terminal = raw MoE output or the quantized tensor
+    # (with the quant scale as a side output).
     deq_tok = dequant_by_output.get(token_id)
     deq_w = dequant_by_output.get(weight_id)
     a_data_id = deq_tok.inputs[0] if deq_tok else token_id
@@ -1082,8 +1035,8 @@ def _build_moe_chain(
         b_operands=[meta[b_data_id].tensor],
         outputs=([terminal_tensor] + reduction_objs + ([quant_scale_obj] if quant_scale_obj is not None else [])),
         first_token_offset=meta[fto_id].tensor,
-        sfa_operands=([meta[deq_tok.inputs[1]].tensor] if deq_tok else [None]) if block_scale_spec is not None else [],
-        sfb_operands=([meta[deq_w.inputs[1]].tensor] if deq_w else [None]) if block_scale_spec is not None else [],
+        sfa_operands=(([meta[deq_tok.inputs[1]].tensor] if deq_tok else [None]) if block_scale_spec is not None else []),
+        sfb_operands=(([meta[deq_w.inputs[1]].tensor] if deq_w else [None]) if block_scale_spec is not None else []),
     )
     return chain, binding
 
@@ -1097,19 +1050,12 @@ def _build_multi_moe_chain(
     compute_dtype: Dtype,
 ) -> FusionChain:
     """Build a FusionChain for K parallel MoE grouped matmuls sharing one
-    ``first_token_offset`` and one pointwise epilogue DAG (e.g. grouped SwiGLU
-    ``silu(tok @ w0) * (tok @ w1) * scale``).
+    ``first_token_offset`` and one pointwise epilogue DAG (e.g. grouped SwiGLU).
 
-    Each ``moe_grouped_matmul`` op is a GEMM; they must share the routed-group
-    layout (same ``first_token_offset``), the same shape / major / dtype, and
-    the same expert count. Token / weight operands are deduped by tensor id, so
-    a shared token collapses to one distinct A operand. The MoE specifics (the
-    per-expert weight selection + group ranges) live in :class:`MoeSpec`; the
-    matmul output is a single ``(1, S, N)`` plane. POC scope: ``mode == "none"``,
-    no mainloop fusion; the terminal must be a fusion op. Block-scale is supported
-    (a ``block_scale_dequantize`` feeding the moe token / weight folds into a
-    shared :class:`BlockScaleSpec`; a shared dequant collapses to one distinct
-    operand, exactly like the plain-matmul multi-GEMM case)."""
+    All GEMMs must share the routed-group layout (same fto), shape / major / dtype,
+    and expert count. Operands deduped by tensor id (shared token → one A operand).
+    POC scope: mode=="none", no mainloop fusion, terminal must be a fusion op.
+    Block-scale supported (dequant folds into a shared :class:`BlockScaleSpec`)."""
     from .fusion_ir import BlockScaleSpec, MoeSpec
 
     for moe in moe_ops:
@@ -1118,8 +1064,7 @@ def _build_multi_moe_chain(
                 f"MoE grouped matmul mode {moe.moe_mode!r} is out of POC scope; " "only mode=NONE is supported (gather / scatter rejected)"
             )
 
-    # All GEMMs must share the SAME first_token_offset (so they have identical
-    # routed-group layout → identical output shape per group).
+    # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
     fto_id = moe_ops[0].inputs[2]
     for moe in moe_ops[1:]:
         if moe.inputs[2] != fto_id:
@@ -1128,9 +1073,8 @@ def _build_multi_moe_chain(
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
     num_groups = int(fto_meta.dim[0]) if fto_meta is not None and fto_meta.dim else 1
 
-    # ----- Resolve each moe operand through any block_scale_dequantize, then
-    # dedup by the PACKED data tensor id (shared dequant → one distinct operand,
-    # the SF travels with its data). Mirrors _build_multi_gemm_chain.
+    # Resolve each moe operand through any dequant, then dedup by PACKED data
+    # tensor id (shared dequant → one distinct operand; SF travels with its data).
     dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
 
     def _capture_side(operand_id: int) -> dict:
@@ -1207,14 +1151,21 @@ def _build_multi_moe_chain(
     M, N, K, E, a_major, b_major, a_dtype, b_dtype = geom0
     matmul_out_dim = (1, M, N)
 
-    # ----- Shared BlockScaleSpec (every distinct operand same combo) --------
+    # Shared BlockScaleSpec (every distinct operand must match GEMM 0's combo).
     block_scale_spec = None
     if is_block_scale:
         a0 = a_caps[a_ids[gemm_operands[0][0]]]
         b0 = b_caps[b_ids[gemm_operands[0][1]]]
 
         def _combo_key(cap):
-            return (cap["data_dtype"], cap["block_size_2d"], cap["sf_dtype"], cap["sf_reorder"], cap["deq_compute"], cap["deq_out"])
+            return (
+                cap["data_dtype"],
+                cap["block_size_2d"],
+                cap["sf_dtype"],
+                cap["sf_reorder"],
+                cap["deq_compute"],
+                cap["deq_out"],
+            )
 
         for cap in a_caps.values():
             if _combo_key(cap) != _combo_key(a0):
@@ -1238,7 +1189,7 @@ def _build_multi_moe_chain(
         )
     mm_compute = moe_ops[0].compute_dtype if moe_ops[0].compute_dtype is not None else compute_dtype
 
-    # ----- Epilogue DAG over MULTIPLE roots (each MoE GEMM output) ----------
+    # Epilogue DAG over multiple roots (each MoE GEMM output).
     gemm_idx_by_output: dict[int, int] = {mm.output: g for g, mm in enumerate(moe_ops)}
     consumers_by_input: dict[int, list[_RecordedOp]] = {}
     for op in ops:
@@ -1499,25 +1450,20 @@ def _build_multi_gemm_chain(
 ) -> FusionChain:
     """Build a FusionChain for K parallel GEMMs sharing one pointwise epilogue.
 
-    Each ``matmul`` op is a GEMM; they must share shape / layout / dtype but may
-    use shared or distinct A / B operands (deduped by tensor id). Their outputs
-    are the DAG roots; a pointwise op references the GEMM output it reads via a
-    negative ``parent_idx`` (``gemm_source(g)``). Block-scale is supported: a
-    matmul operand produced by ``block_scale_dequantize`` folds into the packed
-    data tensor (the SF travels with it), and a dequant shared by several
-    matmuls collapses to ONE distinct operand. POC scope: no mainloop fusion, no
-    per-GEMM matmul taps; the terminal must be a fusion op (the fused output)."""
+    All GEMMs share shape / layout / dtype but may use shared or distinct A / B
+    operands (deduped by tensor id). GEMM outputs are the DAG roots; an op refs a
+    GEMM output via a negative ``parent_idx`` (``gemm_source(g)``). Block-scale
+    supported (dequant folds into the packed tensor; shared dequant → one operand).
+    POC scope: no mainloop fusion, no per-GEMM taps, terminal must be a fusion op."""
     from .fusion_ir import BlockScaleSpec
 
-    # ----- Resolve each matmul operand through any block_scale_dequantize, then
-    # dedup by the PACKED data tensor id (a shared dequant → same packed id →
-    # one distinct operand). This matches the runtime dedup (by packed-data
-    # identity) and the shared-dequant wrinkle (one dequant feeds many matmuls).
+    # Resolve each matmul operand through any dequant, then dedup by PACKED data
+    # tensor id (shared dequant → one distinct operand), matching the runtime dedup.
     dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
 
     def _capture_side(operand_id: int) -> dict:
-        """For a (possibly dequantized) matmul operand, return its packed data
-        id + block-scale fields (all None for a non-dequantized side)."""
+        """Packed data id + block-scale fields for a matmul operand (all None for
+        a non-dequantized side)."""
         deq = dequant_by_output.get(operand_id)
         if deq is None:
             return dict(
@@ -1564,7 +1510,7 @@ def _build_multi_gemm_chain(
 
     is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
 
-    # ----- Validate every GEMM shares shape / layout / dtype ----------------
+    # Validate every GEMM shares shape / layout / dtype.
     def _gemm_geometry(a_pid: int, b_pid: int):
         A_meta = meta[a_pid]
         B_meta = meta[b_pid]
@@ -1594,16 +1540,21 @@ def _build_multi_gemm_chain(
             raise ValueError("parallel GEMMs must share shape / layout / dtype; multi-GEMM " "with heterogeneous GEMMs is out of POC scope")
     M, N, K, batch, Ba, Bb, a_major, b_major, a_dtype, b_dtype = geom0
 
-    # ----- Shared BlockScaleSpec (all GEMMs same combo) --------------------
+    # Shared BlockScaleSpec (every distinct operand must match GEMM 0's combo).
     block_scale_spec = None
     if is_block_scale:
         a0 = a_caps[a_ids[gemm_operands[0][0]]]
         b0 = b_caps[b_ids[gemm_operands[0][1]]]
 
-        # Every distinct A operand (resp. B) must share the same block-scale
-        # combo as GEMM 0's — a single shared BlockScaleSpec describes them all.
         def _combo_key(cap):
-            return (cap["data_dtype"], cap["block_size_2d"], cap["sf_dtype"], cap["sf_reorder"], cap["deq_compute"], cap["deq_out"])
+            return (
+                cap["data_dtype"],
+                cap["block_size_2d"],
+                cap["sf_dtype"],
+                cap["sf_reorder"],
+                cap["deq_compute"],
+                cap["deq_out"],
+            )
 
         for cap in a_caps.values():
             if _combo_key(cap) != _combo_key(a0):
@@ -1628,7 +1579,7 @@ def _build_multi_gemm_chain(
     mm_compute = matmuls[0].compute_dtype if matmuls[0].compute_dtype is not None else compute_dtype
     matmul_out_dim = (batch, M, N)
 
-    # ----- Epilogue DAG over MULTIPLE roots (each GEMM output) --------------
+    # Epilogue DAG over multiple roots (each GEMM output).
     gemm_idx_by_output: dict[int, int] = {mm.output: g for g, mm in enumerate(matmuls)}
     consumers_by_input: dict[int, list[_RecordedOp]] = {}
     for op in ops:
@@ -1678,8 +1629,8 @@ def _build_multi_gemm_chain(
     op_position_by_id: dict[int, int] = {}
 
     def _operand_ref(tid: int) -> int:
-        """Resolve an in-chain operand id to a producing-operation reference:
-        ``gemm_source(g)`` (< 0) for a GEMM output, else the prior op's index."""
+        """In-chain operand id → producing-op ref: ``gemm_source(g)`` (<0) for a
+        GEMM output, else the prior op's index."""
         if tid in gemm_idx_by_output:
             return gemm_source(gemm_idx_by_output[tid])
         return op_position_by_id[tid]
@@ -1734,11 +1685,8 @@ def _build_multi_gemm_chain(
         pending_ops.append((fop, next_op.output))
         op_position_by_id[next_op.output] = len(pending_ops) - 1
 
-    # No fusion epilogue: every GEMM output is materialized directly to its own
-    # GMEM buffer (K parallel matmuls, same shape, no shared epilogue — e.g. the
-    # DualBlockScaleMatmul benchmark). Each GEMM output must set_output(True);
-    # GEMM 0 = terminal (slot 0), GEMMs >0 = taps (slots 1..). Cheaper than the
-    # fused case (just cast+store per GEMM, no pointwise compute).
+    # No fusion epilogue: each GEMM output materializes directly to its own GMEM
+    # buffer. Each must set_output(True); GEMM 0 = terminal (slot 0), GEMMs >0 = taps.
     if not pending_ops:
         per_gemm_dtypes: list[Dtype] = []
         for mm in matmuls:
@@ -1771,8 +1719,7 @@ def _build_multi_gemm_chain(
             per_gemm_outputs=per_gemm_dtypes,
             block_scale=block_scale_spec,
         )
-        # No-epilogue multi-GEMM outputs = each GEMM's own buffer (slot 0 =
-        # GEMM 0, then gemm_<g>), matching chain.outputs.
+        # No-epilogue outputs = each GEMM's own buffer (slot 0 = GEMM 0).
         binding = _make_multi_binding(
             meta,
             a_ids,
@@ -1875,10 +1822,8 @@ def _build_multi_gemm_chain(
         )
         reduction_objs.append(red.output_tensor)
 
-    # GEMM output declared dtype (virtual fp32 in the canonical case) — the
-    # epilogue rounds each accumulator to it before the op chain, matching
-    # cuDNN's per-tensor semantics. All GEMMs share it (same-layout invariant);
-    # resolve from GEMM 0's output tensor.
+    # GEMM output declared dtype — the epilogue rounds each accumulator to it
+    # before the op chain. All GEMMs share it; resolve from GEMM 0.
     matmul_out_dtype = _resolve_out_dtype(matmuls[0].output, matmuls[0].output_tensor, io_dtype, intermediate_dtype)
 
     _mg_term = recorded_by_out[terminal_id].output_tensor
@@ -1913,8 +1858,7 @@ def _build_multi_gemm_chain(
         block_scale=block_scale_spec,
         reductions=reductions,
     )
-    # Outputs in chain.outputs slot order: terminal, op taps (chain order),
-    # reductions. (Multi-GEMM has no matmul tap.)
+    # Outputs in slot order: terminal, op taps (chain order), reductions (no matmul tap).
     output_objs: list[Any] = [recorded_by_out[terminal_id].output_tensor]
     for i, fop in enumerate(fusion_ops):
         if fop.output_tap:
@@ -1940,12 +1884,10 @@ def _build_chain(
     intermediate_dtype: Dtype = "fp32",
     compute_dtype: Dtype = "fp32",
 ) -> FusionChain:
-    # ----- MoE grouped matmul (own graph type) ------------------------------
+    # MoE grouped matmul (own graph type).
     moe_ops = [op for op in ops if op.cudnn_name == "moe_grouped_matmul"]
     if len(moe_ops) > 1:
-        # K parallel MoE grouped matmuls sharing one first_token_offset + one
-        # pointwise epilogue (e.g. grouped SwiGLU). Same multi-GEMM machinery as
-        # the plain-matmul case, with MoE geometry + a shared MoeSpec.
+        # K parallel MoE grouped matmuls sharing one fto + one epilogue.
         return _build_multi_moe_chain(moe_ops, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
     if moe_ops:
         return _build_moe_chain(moe_ops, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
@@ -1954,24 +1896,18 @@ def _build_chain(
     if len(matmuls) == 0:
         raise ValueError("POC scope is >=1 matmul per graph; found 0")
     if len(matmuls) > 1:
-        # Parallel GEMMs sharing one epilogue (multi-GEMM). Block-scale is
-        # handled inside the builder (a shared dequant folds into one distinct
-        # operand). Mainloop fusion alongside multiple matmuls is out of scope —
-        # the builder only walks the epilogue DAG, so a pre-MMA pointwise op
-        # would surface as a non-graph-input operand and raise there.
+        # Parallel GEMMs sharing one epilogue (multi-GEMM). Block-scale handled in
+        # the builder; mainloop fusion alongside multiple matmuls is out of scope
+        # (the builder walks only the epilogue DAG → a pre-MMA op raises there).
         return _build_multi_gemm_chain(matmuls, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
     mm = matmuls[0]
     A_id, B_id = mm.inputs
 
-    # ----- Block-scaled matmul detection (structural pattern-match) ---------
-    # If the matmul's A and/or B operand is produced by a
+    # Block-scaled matmul detection (structural): if A and/or B is produced by a
     # block_scale_dequantize node, fold the dequant(s) + matmul into one
-    # block-scale matmul. Three shapes match: dequant(A) @ B, A @ dequant(B),
-    # dequant(A) @ dequant(B). This is purely STRUCTURAL — we apply NO dtype /
-    # block-size / arch rules here; which combinations are actually runnable
-    # (today: both sides dequantized, valid family) is decided at compile time.
-    # For each dequantized side, the matmul operand is redirected to the packed
-    # (FP4 / FP8) data tensor and its scale factor is captured.
+    # block-scale matmul (dequant(A)@B, A@dequant(B), or both). Purely STRUCTURAL
+    # — NO dtype/block-size/arch rules here; runnability is decided at compile
+    # time. Each dequantized operand is redirected to its packed data tensor + SF.
     from .fusion_ir import BlockScaleSpec
 
     dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
@@ -1981,16 +1917,20 @@ def _build_chain(
     if A_id in dequant_by_output or B_id in dequant_by_output:
 
         def _capture_side(operand_id: int):
-            """For a (possibly) dequantized operand, return a dict of structural
-            block-scale fields (all None for a non-dequantized side, plus
-            ``data_id``/``data_dtype`` of the plain operand). No validation.
-
-            ``deq_compute`` = the dequant op's math precision; ``deq_out`` = the
-            dequant output dtype (the MMA's logical input type for this side)."""
+            """Structural block-scale fields for a (possibly) dequantized operand
+            (all None for a non-dequantized side). No validation. ``deq_compute`` =
+            dequant math precision; ``deq_out`` = dequant output dtype (the MMA's
+            logical input type for this side)."""
             deq = dequant_by_output.get(operand_id)
             if deq is None:
                 return dict(
-                    data_id=operand_id, data_dtype=meta[operand_id].dtype, block_size_2d=None, sf_dtype=None, sf_reorder=None, deq_compute=None, deq_out=None
+                    data_id=operand_id,
+                    data_dtype=meta[operand_id].dtype,
+                    block_size_2d=None,
+                    sf_dtype=None,
+                    sf_reorder=None,
+                    deq_compute=None,
+                    deq_out=None,
                 )
             data_id, sf_id = deq.inputs
             sf_meta = meta[sf_id]
@@ -2024,8 +1964,7 @@ def _build_chain(
             dequant_out_b=b["deq_out"],
         )
         a_data_id, b_data_id = a["data_id"], b["data_id"]
-        # Capture the SF tensor objects (2nd input of each dequant) for binding,
-        # while A_id/B_id still hold the dequant-output ids.
+        # Capture the SF tensors (2nd dequant input) before redirecting A_id/B_id.
         deq_a = dequant_by_output.get(A_id)
         deq_b = dequant_by_output.get(B_id)
         sfa_obj = meta[deq_a.inputs[1]].tensor if deq_a else None
@@ -2033,19 +1972,15 @@ def _build_chain(
         # Redirect each scaled operand to its packed data tensor.
         A_id, B_id = a_data_id, b_data_id
 
-    # ----- Mainloop fusion detection (Phase 6) -----------------------------
-    # Walk backwards from the matmul's A input through any chain of unary
-    # pointwise ops whose ultimate source is a graph-input tensor. Each such
-    # op runs on the dedicated mainloop-fusion warps: it reads the freshly
-    # TMA'd A tile out of SMEM, transforms it in registers (fp32 compute), and
-    # writes it back in place before the MMA consumes it. ``A' = op(A)`` then
-    # ``C = A' @ B``. POC scope: a linear chain of unary ops on A only.
+    # Mainloop fusion detection: walk backwards from A/B through a chain of unary
+    # pointwise ops rooted at a graph input. Each op runs on the mainloop-fusion
+    # warps (transforms the SMEM tile in place before the MMA). POC scope: a
+    # linear chain of unary ops on A/B only.
     op_by_output = {op.output: op for op in ops if op.cudnn_name != "matmul"}
 
-    # Aux tensors (shared across mainloop + epilogue). Defined here so the
-    # mainloop walk can register its scalar auxes; the epilogue DAG walk below
-    # keeps appending. Runtime aux order = this list's order. aux_objs holds the
-    # parallel cuDNN tensor objects for the variant-pack binding.
+    # Aux tensors shared across mainloop + epilogue, defined here so the mainloop
+    # walk can register its scalar auxes (the epilogue walk keeps appending).
+    # Runtime aux order = this list's order; aux_objs = parallel cuDNN tensors.
     aux_tensors: list[TensorRef] = []
     aux_objs: list[Any] = []
     aux_seen: set[int] = set()
@@ -2055,11 +1990,10 @@ def _build_chain(
         return m is not None and m.is_input and len(m.dim) > 0 and all(d == 1 for d in m.dim)
 
     def _walk_mainloop(operand_id: int, label: str) -> tuple[int, list[FusionOp]]:
-        """Walk backwards from a matmul operand through a chain of pointwise ops
-        (unary, or binary with a single SCALAR graph-input aux) to the root
-        graph input. Returns (root_tensor_id, mainloop_ops) in
-        graph-input -> ... -> operand' order. Registers scalar auxes in the
-        shared aux_tensors list."""
+        """Walk backwards from a matmul operand through pointwise ops (unary, or
+        binary with one SCALAR graph-input aux) to the root graph input. Returns
+        (root_tensor_id, mainloop_ops) in graph-input -> operand' order; registers
+        scalar auxes in aux_tensors."""
         # Each entry: (cudnn_name, is_binary, aux_name_or_None, aux_on_rhs).
         steps: list[tuple] = []
         cur = operand_id
@@ -2109,15 +2043,21 @@ def _build_chain(
         for idx, (cudnn_name, is_binary, aux_name, aux_on_rhs) in enumerate(steps):
             parent = idx - 1 if idx > 0 else -1
             if is_binary:
-                fops.append(FusionOp(op=_BINARY_OP_MAP[cudnn_name], aux=aux_name, aux_on_rhs=aux_on_rhs, parent_idx=parent))
+                fops.append(
+                    FusionOp(
+                        op=_BINARY_OP_MAP[cudnn_name],
+                        aux=aux_name,
+                        aux_on_rhs=aux_on_rhs,
+                        parent_idx=parent,
+                    )
+                )
             else:
                 fops.append(FusionOp(op=_UNARY_OP_MAP[cudnn_name], parent_idx=parent))
         return cur, fops
 
     if block_scale_spec is not None:
-        # Block-scaled matmul: operands are the packed FP4/FP8 graph inputs;
-        # the dequant happens inside the MMA, so there is no mainloop fusion
-        # and no dtype-cast staging.
+        # Block-scaled matmul: dequant happens inside the MMA, so no mainloop
+        # fusion and no dtype-cast staging.
         root_A_id, mainloop_a_ops = A_id, []
         root_B_id, mainloop_b_ops = B_id, []
     else:
@@ -2126,35 +2066,18 @@ def _build_chain(
     A_meta = meta[root_A_id]
     B_meta = meta[root_B_id]
 
-    # MMA dtype vs LOAD dtype. The MMA reads the operand at:
-    #   * the EXPLICIT ``set_data_type`` on the tensor feeding the matmul, if the
-    #     user declared one (e.g. `after_pw0 = identity(A_int8)` with
-    #     `set_data_type(bf16)` — the mixed-input case); else
-    #   * the root graph input's dtype (the ordinary dtype-preserving mainloop,
-    #     where the transform rounds back to the root dtype and stores in place,
-    #     and the intermediate's *implicit* fp32 compute dtype is NOT the storage
-    #     dtype — so abs(bf16)@B stays bf16, not fp32).
-    # The LOAD dtype is always the root graph input's dtype. They differ only for
-    # a mixed-input mainloop (int8 load -> bf16 MMA); then `mainloop_*_load_dtype`
-    # records the narrow load dtype and the mainloop warps stage the widen. The
-    # walk preserves layout, so A_meta still drives dim/stride/major.
-    def _mma_operand_dtype(operand_id: int, root_meta: _TensorMeta) -> Dtype:
-        explicit = _TENSOR_EXPLICIT_DTYPE.get(operand_id)
-        if explicit is not None and explicit in _DTYPE_FROM_CUDNN:
-            return _DTYPE_FROM_CUDNN[explicit]
-        return root_meta.dtype
+    def _mma_operand_dtype(operand_id: int) -> Dtype:
+        om = meta.get(operand_id)
+        return _resolve_out_dtype(operand_id, om.tensor if om else None, io_dtype, intermediate_dtype)
 
-    mma_a_dtype = _mma_operand_dtype(A_id, A_meta)
-    mma_b_dtype = _mma_operand_dtype(B_id, B_meta)
+    mma_a_dtype = _mma_operand_dtype(A_id)
+    mma_b_dtype = _mma_operand_dtype(B_id)
     mainloop_a_load_dtype = A_meta.dtype if A_meta.dtype != mma_a_dtype else None
     mainloop_b_load_dtype = B_meta.dtype if B_meta.dtype != mma_b_dtype else None
 
-    # The matmul's compute dtype IS the accumulator dtype — faithfully recorded
-    # from the cuDNN graph's compute_data_type (graph default or per-op
-    # override). Whether the (a, b, accum) combo is actually runnable on the
-    # target arch is validated by the compiler (`_check_supported`), not here —
-    # the IR/analyzer have no arch info. (Pointwise-op compute dtypes are still
-    # checked at FusionOp construction.)
+    # The matmul's compute dtype IS the accumulator dtype, recorded faithfully.
+    # Runnability of the (a,b,accum) combo is validated by the compiler
+    # (_check_supported), not here (the IR has no arch info).
     mm_compute = mm.compute_dtype if mm.compute_dtype is not None else compute_dtype
 
     if len(A_meta.dim) != 3 or len(B_meta.dim) != 3:
@@ -2187,14 +2110,9 @@ def _build_chain(
 
     matmul_out_dim = (batch, M, N)
 
-    # (aux_tensors / aux_seen were defined above so the mainloop walk could
-    # register its scalar auxes; the epilogue DAG walk keeps appending here.)
-    # DAG walk from matmul output. Two passes:
-    #   1. BFS to find every op reachable from `mm.output`.
-    #   2. Kahn topological sort — emit each op only after all its in-chain
-    #      inputs are placed. This naturally handles both fan-out (one
-    #      tensor consumed by several ops) and fan-in (a binary op whose two
-    #      inputs are both prior op results).
+    # DAG walk from matmul output: (1) BFS for every reachable op, (2) Kahn topo
+    # sort (emit each op only after its in-chain inputs) — handles both fan-out
+    # and fan-in.
     consumers_by_input: dict[int, list[_RecordedOp]] = {}
     for op in ops:
         for inp in op.inputs:
@@ -2216,8 +2134,8 @@ def _build_chain(
     reachable_ops = [op for op in ops if (op.output in reachable_op_ids and op.cudnn_name not in ("reduction", "block_scale_quantize"))]
     reachable_quant_ops = [op for op in ops if op.cudnn_name == "block_scale_quantize" and op.output in reachable_op_ids]
 
-    # For each reachable op, identify its in-chain dependencies (= inputs
-    # that are either the matmul output or another reachable op's output).
+    # In-chain deps of each reachable op = inputs that are the matmul output or
+    # another reachable op's output.
     in_chain_deps: dict[int, list[int]] = {}
     for op in reachable_ops:
         deps = [inp for inp in op.inputs if inp == mm.output or inp in reachable_op_ids]
@@ -2298,11 +2216,8 @@ def _build_chain(
         pending_ops.append((fop, next_op.output))
         op_position_by_id[next_op.output] = len(pending_ops) - 1
 
-    # Identify the terminal op (whose dtype lives in `chain.output_dtype` and
-    # whose result is `vec_out` at the trailing store). Rule: the *last*
-    # tensor with `set_output(True)` in recorder discovery order — that
-    # matches the existing single-output and Phase-1/2 conventions where the
-    # caller marks `Y.set_output(True)` last.
+    # Terminal op = the LAST tensor with set_output(True) in recorder order (its
+    # dtype is chain.output_dtype, its result is vec_out at the trailing store).
     set_output_ids_in_order = [tid for tid in _TENSOR_OUTPUT_FLAG.keys() if _TENSOR_OUTPUT_FLAG[tid]]
     terminal_id: int | None = None
     terminal_quant: _RecordedOp | None = None
@@ -2328,8 +2243,7 @@ def _build_chain(
             terminal_id = tid
             break
     if terminal_id is None:
-        # No fusion-op output was marked set_output → the matmul itself is
-        # the terminal (single-output matmul case).
+        # No fusion-op output marked set_output → the matmul is the terminal.
         terminal_id = mm.output
 
     from dataclasses import replace as _replace
@@ -2339,16 +2253,16 @@ def _build_chain(
     fusion_ops: list[FusionOp] = []
     for fop, out_id in pending_ops:
         recorded = recorded_by_out[out_id]
-        # Per-op compute precision: graph default unless overridden by the op.
-        # FusionOp.__post_init__ validates the supported pointwise compute dtypes.
+        # Per-op compute precision: graph default unless overridden (validated in
+        # FusionOp.__post_init__).
         op_compute = recorded.compute_dtype if recorded.compute_dtype is not None else compute_dtype
         if out_id == terminal_id or (terminal_quant is not None and terminal_source_ref == op_position_by_id[out_id]):
-            # The terminal's declared dtype is the chain's output_dtype, applied
-            # by the trailing `vec_out` cast — so no mid-chain rounding here.
+            # Terminal dtype = output_dtype, applied by the trailing vec_out cast
+            # — no mid-chain rounding here.
             fusion_ops.append(_replace(fop, compute_dtype=op_compute))
         else:
-            # Req 2 & 3: round this op's result to its declared output dtype
-            # (even for pure-virtual tensors) before the next op reads it.
+            # Round this op's result to its declared out dtype (even virtual)
+            # before the next op reads it.
             op_out_dtype = _resolve_out_dtype(out_id, recorded.output_tensor, io_dtype, intermediate_dtype)
             fusion_ops.append(
                 _replace(
@@ -2359,12 +2273,11 @@ def _build_chain(
                 )
             )
 
-    # Matmul-output tap: materialize a second GMEM output (the accumulator at
-    # out_dtype) when C.set_output(True) and the matmul isn't also the terminal.
+    # Matmul-output tap: materialize the accumulator as a second GMEM output when
+    # C.set_output(True) and the matmul isn't the terminal.
     matmul_output_tap = mm.output != terminal_id and _TENSOR_OUTPUT_FLAG.get(mm.output, False)
-    # out_dtype = C's declared data_type (virtual or materialized). The epilogue
-    # rounds the fp32 accumulator to it before any fusion op / output — honoring
-    # the cuDNN graph's per-tensor dtype, like every other op.
+    # out_dtype = C's declared dtype; the epilogue rounds the fp32 accumulator to
+    # it before any fusion op / output.
     matmul_out_dtype = _resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype)
 
     if terminal_quant is not None:
@@ -2387,9 +2300,8 @@ def _build_chain(
         out_major=out_major,
     )
 
-    # The final tensor's explicit set_data_type (if any) overrides io_dtype —
-    # this is the canonical cuDNN pattern for FP8-in / FP16-out matmul where
-    # the user does `Y.set_data_type(cudnn.data_type.HALF)` to downcast.
+    # The final tensor's explicit set_data_type (if any) overrides io_dtype
+    # (canonical FP8-in / FP16-out downcast pattern).
     output_dtype: Dtype = io_dtype
     if terminal_quant is not None:
         explicit = terminal_quant.output_tensor.get_data_type()
@@ -2403,10 +2315,9 @@ def _build_chain(
                     output_dtype = _DTYPE_FROM_CUDNN[explicit]
                 break
 
-    # Resolve which position in `fusion_ops` is the terminal. For linear
-    # chains this is always the last op (FusionChain's default sentinel
-    # already handles that case); for fan-out DAGs the analyzer must set
-    # it explicitly because the terminal may not be the last in BFS order.
+    # Which position in fusion_ops is the terminal. Linear chains default to the
+    # last op (FusionChain sentinel); fan-out DAGs must set it explicitly since
+    # the terminal may not be last in BFS order.
     terminal_op_idx_explicit = -2  # auto
     if terminal_quant is not None:
         assert terminal_source_ref is not None
@@ -2535,9 +2446,8 @@ def _build_chain(
         block_quant=block_quant,
     )
 
-    # ----- Variant-pack binding (role -> cuDNN tensor), single-GEMM ----------
-    # Output objects in chain.outputs slot order: terminal, matmul tap, op taps
-    # (chain order), then reduction side-outputs.
+    # Variant-pack binding (role -> cuDNN tensor), single-GEMM. Output objects in
+    # slot order: terminal, matmul tap, op taps (chain order), reductions.
     if terminal_quant is not None:
         terminal_obj = terminal_quant.output_tensor
     else:
@@ -2568,9 +2478,7 @@ def analyze_with_binding(
     graph: cudnn.pygraph,
 ) -> "tuple[FusionChain, GemmBinding | None]":
     """Build the FusionChain AND a variant-pack binding (role -> cuDNN tensor).
-
-    The binding is ``None`` for chain types whose binding is not yet wired up;
-    callers that need it should check. See :class:`GemmBinding`."""
+    See :class:`GemmBinding`."""
     state = _get_state(graph)
     if state is None:
         raise ValueError(
