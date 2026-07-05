@@ -33,6 +33,7 @@ docker image build --no-cache -t gitlab-master.nvidia.com:5005/cudnn/cudnn_front
 docker image build --no-cache -t gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.21.0.82_13.2.0 -f dockers/Dockerfile --build-arg CUDA_VERSION_=13.2 --build-arg CUDNN_VERSION_=9.21.0.82 --build-arg DLFW_MONTH=26.03 .
 docker image build --no-cache -t gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.22.0.52_13.2.0 -f dockers/Dockerfile --build-arg CUDA_VERSION_=13.2 --build-arg CUDNN_VERSION_=9.22.0.52 --build-arg DLFW_MONTH=26.04 .
 docker image build --no-cache -t gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.23.0.39_13.3.0 -f dockers/Dockerfile --build-arg CUDA_VERSION_=13.3 --build-arg CUDNN_VERSION_=9.23.0.39 --build-arg DLFW_MONTH=26.05 .
+docker image build --no-cache -t gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.24.0.43_13.3.0 -f dockers/Dockerfile --build-arg CUDA_VERSION_=13.3 --build-arg CUDNN_VERSION_=9.24.0.43 --build-arg DLFW_MONTH=26.06 .
 
 docker image build --no-cache -t gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_12.9.1 -f dockers/Dockerfile --build-arg CUDA_VERSION_=12.9.1 --build-arg CUDNN_VERSION_=9.12.0.46 --build-arg SKIP_CUDNN=true --build-arg DLFW_MONTH=25.06 .
 docker image build --no-cache -t gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_13.3.0 -f dockers/Dockerfile --build-arg CUDA_VERSION_=13.3 --build-arg CUDNN_VERSION_=9.23.0.39 --build-arg SKIP_CUDNN=true --build-arg DLFW_MONTH=26.05 .
@@ -71,6 +72,7 @@ docker push gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.19.0.56_1
 docker push gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.20.0.48_13.2.0
 docker push gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.21.0.82_13.2.0
 docker push gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.22.0.52_13.2.0
+docker push gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.24.0.43_13.3.0
 
 docker push gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_12.9.1
 docker push gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_13.3.0
