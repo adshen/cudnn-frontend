@@ -660,7 +660,9 @@ def _kernel(
         ml_local = warp_idx - mainloop_warp_id_start
         ml_threads = num_mainloop_warps * 32
         ml_tid = ml_local * 32 + lane
-        ml_vec_elems = 16 // (ab_dtype.width // 8)
+        # 16 B = widest SMEM load/store (128-bit LDS/STS)
+        ml_vec_bytes = 16
+        ml_vec_elems = ml_vec_bytes // (ab_dtype.width // 8)
         ml_chunks_a = (sA_elems // ml_vec_elems) // ml_threads
         ml_chunks_b = (sB_elems // ml_vec_elems) // ml_threads
 
@@ -693,7 +695,12 @@ def _kernel(
                         for i in cutlass.range_constexpr(ml_chunks_a):
                             ml_L = (ml_tid + i * ml_threads) * ml_vec_elems
                             ml_offsets.append(ml_L)
-                            ml_vecs.append((sA_load_stage + ml_L).load(vector_size=ml_vec_elems))
+                            ml_vecs.append(
+                                (sA_load_stage + ml_L).load(
+                                    vector_size=ml_vec_elems,
+                                    alignment=ml_vec_elems * (ab_load_a_dtype.width // 8),
+                                )
+                            )
 
                         ml_outs = []
                         for i in cutlass.range_constexpr(ml_chunks_a):
@@ -704,13 +711,13 @@ def _kernel(
                             ml_outs.append(ml_out_a)
 
                         for i in cutlass.range_constexpr(ml_chunks_a):
-                            (sA_stage + ml_offsets[i]).data_ptr().store_swizzled(ml_outs[i], ab_swizzle, alignment=16)
+                            (sA_stage + ml_offsets[i]).data_ptr().store_swizzled(ml_outs[i], ab_swizzle, alignment=ml_vec_bytes)
                     elif cutlass.const_expr(mainloop_koob_fix):
                         a_kvalid = cutlass.Int32(k - k_tile_idx * cta_tile_mnk[2])
                         for chunk in cutlass.range_constexpr(ml_chunks_a):
                             ml_L = (ml_tid + chunk * ml_threads) * ml_vec_elems
                             ml_ptr_a = (sA_stage + ml_L).data_ptr()
-                            ml_vec_a = ml_ptr_a.load_swizzled(ab_swizzle, count=ml_vec_elems)
+                            ml_vec_a = ml_ptr_a.load_swizzled(ab_swizzle, alignment=ml_vec_bytes, count=ml_vec_elems)
 
                             # @@INJECT_MAINLOOP_A@@
 
@@ -721,16 +728,16 @@ def _kernel(
                                 ml_f32_a - ml_f32_a,
                                 ml_out_a.to(cutlass.Float32),
                             ).to(ab_dtype)
-                            ml_ptr_a.store_swizzled(ml_out_a, ab_swizzle)
+                            ml_ptr_a.store_swizzled(ml_out_a, ab_swizzle, alignment=ml_vec_bytes)
                     else:
                         for chunk in cutlass.range_constexpr(ml_chunks_a):
                             ml_idx = (ml_tid + chunk * ml_threads) * ml_vec_elems
                             ml_ptr_a = sA_stage + ml_idx
-                            ml_vec_a = ml_ptr_a.load(vector_size=ml_vec_elems)
+                            ml_vec_a = ml_ptr_a.load(vector_size=ml_vec_elems, alignment=ml_vec_bytes)
 
                             # @@INJECT_MAINLOOP_A@@
 
-                            ml_ptr_a.store(ml_out_a)
+                            ml_ptr_a.store(ml_out_a, alignment=ml_vec_bytes)
 
                 if cutlass.const_expr(mainloop_fuse_b):
                     while not nvvm.mbarrier_try_wait_parity(
@@ -748,7 +755,12 @@ def _kernel(
                         for i in cutlass.range_constexpr(ml_chunks_b):
                             ml_L = (ml_tid + i * ml_threads) * ml_vec_elems
                             ml_offsets.append(ml_L)
-                            ml_vecs.append((sB_load_stage + ml_L).load(vector_size=ml_vec_elems))
+                            ml_vecs.append(
+                                (sB_load_stage + ml_L).load(
+                                    vector_size=ml_vec_elems,
+                                    alignment=ml_vec_elems * (ab_load_b_dtype.width // 8),
+                                )
+                            )
 
                         ml_outs = []
                         for i in cutlass.range_constexpr(ml_chunks_b):
@@ -759,16 +771,16 @@ def _kernel(
                             ml_outs.append(ml_out_b)
 
                         for i in cutlass.range_constexpr(ml_chunks_b):
-                            (sB_stage + ml_offsets[i]).data_ptr().store_swizzled(ml_outs[i], ab_swizzle, alignment=16)
+                            (sB_stage + ml_offsets[i]).data_ptr().store_swizzled(ml_outs[i], ab_swizzle, alignment=ml_vec_bytes)
                     else:
                         for chunk in cutlass.range_constexpr(ml_chunks_b):
                             ml_idx = (ml_tid + chunk * ml_threads) * ml_vec_elems
                             ml_ptr_b = sB_stage + ml_idx
-                            ml_vec_b = ml_ptr_b.load(vector_size=ml_vec_elems)
+                            ml_vec_b = ml_ptr_b.load(vector_size=ml_vec_elems, alignment=ml_vec_bytes)
 
                             # @@INJECT_MAINLOOP_B@@
 
-                            ml_ptr_b.store(ml_out_b)
+                            ml_ptr_b.store(ml_out_b, alignment=ml_vec_bytes)
 
                 cute.arch.fence_view_async_shared()
                 cute.arch.sync_warp()
