@@ -120,8 +120,7 @@ def fetch_cudnn(base_url, cuda_version, download_dir, unzip_dir, output_dir, cud
         url = f"{base_url}/{_tarball_path(match['version'], cuda_version)}"
 
         if tarball_path.exists():
-            print(f"Fetch skipped for {version_num}: File already exists at {tarball_path}")
-            break
+            print(f"Stale tarball for {version_num} at {tarball_path}; re-downloading (TOT version)")
 
         try:
             print(f"Fetching {version_num} from {url}")
