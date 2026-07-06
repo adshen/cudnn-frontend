@@ -864,6 +864,31 @@ def _mainloop_template_file(base_template_file: str) -> str:
     return base_template_file.replace("_matmul_", "_matmul_mainloop_")
 
 
+_INJECT_MARKER_LINE = re.compile(r"^([ \t]*)# *@@([A-Z0-9_]+)@@[ \t]*\n", flags=re.MULTILINE)
+
+
+def _replace_marker_lines(src: str, replacements: dict[str, str], *, template_kind: str = "template") -> str:
+    """Replace all requested injection-marker lines in one template scan."""
+    found: set[str] = set()
+
+    def repl(match: re.Match) -> str:
+        marker = match.group(2)
+        if marker not in replacements:
+            return match.group(0)
+        found.add(marker)
+        replacement = replacements[marker]
+        if not replacement:
+            return ""
+        indent = match.group(1)
+        return indent + replacement.replace("\n", "\n" + indent) + "\n"
+
+    rendered = _INJECT_MARKER_LINE.sub(repl, src)
+    for marker in replacements:
+        if marker not in found:
+            raise RuntimeError(f"{template_kind} missing marker @@{marker}@@")
+    return rendered
+
+
 def _render_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
@@ -954,38 +979,22 @@ def _render_template(
     red_compile_stride_decls = _reduction_stride_compile_decls(chain)
     red_compile_stride_symbols = _reduction_stride_compile_symbols(chain)
 
-    # @@INJECT_*@@ markers sit on comment-only lines; replace the whole line. A
-    # marker may appear at several indent levels (e.g. @@INJECT_EPILOGUE@@ in
-    # both epilogue branches), so re-indent each match at its own column.
-    def _replace_marker_line(marker: str, replacement: str) -> None:
-        nonlocal src
-        pattern = re.compile(rf"^([ \t]*)# *@@{marker}@@[ \t]*\n", flags=re.MULTILINE)
-        if not pattern.search(src):
-            raise RuntimeError(f"template missing marker @@{marker}@@")
-        if replacement == "":
-            src = pattern.sub("", src)
-        else:
-
-            def repl(m: re.Match) -> str:
-                indent = m.group(1)
-                return indent + replacement.replace("\n", "\n" + indent) + "\n"
-
-            src = pattern.sub(repl, src)
-
-    _replace_marker_line("INJECT_TILE_CONSTANTS", tile_constants)
-    _replace_marker_line("INJECT_KERNEL_AUX_PARAMS", kernel_aux_params)
-    _replace_marker_line("INJECT_HOST_AUX_PARAMS", host_aux_params)
-    _replace_marker_line("INJECT_HOST_AUX_PASS", host_aux_pass)
-    _replace_marker_line("INJECT_COMPILE_AUX_FAKES", compile_aux_fakes)
-    _replace_marker_line("INJECT_COMPILE_AUX_PASS", compile_aux_pass)
-    _replace_marker_line("INJECT_KERNEL_TAP_PARAMS", kernel_tap_params)
-    _replace_marker_line("INJECT_HOST_TAP_PARAMS", host_tap_params)
-    _replace_marker_line("INJECT_HOST_TAP_PASS", host_tap_pass)
-    _replace_marker_line("INJECT_COMPILE_TAP_FAKES", compile_tap_fakes)
-    _replace_marker_line("INJECT_COMPILE_TAP_PASS", compile_tap_pass)
-    _replace_marker_line("INJECT_TAP_PTRS", tap_ptr_binds)
-    _replace_marker_line("INJECT_AUX_VIEWS", snippets.aux_views)
-    _replace_marker_line("INJECT_EPILOGUE", snippets.epilogue)
+    replacements = {
+        "INJECT_TILE_CONSTANTS": tile_constants,
+        "INJECT_KERNEL_AUX_PARAMS": kernel_aux_params,
+        "INJECT_HOST_AUX_PARAMS": host_aux_params,
+        "INJECT_HOST_AUX_PASS": host_aux_pass,
+        "INJECT_COMPILE_AUX_FAKES": compile_aux_fakes,
+        "INJECT_COMPILE_AUX_PASS": compile_aux_pass,
+        "INJECT_KERNEL_TAP_PARAMS": kernel_tap_params,
+        "INJECT_HOST_TAP_PARAMS": host_tap_params,
+        "INJECT_HOST_TAP_PASS": host_tap_pass,
+        "INJECT_COMPILE_TAP_FAKES": compile_tap_fakes,
+        "INJECT_COMPILE_TAP_PASS": compile_tap_pass,
+        "INJECT_TAP_PTRS": tap_ptr_binds,
+        "INJECT_AUX_VIEWS": snippets.aux_views,
+        "INJECT_EPILOGUE": snippets.epilogue,
+    }
     for marker, replacement in (
         ("INJECT_KERNEL_REDUCTION_STRIDE_PARAMS", red_kernel_stride_params),
         ("INJECT_HOST_REDUCTION_STRIDES", red_host_stride_unpack),
@@ -994,33 +1003,47 @@ def _render_template(
         ("INJECT_COMPILE_REDUCTION_STRIDE_SYMBOLS", red_compile_stride_symbols),
     ):
         if f"@@{marker}@@" in src:
-            _replace_marker_line(marker, replacement)
+            replacements[marker] = replacement
         elif chain.reductions or chain.block_quant is not None:
             raise RuntimeError(f"template missing marker @@{marker}@@")
     # Multi-GEMM A/B operand plumbing — only the 1ctamma template carries these
     # markers; other templates keep their fixed single-A/single-B signature.
     if "@@INJECT_KERNEL_AB_DESC_PARAMS@@" in src:
-        _replace_marker_line("INJECT_KERNEL_AB_DESC_PARAMS", kernel_ab_desc_params)
-        _replace_marker_line("INJECT_AB_DESC_LISTS", ab_desc_lists)
-        _replace_marker_line("INJECT_HOST_AB_PARAMS", host_ab_params)
-        _replace_marker_line("INJECT_HOST_AB_LISTS", host_ab_lists)
-        _replace_marker_line("INJECT_HOST_KERNEL_DESC_PASS", host_kernel_desc_pass)
-        _replace_marker_line("INJECT_COMPILE_AB_FAKES", compile_ab_fakes)
-        _replace_marker_line("INJECT_COMPILE_AB_PASS", compile_ab_pass)
+        replacements.update(
+            {
+                "INJECT_KERNEL_AB_DESC_PARAMS": kernel_ab_desc_params,
+                "INJECT_AB_DESC_LISTS": ab_desc_lists,
+                "INJECT_HOST_AB_PARAMS": host_ab_params,
+                "INJECT_HOST_AB_LISTS": host_ab_lists,
+                "INJECT_HOST_KERNEL_DESC_PASS": host_kernel_desc_pass,
+                "INJECT_COMPILE_AB_FAKES": compile_ab_fakes,
+                "INJECT_COMPILE_AB_PASS": compile_ab_pass,
+            }
+        )
     # Per-GEMM STG vector bindings — on every STG-epilogue template (mainloop
     # included; single-GEMM → `pass`).
     if "@@INJECT_STG_VEC_BINDINGS@@" in src:
-        _replace_marker_line("INJECT_STG_VEC_BINDINGS", stg_vec_bindings)
+        replacements["INJECT_STG_VEC_BINDINGS"] = stg_vec_bindings
     # MoE raw-A-tensor plumbing — only MoE grouped-matmul templates carry these
     # (the kernel patches each A descriptor per routed group).
     if "@@INJECT_MOE_KERNEL_MA_PARAMS@@" in src:
-        _replace_marker_line("INJECT_MOE_KERNEL_MA_PARAMS", moe_kernel_ma_params)
-        _replace_marker_line("INJECT_MOE_MA_LIST", moe_ma_list)
-        _replace_marker_line("INJECT_MOE_HOST_MA_PASS", moe_host_ma_pass)
+        replacements.update(
+            {
+                "INJECT_MOE_KERNEL_MA_PARAMS": moe_kernel_ma_params,
+                "INJECT_MOE_MA_LIST": moe_ma_list,
+                "INJECT_MOE_HOST_MA_PASS": moe_host_ma_pass,
+            }
+        )
     # Mainloop-fusion transforms — only the 12-warp templates carry these.
     if chain.has_mainloop_fusion:
-        _replace_marker_line("INJECT_MAINLOOP_A", snippets.mainloop_transform_a)
-        _replace_marker_line("INJECT_MAINLOOP_B", snippets.mainloop_transform_b)
+        replacements.update(
+            {
+                "INJECT_MAINLOOP_A": snippets.mainloop_transform_a,
+                "INJECT_MAINLOOP_B": snippets.mainloop_transform_b,
+            }
+        )
+
+    src = _replace_marker_lines(src, replacements)
 
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
@@ -1150,35 +1173,22 @@ def _render_block_scale_template(
     if moe_host_ma_pass:
         moe_host_ma_pass += ","
 
-    def _replace_marker_line(marker: str, replacement: str) -> None:
-        nonlocal src
-        pattern = re.compile(rf"^([ \t]*)# *@@{marker}@@[ \t]*\n", flags=re.MULTILINE)
-        if not pattern.search(src):
-            raise RuntimeError(f"block-scale template missing marker @@{marker}@@")
-        if replacement == "":
-            src = pattern.sub("", src)
-        else:
-
-            def repl(m: re.Match) -> str:
-                indent = m.group(1)
-                return indent + replacement.replace("\n", "\n" + indent) + "\n"
-
-            src = pattern.sub(repl, src)
-
-    _replace_marker_line("INJECT_TILE_CONSTANTS", tile_constants)
-    _replace_marker_line("INJECT_KERNEL_AUX_PARAMS", kernel_aux_params)
-    _replace_marker_line("INJECT_HOST_AUX_PARAMS", host_aux_params)
-    _replace_marker_line("INJECT_HOST_AUX_PASS", host_aux_pass)
-    _replace_marker_line("INJECT_COMPILE_AUX_FAKES", compile_aux_fakes)
-    _replace_marker_line("INJECT_COMPILE_AUX_PASS", compile_aux_pass)
-    _replace_marker_line("INJECT_KERNEL_TAP_PARAMS", kernel_tap_params)
-    _replace_marker_line("INJECT_HOST_TAP_PARAMS", host_tap_params)
-    _replace_marker_line("INJECT_HOST_TAP_PASS", host_tap_pass)
-    _replace_marker_line("INJECT_COMPILE_TAP_FAKES", compile_tap_fakes)
-    _replace_marker_line("INJECT_COMPILE_TAP_PASS", compile_tap_pass)
-    _replace_marker_line("INJECT_TAP_PTRS", tap_ptr_binds)
-    _replace_marker_line("INJECT_AUX_VIEWS", snippets.aux_views)
-    _replace_marker_line("INJECT_EPILOGUE", snippets.epilogue)
+    replacements = {
+        "INJECT_TILE_CONSTANTS": tile_constants,
+        "INJECT_KERNEL_AUX_PARAMS": kernel_aux_params,
+        "INJECT_HOST_AUX_PARAMS": host_aux_params,
+        "INJECT_HOST_AUX_PASS": host_aux_pass,
+        "INJECT_COMPILE_AUX_FAKES": compile_aux_fakes,
+        "INJECT_COMPILE_AUX_PASS": compile_aux_pass,
+        "INJECT_KERNEL_TAP_PARAMS": kernel_tap_params,
+        "INJECT_HOST_TAP_PARAMS": host_tap_params,
+        "INJECT_HOST_TAP_PASS": host_tap_pass,
+        "INJECT_COMPILE_TAP_FAKES": compile_tap_fakes,
+        "INJECT_COMPILE_TAP_PASS": compile_tap_pass,
+        "INJECT_TAP_PTRS": tap_ptr_binds,
+        "INJECT_AUX_VIEWS": snippets.aux_views,
+        "INJECT_EPILOGUE": snippets.epilogue,
+    }
     for marker, replacement in (
         ("INJECT_KERNEL_REDUCTION_STRIDE_PARAMS", red_kernel_stride_params),
         ("INJECT_HOST_REDUCTION_STRIDES", red_host_stride_unpack),
@@ -1187,26 +1197,36 @@ def _render_block_scale_template(
         ("INJECT_COMPILE_REDUCTION_STRIDE_SYMBOLS", red_compile_stride_symbols),
     ):
         if f"@@{marker}@@" in src:
-            _replace_marker_line(marker, replacement)
+            replacements[marker] = replacement
         elif chain.reductions or chain.block_quant is not None:
             raise RuntimeError(f"block-scale template missing marker @@{marker}@@")
     # Multi-GEMM A/B + SF operand plumbing — only block-scale templates that
     # carry these markers (MoE block-scale lacks them).
     if "@@INJECT_KERNEL_AB_DESC_PARAMS@@" in src:
-        _replace_marker_line("INJECT_KERNEL_AB_DESC_PARAMS", kernel_ab_desc_params)
-        _replace_marker_line("INJECT_AB_DESC_LISTS", ab_desc_lists)
-        _replace_marker_line("INJECT_HOST_AB_PARAMS", host_ab_params)
-        _replace_marker_line("INJECT_HOST_AB_LISTS", host_ab_lists)
-        _replace_marker_line("INJECT_HOST_KERNEL_DESC_PASS", host_kernel_desc_pass)
-        _replace_marker_line("INJECT_COMPILE_AB_FAKES", compile_ab_fakes)
-        _replace_marker_line("INJECT_COMPILE_AB_PASS", compile_ab_pass)
+        replacements.update(
+            {
+                "INJECT_KERNEL_AB_DESC_PARAMS": kernel_ab_desc_params,
+                "INJECT_AB_DESC_LISTS": ab_desc_lists,
+                "INJECT_HOST_AB_PARAMS": host_ab_params,
+                "INJECT_HOST_AB_LISTS": host_ab_lists,
+                "INJECT_HOST_KERNEL_DESC_PASS": host_kernel_desc_pass,
+                "INJECT_COMPILE_AB_FAKES": compile_ab_fakes,
+                "INJECT_COMPILE_AB_PASS": compile_ab_pass,
+            }
+        )
         if "@@INJECT_STG_VEC_BINDINGS@@" in src:
-            _replace_marker_line("INJECT_STG_VEC_BINDINGS", stg_vec_bindings)
+            replacements["INJECT_STG_VEC_BINDINGS"] = stg_vec_bindings
     # MoE block-scale raw-A-tensor plumbing (per-routed-group descriptor patch).
     if "@@INJECT_MOE_KERNEL_MA_PARAMS@@" in src:
-        _replace_marker_line("INJECT_MOE_KERNEL_MA_PARAMS", moe_kernel_ma_params)
-        _replace_marker_line("INJECT_MOE_MA_LIST", moe_ma_list)
-        _replace_marker_line("INJECT_MOE_HOST_MA_PASS", moe_host_ma_pass)
+        replacements.update(
+            {
+                "INJECT_MOE_KERNEL_MA_PARAMS": moe_kernel_ma_params,
+                "INJECT_MOE_MA_LIST": moe_ma_list,
+                "INJECT_MOE_HOST_MA_PASS": moe_host_ma_pass,
+            }
+        )
+
+    src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
     src = re.sub(r"\b_kernel\(", f"_kernel_{tag}(", src)

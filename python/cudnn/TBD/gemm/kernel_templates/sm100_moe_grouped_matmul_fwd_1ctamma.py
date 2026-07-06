@@ -35,7 +35,7 @@ _TENSOR_MAP_QWORDS = 16
 def _copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
     """Copy the 128-byte A tensormap into ``dst_i64_ptr`` (seeds the SMEM copy)."""
     src_words = cute.make_ptr(cutlass.Int64, src_desc_ptr.toint(), mem_space=cute.AddressSpace.generic)
-    for i in cutlass.range_constexpr(_TENSOR_MAP_QWORDS):
+    for i in cutlass.range(_TENSOR_MAP_QWORDS, unroll_full=True):
         (dst_i64_ptr + i).store((src_words + i).load())
 
 
@@ -656,7 +656,7 @@ def _kernel(
                     ):
                         pass
 
-                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                         for g in cutlass.range_constexpr(num_gemms):
                             sA_stage = smem_a_list[gemm_a_idx[g]] + sA_elems * stage
                             sB_stage = smem_b_list[gemm_b_idx[g]] + sB_elems * stage
@@ -790,7 +790,7 @@ def _kernel(
 
             # @@INJECT_AUX_VIEWS@@
 
-            for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+            for subtile_idx in cutlass.range(subtile_cnt, unroll_full=True):
                 subtile_col_offset = subtile_idx * 32
                 c_rmem_vecs = []
                 for g in cutlass.range_constexpr(num_gemms):
@@ -803,7 +803,7 @@ def _kernel(
                     c_rmem_vecs.append(_cv)
                 c_rmem_vec = c_rmem_vecs[0]
 
-                if cutlass.const_expr(subtile_idx == subtile_cnt - 1):
+                if subtile_idx == subtile_cnt - 1:
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if nvvm.elect_sync():
                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr + acc_stage)

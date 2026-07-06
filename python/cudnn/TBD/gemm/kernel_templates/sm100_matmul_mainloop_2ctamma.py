@@ -686,7 +686,7 @@ def _kernel(
                         layout=ab_smem_swizzle,
                     )
 
-                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                         desc_a = desc_a_base.advance_start_address(a_smem_k_step_bytes * k_block_idx)
                         desc_b = desc_b_base.advance_start_address(b_smem_k_step_bytes * k_block_idx)
                         if nvvm.elect_sync():
@@ -985,7 +985,7 @@ def _kernel(
 
             # @@INJECT_AUX_VIEWS@@
 
-            for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+            for subtile_idx in cutlass.range(subtile_cnt, unroll_full=True):
                 subtile_col_offset = subtile_idx * t2r_inst_repx
                 if cutlass.const_expr(not (use_tma_store_epi and cd_out_is_m_major)):
                     c_rmem_vecs = []
@@ -1001,7 +1001,7 @@ def _kernel(
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
 
-                if cutlass.const_expr((not use_tma_store_epi) and subtile_idx == subtile_cnt - 1):
+                if (not use_tma_store_epi) and subtile_idx == subtile_cnt - 1:
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if nvvm.elect_sync():
                         nvvm.mbarrier_arrive(
@@ -1019,7 +1019,7 @@ def _kernel(
 
                 if cutlass.const_expr(cd_out_is_m_major):
                     ld_col = acc_base_col + subtile_col_offset
-                    for _h in cutlass.range_constexpr(2):
+                    for _h in cutlass.range(2, unroll_full=True):
                         ld_row = base_row_id + warp_idx * 32 + _h * 16
                         ld_addr = (ld_row << 16) | ld_col
                         ld_tmem = cutlass.inttoptr(ld_addr, 6, mma_c_dtype)

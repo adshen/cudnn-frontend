@@ -589,7 +589,7 @@ def _kernel(
                     for j in range(num_b_operands)
                 ]
 
-                for atom_r in cutlass.range_constexpr(num_sf_atoms):
+                for atom_r in cutlass.range(num_sf_atoms, unroll_full=True):
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         for _m in cutlass.range_constexpr(num_blocks_m):
                             if nvvm.elect_sync():
@@ -730,7 +730,7 @@ def _kernel(
 
             # @@INJECT_AUX_VIEWS@@
 
-            for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+            for subtile_idx in cutlass.range(subtile_cnt, unroll_full=True):
                 if cutlass.const_expr(use_acc_overlap):
                     _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
                     subtile_col_offset = _sub * 32
@@ -748,7 +748,7 @@ def _kernel(
                         c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx))
                     c_rmem_vec = c_rmem_vecs[0]
 
-                if cutlass.const_expr(use_acc_overlap and (not cd_out_is_m_major) and subtile_idx == acc_overlap_subtiles - 1):
+                if use_acc_overlap and (not cd_out_is_m_major) and subtile_idx == acc_overlap_subtiles - 1:
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if nvvm.elect_sync():
                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr + acc_stage)
@@ -762,7 +762,7 @@ def _kernel(
 
                 if cutlass.const_expr(cd_out_is_m_major):
                     ld_col = acc_base_col + subtile_col_offset
-                    for _h in cutlass.range_constexpr(2):
+                    for _h in cutlass.range(2, unroll_full=True):
                         ld_row = base_row_id + warp_idx * 32 + _h * 16
                         ld_addr = (ld_row << 16) | ld_col
                         ld_tmem = cutlass.inttoptr(ld_addr, 6, cutlass.Float32)

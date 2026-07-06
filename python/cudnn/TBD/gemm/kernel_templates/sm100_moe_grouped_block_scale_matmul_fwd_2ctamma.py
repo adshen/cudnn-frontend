@@ -35,7 +35,7 @@ _TENSOR_MAP_QWORDS = 16
 def _copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
     """Copy the 128-byte A tensormap into ``dst_i64_ptr`` (seeds the SMEM copy)."""
     src_words = cute.make_ptr(cutlass.Int64, src_desc_ptr.toint(), mem_space=cute.AddressSpace.generic)
-    for i in cutlass.range_constexpr(_TENSOR_MAP_QWORDS):
+    for i in cutlass.range(_TENSOR_MAP_QWORDS, unroll_full=True):
         (dst_i64_ptr + i).store((src_words + i).load())
 
 
@@ -805,7 +805,7 @@ def _kernel(
                             for j in range(num_b_operands)
                         ]
 
-                        for atom_r in cutlass.range_constexpr(num_sf_atoms):
+                        for atom_r in cutlass.range(num_sf_atoms, unroll_full=True):
                             for _ai in cutlass.range_constexpr(num_a_operands):
                                 for _m in cutlass.range_constexpr(num_blocks_m):
                                     if nvvm.elect_sync():
@@ -1011,7 +1011,7 @@ def _kernel(
 
                 # @@INJECT_AUX_VIEWS@@
 
-                for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+                for subtile_idx in cutlass.range(subtile_cnt, unroll_full=True):
                     if cutlass.const_expr(use_acc_overlap):
                         _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
                         subtile_col_offset = _sub * t2r_inst_repx
@@ -1027,7 +1027,7 @@ def _kernel(
                         c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx))
                     c_rmem_vec = c_rmem_vecs[0]
 
-                    if cutlass.const_expr(use_acc_overlap and subtile_idx == acc_overlap_subtiles - 1):
+                    if use_acc_overlap and subtile_idx == acc_overlap_subtiles - 1:
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if nvvm.elect_sync():
                             mbar_pair_ptr = nvvm.mapa(acc_empty_mbar_ptr + acc_stage, pair_leader_rank)
