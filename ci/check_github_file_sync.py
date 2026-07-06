@@ -14,7 +14,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
-
 GITHUB_REMOTE = os.environ.get("GITHUB_SYNC_REMOTE", "https://github.com/NVIDIA/cudnn-frontend.git")
 GITHUB_BRANCH = os.environ.get("GITHUB_SYNC_BRANCH", "develop")
 GITHUB_REMOTE_REF = "refs/remotes/github-sync/develop"
@@ -34,10 +33,10 @@ ALLOWED_GITLAB_ONLY_PATTERNS = (
     "benchmark/norms/results_internal/**",
     "benchmark/sdpa_benchmark_training/results_internal/**",
     "test/pycudnnTest/**",
-    # TBD GEMM feature.
-    "benchmark/TBD/gemm/**",
-    "python/cudnn/TBD/**",
-    "test/python/TBD/gemm/**",
+    # FROST GEMM feature.
+    "benchmark/frost/gemm/**",
+    "python/cudnn/frost/**",
+    "test/python/frost/gemm/**",
 )
 
 
@@ -109,7 +108,9 @@ def main() -> int:
     unallowed_gitlab_only = [path for path in gitlab_only if not is_allowed_gitlab_only(path)]
     allowed_gitlab_only = [path for path in gitlab_only if is_allowed_gitlab_only(path)]
 
-    mode_type_different = sorted(path for path in shared_paths if (github_tree[path].mode, github_tree[path].object_type) != (gitlab_tree[path].mode, gitlab_tree[path].object_type))
+    mode_type_different = sorted(
+        path for path in shared_paths if (github_tree[path].mode, github_tree[path].object_type) != (gitlab_tree[path].mode, gitlab_tree[path].object_type)
+    )
     content_different = sorted(path for path in shared_paths if github_tree[path].oid != gitlab_tree[path].oid and path not in mode_type_different)
 
     print(f"GitHub {GITHUB_BRANCH}: {github_sha}")
