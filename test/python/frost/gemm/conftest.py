@@ -4,7 +4,11 @@ subtree). Unnecessary once the engine ships in the built frontend package."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+# FROST engines are off by default; the frost test suite exercises them, so enable.
+os.environ["NV_CUDNN_FE_ENABLE_FROST_ENGINES"] = "1"
 
 import cudnn
 

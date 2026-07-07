@@ -11,7 +11,11 @@ cast independently.
 from __future__ import annotations
 
 import cudnn
-import cudnn.frost.gemm  # noqa: F401  (registers frost_eng0 + installs hook)
+import os
+
+os.environ.setdefault("NV_CUDNN_FE_ENABLE_FROST_ENGINES", "1")
+
+import cudnn.frost.gemm  # noqa: F401  (registers frost_gemm_eng0 + installs hook)
 import torch
 
 
@@ -32,7 +36,7 @@ def _run(M: int, N: int, K: int) -> None:
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    g.select_engines(["frost_eng0"])
+    g.select_engines(["frost_gemm_eng0"])
     g.check_support()
     g.build_plans()
 

@@ -9,7 +9,11 @@ plus scalar-aux binary (A*alpha) @ (B*beta).
 from __future__ import annotations
 
 import cudnn
-import cudnn.frost.gemm  # noqa: F401  (registers frost_eng0 + installs hook)
+import os
+
+os.environ.setdefault("NV_CUDNN_FE_ENABLE_FROST_ENGINES", "1")
+
+import cudnn.frost.gemm  # noqa: F401  (registers frost_gemm_eng0 + installs hook)
 import torch
 
 _T = {"abs": torch.abs, "relu": torch.relu, "none": lambda x: x}
@@ -31,7 +35,7 @@ def _run(aop: str, bop: str, M: int, N: int, K: int) -> None:
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    g.select_engines(["frost_eng0"])
+    g.select_engines(["frost_gemm_eng0"])
     g.check_support()
     g.build_plans()
 
@@ -70,7 +74,7 @@ def _run_scaled(M: int, N: int, K: int, av: float = 2.0, bv: float = 0.5) -> Non
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    g.select_engines(["frost_eng0"])
+    g.select_engines(["frost_gemm_eng0"])
     g.check_support()
     g.build_plans()
 

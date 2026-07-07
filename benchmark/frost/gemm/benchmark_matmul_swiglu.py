@@ -1,7 +1,7 @@
 """Benchmark the fused multi-GEMM SwiGLU block silu(a@b0)*(a@b1)*scale vs an
 unfused 2×cuBLAS + pointwise baseline. --shape is B,M,N,K.
 
-    python cudnn.frost.gemm/benchmarks/benchmark_matmul_swiglu.py --shape 1,4096,11008,4096
+    python benchmark/frost/gemm/benchmark_matmul_swiglu.py --shape 1,4096,11008,4096
 """
 
 from __future__ import annotations

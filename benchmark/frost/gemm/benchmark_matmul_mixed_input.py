@@ -4,7 +4,7 @@ MMA dtype) vs the equivalent dense cuBLAS matmul on the widened operands.
 Default: load=int8, tin=tout=bf16. Timing / buffer-rotation / CLI mirror
 benchmark_matmul.py.
 
-    python cudnn.frost.gemm/benchmarks/benchmark_matmul_mixed_input.py --load-dtype int8 --tin bf16 --tout bf16
+    python benchmark/frost/gemm/benchmark_matmul_mixed_input.py --load-dtype int8 --tin bf16 --tout bf16
 """
 
 from __future__ import annotations

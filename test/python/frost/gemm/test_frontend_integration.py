@@ -1,4 +1,4 @@
-"""Frontend integration: the GEMM engine ``frost_eng0`` is appended to the plan
+"""Frontend integration: the GEMM engine ``frost_gemm_eng0`` is appended to the plan
 list from native cuDNN heuristics (not a heuristics mode). Exercises engine
 select/deselect, plan-count growth, ineligible graphs, and the wrapper.Graph path."""
 
@@ -8,14 +8,14 @@ import pytest
 import torch
 
 import cudnn
-import cudnn.frost.gemm  # noqa: F401  (registers frost_eng0 + installs lifecycle patches)
+import cudnn.frost.gemm  # noqa: F401  (registers frost_gemm_eng0 + installs lifecycle patches)
 from cudnn.frost import engine_names, is_frost_engine
 from cudnn.frost.heuristics import _get_plan_state
 
 _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
 M, N, K = 256, 256, 128
-_FROST = "frost_eng0"
+_FROST = "frost_gemm_eng0"
 
 
 def _build_matmul_bias_relu():
@@ -67,12 +67,30 @@ def test_engine_registered():
     assert not is_frost_engine(cudnn.heur_mode.A)
 
 
+def test_env_flag_gates_frost(monkeypatch):
+    """NV_CUDNN_FE_ENABLE_FROST_ENGINES=0 removes FROST from the plan list entirely;
+    =1 restores it (the frost test suite runs with it enabled via conftest)."""
+    from cudnn.frost import frost_engines_enabled
+
+    monkeypatch.setenv("NV_CUDNN_FE_ENABLE_FROST_ENGINES", "0")
+    assert frost_engines_enabled() is False
+    g, *_ = _build_matmul_bias_relu()
+    _run_native(g)
+    assert _get_plan_state(g)["eligible"] == []  # disabled → never eligible
+
+    monkeypatch.setenv("NV_CUDNN_FE_ENABLE_FROST_ENGINES", "1")
+    assert frost_engines_enabled() is True
+    g2, *_ = _build_matmul_bias_relu()
+    _run_native(g2)
+    assert _FROST in _get_plan_state(g2)["eligible"]  # enabled → back in the list
+
+
 @_GPU
 def test_select_frost_engine_runs_frost():
     a, b, bias_t, ref = _operands()
     g, A, B, bias, Y = _build_matmul_bias_relu()
     _run_native(g)
-    # frost_eng0 is appended after cuDNN's engines.
+    # frost_gemm_eng0 is appended after cuDNN's engines.
     state = _get_plan_state(g)
     assert _FROST in state["eligible"]
     g.select_engines([_FROST])
@@ -131,7 +149,7 @@ def test_build_convenience_then_select():
 
 
 def test_ineligible_graph_not_listed():
-    """fp32 matmul (no fp32 MMA path) is not eligible → frost_eng0 not listed."""
+    """fp32 matmul (no fp32 MMA path) is not eligible → frost_gemm_eng0 not listed."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.FLOAT,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -195,7 +213,7 @@ def test_probe_exception_marks_ineligible(monkeypatch, caplog):
 
 @_GPU
 def test_wrapper_graph_path():
-    """wrapper.Graph(heuristics=[A]) builds cuDNN + frost_eng0; select FROST."""
+    """wrapper.Graph(heuristics=[A]) builds cuDNN + frost_gemm_eng0; select FROST."""
     from cudnn.wrapper import Graph
 
     a, b, bias_t, ref = _operands()

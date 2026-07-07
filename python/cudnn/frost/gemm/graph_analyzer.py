@@ -1,15 +1,14 @@
 """Analyze a user-built ``cudnn.pygraph`` and produce a ``FusionChain``.
 
-Importing ``cudnn.frost.gemm`` monkey-patches ``cudnn.pygraph``'s tensor / matmul /
-pointwise methods to record the op chain while delegating to the real backend, so
-any graph built AFTER the import is analyzable (call ``install_recorder()`` early
-otherwise). ``analyze(g)`` reads that recorded state.
+``cudnn.pygraph`` is the Python-native graph IR: it records its op DAG directly,
+exposed via ``graph.nodes`` / ``graph.tensors``. ``analyze(g)`` reads that IR, so a
+graph is analyzable whenever it is built — no construction-time hook required.
 """
 
 from __future__ import annotations
 
 import logging
-import weakref
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -114,36 +113,16 @@ class _TensorMeta:
     tensor: Any = None
 
 
-# pybind11's cudnn.pygraph forbids arbitrary instance attrs, so per-graph state
-# lives in a WeakKeyDictionary keyed by the graph (auto-evicts on GC; no id() reuse).
-_GRAPH_STATES: "weakref.WeakKeyDictionary[cudnn.pygraph, dict]" = weakref.WeakKeyDictionary()
-
-# set_output / set_data_type are setters with no getter, so we class-patch them
-# and stash the flags here (keyed by id(tensor)). Cleared each pygraph __init__.
+# The native tensor mirrors set_output / set_data_type / set_dim / set_reordering_type
+# onto its own attributes; these side tables (keyed by id(tensor)) carry them into
+# the analyzer, repopulated from graph.nodes each analyze (see _state_from_graph).
 _TENSOR_OUTPUT_FLAG: dict[int, bool] = {}
 _TENSOR_EXPLICIT_DTYPE: dict[int, Any] = {}
 _TENSOR_DIM_OVERRIDE: dict[int, tuple[int, ...]] = {}
 _TENSOR_REORDERING_OVERRIDE: dict[int, str | None] = {}
 
-
-def _ensure_state(graph: cudnn.pygraph) -> dict:
-    state = _GRAPH_STATES.get(graph)
-    if state is None:
-        state = {
-            "ops": [],
-            "tensor_meta": {},
-            "io_dtype": "bf16",
-            # Graph-level defaults: intermediate_dtype = a virtual tensor's dtype
-            # when no set_data_type; compute_dtype = default op math precision.
-            "intermediate_dtype": "fp32",
-            "compute_dtype": "fp32",
-        }
-        _GRAPH_STATES[graph] = state
-    return state
-
-
-def _get_state(graph: cudnn.pygraph) -> dict | None:
-    return _GRAPH_STATES.get(graph)
+# The side tables above are module-global; serialize the analyze path around them.
+_ANALYZE_LOCK = threading.RLock()
 
 
 # Variant-pack binding — maps each graph role to its cuDNN tensor
@@ -273,183 +252,7 @@ def resolve_variant_pack(variant_pack: dict, binding: GemmBinding) -> dict[int, 
     return resolved
 
 
-# Monkey-patch installer
-
-
-_INSTALLED = False
-_ORIGINALS: dict[str, Any] = {}
-
-
-def _bind(args: tuple, kwargs: dict, names: tuple[str, ...]) -> dict:
-    """Merge positional + keyword args into a ``name -> value`` dict for op
-    recording (delegation still passes ``*args, **kwargs`` verbatim)."""
-    bound = dict(kwargs)
-    for i, val in enumerate(args):
-        if i < len(names):
-            bound.setdefault(names[i], val)
-    return bound
-
-
-def _patched_init(self, *args, **kwargs):
-    _ORIGINALS["__init__"](self, *args, **kwargs)
-    io_dt = kwargs.get("io_data_type", cudnn.data_type.BFLOAT16)
-    inter_dt = kwargs.get("intermediate_data_type", cudnn.data_type.FLOAT)
-    comp_dt = kwargs.get("compute_data_type", cudnn.data_type.FLOAT)
-    state = _ensure_state(self)
-    state["io_dtype"] = _DTYPE_FROM_CUDNN.get(io_dt, "bf16")
-    state["intermediate_dtype"] = _DTYPE_FROM_CUDNN.get(inter_dt, "fp32")
-    state["compute_dtype"] = _DTYPE_FROM_CUDNN.get(comp_dt, "fp32")
-    # Fresh graph → clear stale tensor-level flags from earlier graphs.
-    _TENSOR_OUTPUT_FLAG.clear()
-    _TENSOR_EXPLICIT_DTYPE.clear()
-    _TENSOR_DIM_OVERRIDE.clear()
-    _TENSOR_REORDERING_OVERRIDE.clear()
-
-
-def _patched_tensor(self, *args, **kwargs):
-    state = _ensure_state(self)
-    # GEMM keyword style omits data_type → default to io dtype. Only inject for
-    # the pure-keyword call (host callers pass a torch dtype — leave untouched).
-    if not args and kwargs.get("data_type") is None:
-        kwargs = {**kwargs, "data_type": _CUDNN_FROM_DTYPE[state["io_dtype"]]}
-    t = _ORIGINALS["tensor"](self, *args, **kwargs)
-    try:
-        b = _bind(args, kwargs, ("name", "dim", "stride", "data_type"))
-        # SF reorder layout (e.g. F8_128x4) when set; enum .name is "NONE" default → None.
-        rt = b.get("reordering_type")
-        reordering = rt.name if (rt is not None and getattr(rt, "name", "NONE") != "NONE") else None
-        state["tensor_meta"][id(t)] = _TensorMeta(
-            name=b.get("name"),
-            dim=tuple(b["dim"]),
-            stride=tuple(b["stride"]),
-            # .get → None for torch dtypes (host graphs); cuDNN enums map to our literal.
-            dtype=_DTYPE_FROM_CUDNN.get(b.get("data_type")),
-            is_input=True,
-            reordering=reordering,
-            tensor=t,
-        )
-    except Exception:  # noqa: BLE001 — recording is best-effort; never break a real graph build
-        pass
-    return t
-
-
-def _opt_compute_dtype(kwargs: dict) -> Dtype | None:
-    """Per-op ``compute_data_type`` override → Dtype literal; None → graph default."""
-    dt = kwargs.get("compute_data_type")
-    if dt is None:
-        return None
-    return _DTYPE_FROM_CUDNN.get(dt)
-
-
-def _patched_matmul(self, *args, **kwargs):
-    out = _ORIGINALS["matmul"](self, *args, **kwargs)
-    try:
-        b = _bind(args, kwargs, ("A", "B"))
-        name = b.get("name", "")
-        state = _ensure_state(self)
-        state["ops"].append(
-            _RecordedOp(
-                "matmul",
-                name,
-                [id(b["A"]), id(b["B"])],
-                id(out),
-                out,
-                compute_dtype=_opt_compute_dtype(kwargs),
-            )
-        )
-        state["tensor_meta"][id(out)] = _TensorMeta(name=f"{name}::OUT_0", dim=(), stride=(), dtype="fp32")
-    except Exception:  # noqa: BLE001
-        pass
-    return out
-
-
-def _patched_block_scale_dequantize(self, *args, **kwargs):
-    out = _ORIGINALS["block_scale_dequantize"](self, *args, **kwargs)
-    try:
-        b = _bind(args, kwargs, ("input", "descale", "block_size", "is_negative_scale"))
-        name = b.get("name", "")
-        state = _ensure_state(self)
-        # Dequant output is virtual fp32 with the packed input's dim/stride, so
-        # downstream rank checks see a 3D operand carrying the input's dims.
-        in_meta = state["tensor_meta"].get(id(b["input"]))
-        state["ops"].append(
-            _RecordedOp(
-                "block_scale_dequantize",
-                name,
-                [id(b["input"]), id(b["descale"])],
-                id(out),
-                out,
-                compute_dtype=_opt_compute_dtype(kwargs),
-                block_size=tuple(b["block_size"]),
-                is_negative_scale=bool(b.get("is_negative_scale", False)),
-            )
-        )
-        state["tensor_meta"][id(out)] = _TensorMeta(
-            name=f"{name}::OUT_0",
-            dim=in_meta.dim if in_meta else (),
-            stride=in_meta.stride if in_meta else (),
-            dtype="fp32",
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    return out
-
-
-def _patched_block_scale_quantize(self, *args, **kwargs):
-    out = _ORIGINALS["block_scale_quantize"](self, *args, **kwargs)
-    try:
-        b = _bind(args, kwargs, ("input", "block_size", "axis", "transpose"))
-        name = b.get("name", "")
-        quantized, scale = out
-        block_size = b["block_size"]
-        if isinstance(block_size, (list, tuple)):
-            if len(block_size) != 1:
-                raise NotImplementedError(f"block_scale_quantize expects a scalar block_size in cudnn.frost.gemm; got {block_size!r}")
-            block_size_i = int(block_size[0])
-        else:
-            block_size_i = int(block_size)
-        axis = b.get("axis")
-        transpose = bool(b.get("transpose", False))
-        state = _ensure_state(self)
-        in_meta = state["tensor_meta"].get(id(b["input"]))
-        state["ops"].append(
-            _RecordedOp(
-                "block_scale_quantize",
-                name,
-                [id(b["input"])],
-                id(quantized),
-                quantized,
-                compute_dtype=_opt_compute_dtype(kwargs),
-                block_size=(block_size_i,),
-                scale_output=id(scale),
-                scale_output_tensor=scale,
-                quant_axis=-1 if axis is None else int(axis),
-                quant_transpose=transpose,
-            )
-        )
-        state["tensor_meta"][id(quantized)] = _TensorMeta(
-            name=f"{name}::OUT_0",
-            dim=in_meta.dim if in_meta else (),
-            stride=in_meta.stride if in_meta else (),
-            dtype="fp32",
-        )
-        scale_dim: tuple[int, ...] = ()
-        scale_stride: tuple[int, ...] = ()
-        if in_meta is not None and len(in_meta.dim) == 3:
-            bb, m, n = in_meta.dim
-            scale_n = (int(n) + block_size_i - 1) // block_size_i
-            scale_dim = (int(bb), int(m), scale_n)
-            scale_stride = (int(m) * scale_n, scale_n, 1)
-        state["tensor_meta"][id(scale)] = _TensorMeta(
-            name=f"{name}::OUT_1",
-            dim=scale_dim,
-            stride=scale_stride,
-            dtype="fp8_e8m0",
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    return out
-
+# MoE / reduction mode maps (cuDNN enum -> our literal)
 
 _MOE_MODE_FROM_CUDNN: dict[Any, str] = {
     cudnn.moe_grouped_matmul_mode.NONE: "none",
@@ -465,140 +268,220 @@ _REDUCTION_MODE_FROM_CUDNN: dict[Any, str] = {
 }
 
 
-def _patched_moe_grouped_matmul(self, *args, **kwargs):
-    out = _ORIGINALS["moe_grouped_matmul"](self, *args, **kwargs)
+# Reading the native cudnn.pygraph IR (graph.nodes) into analyzer state
+
+
+def _map_dtype(dt: Any) -> "Dtype | None":
+    """cuDNN data_type enum (or None) -> our Dtype literal (or None)."""
+    if dt is None:
+        return None
+    return _DTYPE_FROM_CUDNN.get(dt)
+
+
+def _reordering_name(t: Any) -> "str | None":
+    """SF reorder layout name (e.g. ``F8_128x4``) of a tensor, or None (default)."""
+    rt = getattr(t, "reordering_type", None)
+    name = getattr(rt, "name", None) if rt is not None else None
+    return name if (name and name != "NONE") else None
+
+
+def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
+    """Translate one native-IR ``Node`` into a :class:`_RecordedOp`, or None for a
+    node type outside the GEMM family (ignored — the analyzer only consumes the
+    matmul / pointwise / block-scale / MoE / reduction ops)."""
+    node_type = node.node_type.name
+    name = node.name
+    compute = _map_dtype(node.compute_data_type)
+    if node_type == "MATMUL":
+        A, B = node.inputs["A"], node.inputs["B"]
+        out = node.outputs["C"]
+        return _RecordedOp("matmul", name, [id(A), id(B)], id(out), out, compute_dtype=compute)
+    if node_type == "MOE_GROUPED_MATMUL":
+        tok = node.inputs["token"]
+        weight = node.inputs["weight"]
+        fto = node.inputs["first_token_offset"]
+        out = node.outputs["OUT_0"]
+        mode = node.params.get("mode", cudnn.moe_grouped_matmul_mode.NONE)
+        return _RecordedOp(
+            "moe_grouped_matmul",
+            name,
+            [id(tok), id(weight), id(fto)],
+            id(out),
+            out,
+            compute_dtype=compute,
+            moe_mode=_MOE_MODE_FROM_CUDNN.get(mode, "none"),
+        )
+    if node_type == "REDUCTION":
+        inp = node.inputs["input"]
+        out = node.outputs["OUT_0"]
+        group_offset = node.inputs.get("group_offset")
+        return _RecordedOp(
+            "reduction",
+            name,
+            [id(inp)],
+            id(out),
+            out,
+            compute_dtype=compute,
+            reduction_mode=_REDUCTION_MODE_FROM_CUDNN.get(node.params.get("mode")),
+            group_offset=(id(group_offset) if group_offset is not None else None),
+        )
+    if node_type == "BLOCK_SCALE_DEQUANTIZE":
+        inp = node.inputs["input"]
+        descale = node.inputs["descale"]
+        out = node.outputs["OUT_0"]
+        block_size = node.params.get("block_size")
+        return _RecordedOp(
+            "block_scale_dequantize",
+            name,
+            [id(inp), id(descale)],
+            id(out),
+            out,
+            compute_dtype=compute,
+            block_size=tuple(block_size) if block_size is not None else None,
+            is_negative_scale=bool(node.params.get("is_negative_scale", False)),
+        )
+    if node_type == "BLOCK_SCALE_QUANTIZE":
+        inp = node.inputs["input"]
+        quantized = node.outputs["Y"]
+        scale = node.outputs["scale"]
+        block_size = node.params.get("block_size")
+        if isinstance(block_size, (list, tuple)):
+            if len(block_size) != 1:
+                raise NotImplementedError(f"block_scale_quantize expects a scalar block_size in cudnn.frost.gemm; got {block_size!r}")
+            block_size_i = int(block_size[0])
+        else:
+            block_size_i = int(block_size)
+        axis = node.params.get("axis")
+        return _RecordedOp(
+            "block_scale_quantize",
+            name,
+            [id(inp)],
+            id(quantized),
+            quantized,
+            compute_dtype=compute,
+            block_size=(block_size_i,),
+            scale_output=id(scale),
+            scale_output_tensor=scale,
+            quant_axis=-1 if axis is None else int(axis),
+            quant_transpose=bool(node.params.get("transpose", False)),
+        )
+    if node_type == "POINTWISE":
+        out = node.outputs["OUT_0"]
+        return _RecordedOp(
+            node.params.get("mode"),
+            name,
+            [id(t) for t in node.inputs.values()],
+            id(out),
+            out,
+            compute_dtype=compute,
+        )
+    return None
+
+
+def _state_from_graph(graph: cudnn.pygraph) -> dict:
+    """Read a Python-native ``cudnn.pygraph`` into the analyzer's working state:
+    the op list + per-tensor metadata + graph dtype defaults, plus the tensor-flag
+    side tables. The native graph exposes its op DAG directly via ``graph.nodes``,
+    so nothing is recorded at construction time."""
+    _TENSOR_OUTPUT_FLAG.clear()
+    _TENSOR_EXPLICIT_DTYPE.clear()
+    _TENSOR_DIM_OVERRIDE.clear()
+    _TENSOR_REORDERING_OVERRIDE.clear()
+
+    ctx = graph.context
+    raw_io = getattr(ctx, "io_data_type", None)
+    raw_intermediate = getattr(ctx, "intermediate_data_type", None)
+    raw_compute = getattr(ctx, "compute_data_type", None)
+    io_dtype = _map_dtype(raw_io)
+    intermediate_dtype = _map_dtype(raw_intermediate)
+    compute_dtype = _map_dtype(raw_compute)
+    for _raw, _mapped, _field in (
+        (raw_io, io_dtype, "io_data_type"),
+        (raw_intermediate, intermediate_dtype, "intermediate_data_type"),
+        (raw_compute, compute_dtype, "compute_data_type"),
+    ):
+        if _raw is not None and _mapped is None:
+            raise ValueError(f"unsupported {_field}: {_raw!r}")
+    io_dtype = io_dtype or "bf16"
+    intermediate_dtype = intermediate_dtype or "fp32"
+    compute_dtype = compute_dtype or "fp32"
+
+    nodes = list(graph.nodes)
+    produced: set[int] = set()
+    for node in nodes:
+        for out in node.outputs.values():
+            if out is not None:
+                produced.add(id(out))
+
+    tensor_meta: dict[int, _TensorMeta] = {}
+
+    def _register(t: Any) -> None:
+        if t is None or id(t) in tensor_meta:
+            return
+        reordering = _reordering_name(t)
+        tensor_meta[id(t)] = _TensorMeta(
+            name=t.get_name(),
+            dim=tuple(t.dim),
+            stride=tuple(t.stride),
+            dtype=_map_dtype(t.get_data_type()),
+            is_input=id(t) not in produced,
+            reordering=reordering,
+            tensor=t,
+        )
+        if getattr(t, "data_type", None) is not None:
+            _TENSOR_EXPLICIT_DTYPE[id(t)] = t.get_data_type()
+        if getattr(t, "dim_assigned", False) and id(t) in produced:
+            _TENSOR_DIM_OVERRIDE[id(t)] = tuple(t.dim)
+        if reordering is not None:
+            _TENSOR_REORDERING_OVERRIDE[id(t)] = reordering
+
+    for node in nodes:
+        for t in node.inputs.values():
+            _register(t)
+        for t in node.outputs.values():
+            _register(t)
+
+    # Materialized (non-virtual) op outputs, in node order -> terminal = last.
+    for node in nodes:
+        for out in node.outputs.values():
+            if out is not None and not out.is_virtual:
+                _TENSOR_OUTPUT_FLAG[id(out)] = True
+
+    ops: list[_RecordedOp] = []
+    for node in nodes:
+        recorded = _node_to_recorded_op(node)
+        if recorded is not None:
+            ops.append(recorded)
+
+    for op in ops:
+        if op.cudnn_name == "block_scale_dequantize":
+            in_meta = tensor_meta.get(op.inputs[0])
+            out_meta = tensor_meta.get(op.output)
+            if in_meta is not None and out_meta is not None:
+                out_meta.dim = in_meta.dim
+                out_meta.stride = in_meta.stride
+
+    return {
+        "ops": ops,
+        "tensor_meta": tensor_meta,
+        "io_dtype": io_dtype,
+        "intermediate_dtype": intermediate_dtype,
+        "compute_dtype": compute_dtype,
+    }
+
+
+def _graph_has_gemm(graph: cudnn.pygraph) -> bool:
+    """True if the graph has any matmul / MoE grouped-matmul node (GEMM candidate)."""
     try:
-        b = _bind(
-            args,
-            kwargs,
-            (
-                "token",
-                "weight",
-                "first_token_offset",
-                "token_index",
-                "token_ks",
-                "mode",
-            ),
-        )
-        name = b.get("name", "")
-        mode = b.get("mode", cudnn.moe_grouped_matmul_mode.NONE)
-        state = _ensure_state(self)
-        state["ops"].append(
-            _RecordedOp(
-                "moe_grouped_matmul",
-                name,
-                [id(b["token"]), id(b["weight"]), id(b["first_token_offset"])],
-                id(out),
-                out,
-                compute_dtype=_opt_compute_dtype(kwargs),
-                moe_mode=_MOE_MODE_FROM_CUDNN.get(mode, "none"),
-            )
-        )
-        state["tensor_meta"][id(out)] = _TensorMeta(name=f"{name}::OUT_0", dim=(), stride=(), dtype="fp32")
-    except Exception:  # noqa: BLE001
-        pass
-    return out
+        for node in graph.nodes:
+            if node.node_type.name in ("MATMUL", "MOE_GROUPED_MATMUL"):
+                return True
+    except Exception:  # noqa: BLE001 — a probe must never break the native path
+        return False
+    return False
 
 
-def _patched_reduction(self, *args, **kwargs):
-    out = _ORIGINALS["reduction"](self, *args, **kwargs)
-    try:
-        b = _bind(args, kwargs, ("input", "mode"))
-        mode = b.get("mode")
-        name = b.get("name", "")
-        group_offset = b.get("group_offset")
-        state = _ensure_state(self)
-        # Record every reduction (mode → literal, or None if unsupported). Reject
-        # unsupported modes later in analyze() so a non-GEMM graph still builds.
-        state["ops"].append(
-            _RecordedOp(
-                "reduction",
-                name,
-                [id(b["input"])],
-                id(out),
-                out,
-                compute_dtype=_opt_compute_dtype(kwargs),
-                reduction_mode=_REDUCTION_MODE_FROM_CUDNN.get(mode),
-                group_offset=(id(group_offset) if group_offset is not None else None),
-            )
-        )
-        state["tensor_meta"][id(out)] = _TensorMeta(name=f"{name}::OUT_0", dim=(), stride=(), dtype="fp32")
-    except Exception:  # noqa: BLE001
-        pass
-    return out
-
-
-def _make_unary_patch(cudnn_name: str):
-    def patched(self, *args, **kwargs):
-        out = _ORIGINALS[cudnn_name](self, *args, **kwargs)
-        try:
-            b = _bind(args, kwargs, ("input",))
-            name = b.get("name", "")
-            state = _ensure_state(self)
-            state["ops"].append(
-                _RecordedOp(
-                    cudnn_name,
-                    name,
-                    [id(b["input"])],
-                    id(out),
-                    out,
-                    compute_dtype=_opt_compute_dtype(kwargs),
-                )
-            )
-            state["tensor_meta"][id(out)] = _TensorMeta(name=f"{name}::OUT_0", dim=(), stride=(), dtype="fp32")
-        except Exception:  # noqa: BLE001
-            pass
-        return out
-
-    return patched
-
-
-def _make_binary_patch(cudnn_name: str, *, a_kw: str = "a", b_kw: str = "b"):
-    def patched(self, *args, **kwargs):
-        out = _ORIGINALS[cudnn_name](self, *args, **kwargs)
-        try:
-            bnd = _bind(args, kwargs, (a_kw, b_kw))
-            name = bnd.get("name", "")
-            state = _ensure_state(self)
-            state["ops"].append(
-                _RecordedOp(
-                    cudnn_name,
-                    name,
-                    [id(bnd[a_kw]), id(bnd[b_kw])],
-                    id(out),
-                    out,
-                    compute_dtype=_opt_compute_dtype(kwargs),
-                )
-            )
-            state["tensor_meta"][id(out)] = _TensorMeta(name=f"{name}::OUT_0", dim=(), stride=(), dtype="fp32")
-        except Exception:  # noqa: BLE001
-            pass
-        return out
-
-    return patched
-
-
-def _patched_tensor_set_output(self, val):
-    _TENSOR_OUTPUT_FLAG[id(self)] = bool(val)
-    return _ORIGINALS["tensor.set_output"](self, val)
-
-
-def _patched_tensor_set_data_type(self, dt):
-    _TENSOR_EXPLICIT_DTYPE[id(self)] = dt
-    return _ORIGINALS["tensor.set_data_type"](self, dt)
-
-
-def _patched_tensor_set_dim(self, dim):
-    _TENSOR_DIM_OVERRIDE[id(self)] = tuple(dim)
-    return _ORIGINALS["tensor.set_dim"](self, dim)
-
-
-def _patched_tensor_set_reordering_type(self, rt):
-    _TENSOR_REORDERING_OVERRIDE[id(self)] = rt.name if getattr(rt, "name", "NONE") != "NONE" else None
-    return _ORIGINALS["tensor.set_reordering_type"](self, rt)
-
-
-# GEMM engine ("frost_eng0"), registered with the shared cudnn.frost dispatch (see
+# GEMM engine ("frost_gemm_eng0"), registered with the shared cudnn.frost dispatch (see
 # cudnn/frost/heuristics.py). probe_gemm_plan = eligibility (no compile);
 # build_gemm_plan = JIT when selected. Forced-config callers use jit_from_cudnn_graph.
 
@@ -606,9 +489,8 @@ def _patched_tensor_set_reordering_type(self, rt):
 def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
     """Cheap eligibility check for the GEMM engine (analyze + support gates, NO
     ``cute.compile``). Never raises (a probe must not break the native path)."""
-    state = _get_state(graph)
-    if state is None or not state.get("ops"):
-        return False  # not recorded by the hook → not a GEMM candidate
+    if not _graph_has_gemm(graph):
+        return False
     from .compiler import probe_supported
 
     try:
@@ -625,84 +507,18 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
 
 
 def build_gemm_plan(graph: cudnn.pygraph):
-    """Analyze + JIT the recorded graph into a compiled GEMM plan.
+    """Analyze + JIT the graph into a compiled GEMM plan.
 
     Returns a callable :class:`CompiledFusedGemm`; raises ``NotImplementedError`` /
-    ``ValueError`` (type + message preserved) on rejection, or ``ValueError`` if
-    the graph was never recorded (import-order error)."""
-    state = _get_state(graph)
-    if state is None or not state.get("ops"):
-        raise ValueError(
-            "cudnn.frost.gemm: this graph has no recorded ops — import "
-            "cudnn.frost.gemm BEFORE constructing the graph so the recorder hook "
-            "is installed before g = cudnn.pygraph(...). The op chain cannot be "
-            "reconstructed after the fact."
-        )
+    ``ValueError`` (type + message preserved) on rejection."""
+    if not _graph_has_gemm(graph):
+        raise ValueError("cudnn.frost.gemm: graph has no matmul / moe_grouped_matmul node; nothing to compile")
     from .compiler import jit_from_cudnn_graph
     from .tile_config import select_config
 
     chain = analyze(graph)
     config, cta_group, scheduler = select_config(chain.matmul.M, chain.matmul.N, chain.num_gemms)
     return jit_from_cudnn_graph(graph, config=config, cta_group=cta_group, scheduler=scheduler)
-
-
-def install_recorder() -> None:
-    """Monkey-patch ``cudnn.pygraph`` to record op chains. Idempotent."""
-    global _INSTALLED
-    if _INSTALLED:
-        return
-
-    _ORIGINALS["__init__"] = cudnn.pygraph.__init__
-    _ORIGINALS["tensor"] = cudnn.pygraph.tensor
-    _ORIGINALS["matmul"] = cudnn.pygraph.matmul
-    _ORIGINALS["block_scale_dequantize"] = cudnn.pygraph.block_scale_dequantize
-    _ORIGINALS["block_scale_quantize"] = cudnn.pygraph.block_scale_quantize
-    _ORIGINALS["moe_grouped_matmul"] = cudnn.pygraph.moe_grouped_matmul
-    _ORIGINALS["reduction"] = cudnn.pygraph.reduction
-    cudnn.pygraph.__init__ = _patched_init
-    cudnn.pygraph.tensor = _patched_tensor
-    cudnn.pygraph.matmul = _patched_matmul
-    cudnn.pygraph.block_scale_dequantize = _patched_block_scale_dequantize
-    cudnn.pygraph.block_scale_quantize = _patched_block_scale_quantize
-    cudnn.pygraph.moe_grouped_matmul = _patched_moe_grouped_matmul
-    cudnn.pygraph.reduction = _patched_reduction
-
-    for cudnn_name in _UNARY_OP_MAP:
-        _ORIGINALS[cudnn_name] = getattr(cudnn.pygraph, cudnn_name)
-        setattr(cudnn.pygraph, cudnn_name, _make_unary_patch(cudnn_name))
-
-    for cudnn_name in _BINARY_OP_MAP:
-        _ORIGINALS[cudnn_name] = getattr(cudnn.pygraph, cudnn_name)
-        if cudnn_name == "bias":
-            setattr(
-                cudnn.pygraph,
-                cudnn_name,
-                _make_binary_patch(cudnn_name, a_kw="input", b_kw="bias"),
-            )
-        elif cudnn_name in {"max", "min", "pow"}:
-            setattr(
-                cudnn.pygraph,
-                cudnn_name,
-                _make_binary_patch(cudnn_name, a_kw="input0", b_kw="input1"),
-            )
-        else:
-            setattr(cudnn.pygraph, cudnn_name, _make_binary_patch(cudnn_name))
-
-    # set_output / set_data_type have no getters, so wrap the setters and stash
-    # the flags in side-tables.
-    from cudnn import _compiled_module as _cudnn_module
-
-    tensor_cls = _cudnn_module.tensor
-    _ORIGINALS["tensor.set_output"] = tensor_cls.set_output
-    _ORIGINALS["tensor.set_data_type"] = tensor_cls.set_data_type
-    _ORIGINALS["tensor.set_dim"] = tensor_cls.set_dim
-    _ORIGINALS["tensor.set_reordering_type"] = tensor_cls.set_reordering_type
-    tensor_cls.set_output = _patched_tensor_set_output
-    tensor_cls.set_data_type = _patched_tensor_set_data_type
-    tensor_cls.set_dim = _patched_tensor_set_dim
-    tensor_cls.set_reordering_type = _patched_tensor_set_reordering_type
-
-    _INSTALLED = True
 
 
 # Analyzer
@@ -2479,20 +2295,17 @@ def analyze_with_binding(
 ) -> "tuple[FusionChain, GemmBinding | None]":
     """Build the FusionChain AND a variant-pack binding (role -> cuDNN tensor).
     See :class:`GemmBinding`."""
-    state = _get_state(graph)
-    if state is None:
-        raise ValueError(
-            "graph has no recorded ops — was cudnn.frost.gemm imported BEFORE the " "graph was built? If not, call cudnn.frost.gemm.install_recorder() first."
+    with _ANALYZE_LOCK:
+        state = _state_from_graph(graph)
+        if not state["ops"]:
+            raise ValueError("graph has no ops; nothing to compile")
+        return _build_chain(
+            state["ops"],
+            state["tensor_meta"],
+            state["io_dtype"],
+            state["intermediate_dtype"],
+            state["compute_dtype"],
         )
-    if not state["ops"]:
-        raise ValueError("graph has no ops; nothing to compile")
-    return _build_chain(
-        state["ops"],
-        state["tensor_meta"],
-        state["io_dtype"],
-        state.get("intermediate_dtype", "fp32"),
-        state.get("compute_dtype", "fp32"),
-    )
 
 
 def analyze(graph: cudnn.pygraph) -> FusionChain:

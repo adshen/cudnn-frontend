@@ -539,13 +539,11 @@ def test_no_tap_when_matmul_is_terminal() -> None:
     assert chain.outputs[0].source == "terminal"
 
 
-def test_analyze_raises_when_no_recording() -> None:
-    """An unrecorded graph gives a clear error (synthesize the missing-state case)."""
-    from cudnn.frost.gemm.graph_analyzer import _GRAPH_STATES
-
+def test_analyze_raises_on_graph_without_ops() -> None:
+    """A graph with tensors but no ops gives a clear error."""
     g = _mk_graph()
-    _GRAPH_STATES.pop(g, None)
-    with pytest.raises(ValueError, match="no recorded ops"):
+    g.tensor(name="A", dim=[1, 128, 64], stride=[128 * 64, 64, 1])
+    with pytest.raises(ValueError, match="no ops"):
         analyze(g)
 
 

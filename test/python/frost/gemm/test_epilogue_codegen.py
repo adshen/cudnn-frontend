@@ -237,6 +237,7 @@ def test_bias_per_row_then_gelu_tanh() -> None:
     # gelu_tanh is whole-vector (tanh via vector exp2/rcp fastmath), no scalar repack.
     assert "cute.math.exp2(" in out.epilogue and "cute.math.rcp(" in out.epilogue
     assert "fastmath=True" in out.epilogue
+    assert "approx=True, ftz=True)" in out.epilogue
     assert "vector_from_scalars(" not in out.epilogue
     assert out.epilogue.endswith("vec_out = (_op_1).to(cutlass.BFloat16)")
     assert out.kernel_params == ["bias: cute.Tensor"]
@@ -283,10 +284,10 @@ def test_rank1_scalar_uses_zero_offset() -> None:
 
 
 def test_swish_chain() -> None:
-    # swish = x * sigmoid(x), emitted as whole-vector exp2/rcp fastmath, no scalar repack.
+    # swish = x * sigmoid(x): whole-vector exp2 fastmath + rcp approx/ftz (MUFU), no scalar repack.
     out = generate(FusionChain(matmul=_mm(), ops=[FusionOp("swish")], output_dtype="bf16"))
     assert "cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True)" in out.epilogue
-    assert "cute.math.rcp(" in out.epilogue
+    assert "approx=True, ftz=True)" in out.epilogue
     assert "vector_from_scalars(" not in out.epilogue
 
 
@@ -297,7 +298,7 @@ def test_swish_chain() -> None:
         ("floor", "_op_0 = cute.math.floor(_c_0_a)"),
         ("erf", "_op_0 = cute.math.erf(_c_0_a)"),
         ("log", "_op_0 = cute.math.log(_c_0_a)"),
-        ("reciprocal", "_op_0 = cute.math.rcp(_c_0_a, fastmath=True)"),
+        ("reciprocal", "_op_0 = cute.math.rcp(_c_0_a, approx=True, ftz=True)"),
         ("rsqrt", "_op_0 = cute.math.rsqrt(_c_0_a)"),
         ("sqrt", "_op_0 = cute.math.sqrt(_c_0_a)"),
     ),

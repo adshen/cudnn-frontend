@@ -1,14 +1,18 @@
 """Example 01: baseline matmul (no fusion) — FROST engine vs native cuDNN.
 
-FROST is a named engine (``frost_eng0``) in ``heur_mode.A``'s plan list, not a
-heuristic mode. Builds the same graph twice: select frost_eng0 (OSS JIT GEMM) vs
+FROST is a named engine (``frost_gemm_eng0``) in ``heur_mode.A``'s plan list, not a
+heuristic mode. Builds the same graph twice: select frost_gemm_eng0 (OSS JIT GEMM) vs
 deselect it (native cuDNN); asserts both match torch.
 """
 
 from __future__ import annotations
 
 import cudnn
-import cudnn.frost.gemm  # noqa: F401  (registers frost_eng0 + installs hook)
+import os
+
+os.environ.setdefault("NV_CUDNN_FE_ENABLE_FROST_ENGINES", "1")
+
+import cudnn.frost.gemm  # noqa: F401  (registers frost_gemm_eng0 + installs hook)
 import torch
 
 
@@ -31,12 +35,12 @@ def main(M: int = 256, N: int = 256, K: int = 128) -> None:
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
 
-    # FROST engine: select frost_eng0 out of heur_mode.A's plan list
+    # FROST engine: select frost_gemm_eng0 out of heur_mode.A's plan list
     g_frost, A, B, C = _build_matmul_graph(M, N, K)
     g_frost.validate()
     g_frost.build_operation_graph()
     g_frost.create_execution_plans([cudnn.heur_mode.A])
-    g_frost.select_engines(["frost_eng0"])
+    g_frost.select_engines(["frost_gemm_eng0"])
     g_frost.check_support()
     g_frost.build_plans()
 
@@ -44,12 +48,12 @@ def main(M: int = 256, N: int = 256, K: int = 128) -> None:
     ws_frost = torch.empty(max(g_frost.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g_frost.execute({A: a, B: b, C: c_frost}, ws_frost)
 
-    # native cuDNN: deselect frost_eng0
+    # native cuDNN: deselect frost_gemm_eng0
     g_ref, A_ref, B_ref, C_ref = _build_matmul_graph(M, N, K)
     g_ref.validate()
     g_ref.build_operation_graph()
     g_ref.create_execution_plans([cudnn.heur_mode.A])
-    g_ref.deselect_engines(["frost_eng0"])
+    g_ref.deselect_engines(["frost_gemm_eng0"])
     g_ref.check_support()
     g_ref.build_plans()
 

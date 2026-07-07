@@ -1048,7 +1048,7 @@ def _render_template(
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
-    src = re.sub(r"\b_kernel\(", f"_kernel_{tag}(", src)
+    src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
 
     return src
 
@@ -1229,7 +1229,7 @@ def _render_block_scale_template(
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
-    src = re.sub(r"\b_kernel\(", f"_kernel_{tag}(", src)
+    src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
     return src
 
 
@@ -1916,7 +1916,7 @@ def probe_supported(
 ) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT
     ``cute.compile``. Raises if the engine can't run the graph. Used by the FROST
-    engine probe to decide whether to list ``frost_eng0`` (see cudnn.frost.heuristics).
+    engine probe to decide whether to list ``frost_gemm_eng0`` (see cudnn.frost.heuristics).
 
     Block-scale / MoE gate inside their ``_jit_*`` compile paths; here a
     successful analysis is treated as eligible (full validation at compile)."""

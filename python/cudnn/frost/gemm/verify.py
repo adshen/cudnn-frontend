@@ -29,7 +29,7 @@ from xml.etree import ElementTree
 _THIS_FILE = Path(__file__).resolve()
 # parents[4] = cudnn-frontend root; tests/examples under test/python/frost/gemm/.
 _REPO_ROOT = _THIS_FILE.parents[4]
-_TESTS_DIR = _REPO_ROOT / "test" / "python" / "FROST" / "gemm"
+_TESTS_DIR = _REPO_ROOT / "test" / "python" / "frost" / "gemm"
 _EXAMPLES_DIR = _TESTS_DIR / "examples"
 
 

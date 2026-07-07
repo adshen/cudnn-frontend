@@ -1,7 +1,7 @@
 """Benchmark block-scale-compatible CATALOG configs on one shape (default nvfp4
 in / BF16 out) vs a reference. Perf only, no CPU verify.
 
-    python cudnn.frost.gemm/benchmarks/benchmark_block_scale_matmul.py
+    python benchmark/frost/gemm/benchmark_block_scale_matmul.py
 """
 
 from __future__ import annotations

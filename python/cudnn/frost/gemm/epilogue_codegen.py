@@ -127,7 +127,7 @@ def _tanh_expr(v: str) -> str:
     one = f"cutlass.full_like({v}, cutlass.Float32(1.0))"
     two = f"cutlass.full_like({v}, cutlass.Float32(2.0))"
     e2 = f"cute.math.exp2({v} * cutlass.full_like({v}, {_TWO_LOG2E}), fastmath=True)"
-    return f"({one} - {two} * cute.math.rcp({e2} + {one}, fastmath=True))"
+    return f"({one} - {two} * cute.math.rcp({e2} + {one}, approx=True, ftz=True))"
 
 
 def _emit_op(
@@ -180,7 +180,7 @@ def _emit_op(
         return [f"{new} = cute.math.log({prev})"], new
 
     if op.op == "reciprocal":
-        return [f"{new} = cute.math.rcp({prev}, fastmath=True)"], new
+        return [f"{new} = cute.math.rcp({prev}, approx=True, ftz=True)"], new
 
     if op.op == "rsqrt":
         return [f"{new} = cute.math.rsqrt({prev})"], new
@@ -192,14 +192,14 @@ def _emit_op(
         # sigmoid(x) = 1/(1+exp(-x)) — vector exp2.approx + rcp.approx (MUFU).
         return [
             f"{new} = cute.math.rcp(cutlass.full_like({prev}, cutlass.Float32(1.0)) + "
-            f"cute.math.exp2(-{prev} * cutlass.full_like({prev}, {_LOG2E}), fastmath=True), fastmath=True)"
+            f"cute.math.exp2(-{prev} * cutlass.full_like({prev}, {_LOG2E}), fastmath=True), approx=True, ftz=True)"
         ], new
 
     if op.op == "swish":
         # swish/SiLU = x * sigmoid(x).
         return [
             f"{new} = {prev} * cute.math.rcp(cutlass.full_like({prev}, cutlass.Float32(1.0)) + "
-            f"cute.math.exp2(-{prev} * cutlass.full_like({prev}, {_LOG2E}), fastmath=True), fastmath=True)"
+            f"cute.math.exp2(-{prev} * cutlass.full_like({prev}, {_LOG2E}), fastmath=True), approx=True, ftz=True)"
         ], new
 
     if op.op == "gelu_tanh":

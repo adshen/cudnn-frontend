@@ -1,22 +1,35 @@
 """Shared FROST engine dispatch for the ``cudnn.frost`` OSS engines.
 
-FROST engines are named engines appended (by name, e.g. GEMM = ``frost_eng0``) to the
+FROST engines are named engines appended (by name, e.g. GEMM = ``frost_gemm_eng0``) to the
 plan list produced by the native cuDNN heuristics; the default stays cuDNN and
-the user pins FROST via ``select_engines(["frost_eng0"])`` (drop via
+the user pins FROST via ``select_engines(["frost_gemm_eng0"])`` (drop via
 ``deselect_engines``). Implemented as a named-engine registry + per-graph shadow
 plan-state layered over the native ``cudnn.pygraph`` lifecycle. Pure Python — the
 C++ side is untouched.
+
+FROST engines are OFF by default; set ``NV_CUDNN_FE_ENABLE_FROST_ENGINES=1`` to
+enable them (see :func:`frost_engines_enabled`).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import weakref
 from typing import Any, Callable
 
 import cudnn
 
 _LOG = logging.getLogger(__name__)
+
+# FROST engines are OFF by default; opt in via this env var.
+_ENABLE_ENV = "NV_CUDNN_FE_ENABLE_FROST_ENGINES"
+
+
+def frost_engines_enabled() -> bool:
+    """Whether FROST engines are enabled (env ``NV_CUDNN_FE_ENABLE_FROST_ENGINES``;
+    default off). Read live so it can be toggled per process / test."""
+    return os.environ.get(_ENABLE_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -30,8 +43,8 @@ _ENGINES: "dict[str, tuple[Callable[[Any], bool], Callable[[Any], Any]]]" = {}
 
 
 def register_engine(name: str, probe: Callable[[Any], bool], build: Callable[[Any], Any]) -> None:
-    """Register a named FROST engine (idempotent). ``name`` (``frost_eng<N>``) is what
-    ``select_engines`` / ``deselect_engines`` match."""
+    """Register a named FROST engine (idempotent). ``name`` (``frost_<op>_eng<N>``,
+    e.g. ``frost_gemm_eng0``) is what ``select_engines`` / ``deselect_engines`` match."""
     _ENGINES[name] = (probe, build)
 
 
@@ -90,6 +103,8 @@ def _probe_and_append(graph: cudnn.pygraph) -> None:
     """Probe every registered FROST engine and record the eligible ones (no compile)."""
     state = _plan_state(graph)
     state["eligible"] = []
+    if not frost_engines_enabled():
+        return
     for name, (probe, _build) in _ENGINES.items():
         try:
             ok = probe(graph)

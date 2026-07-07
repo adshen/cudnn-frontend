@@ -7,6 +7,7 @@ via :func:`register_engine`; the user pins one via ``select_engines``.
 
 from .heuristics import (
     engine_names,
+    frost_engines_enabled,
     install_lifecycle_patches,
     is_frost_engine,
     register_engine,
@@ -19,4 +20,5 @@ __all__ = [
     "engine_names",
     "is_frost_engine",
     "install_lifecycle_patches",
+    "frost_engines_enabled",
 ]
