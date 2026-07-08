@@ -8,6 +8,8 @@ import pytest
 
 from cudnn.frost.gemm.graph_analyzer import analyze
 
+pytestmark = pytest.mark.L0
+
 
 def _mk_graph() -> cudnn.pygraph:
     return cudnn.pygraph(

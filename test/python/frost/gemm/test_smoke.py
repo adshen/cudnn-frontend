@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+pytestmark = [pytest.mark.L0, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")]
 
 
 _EXAMPLES = Path(__file__).resolve().parent / "examples"

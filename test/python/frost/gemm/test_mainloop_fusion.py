@@ -18,6 +18,8 @@ from cudnn.frost.gemm.epilogue_codegen import generate_mainloop
 from cudnn.frost.gemm.graph_analyzer import analyze, analyze_with_binding
 from cudnn.frost.gemm.tile_config import by_name
 
+pytestmark = pytest.mark.L0
+
 
 def _vp(g, a, b, outs, *aux):
     """Variant-pack dict keyed by the graph's tensors (binding from the public analyzer)."""

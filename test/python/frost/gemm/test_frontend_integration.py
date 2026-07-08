@@ -12,6 +12,8 @@ import cudnn.frost.gemm  # noqa: F401  (registers frost_gemm_eng0 + installs lif
 from cudnn.frost import engine_names, is_frost_engine
 from cudnn.frost.heuristics import _get_plan_state
 
+pytestmark = pytest.mark.L0
+
 _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
 M, N, K = 256, 256, 128

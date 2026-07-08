@@ -13,6 +13,8 @@ from cudnn.frost.gemm.epilogue_codegen import generate
 from cudnn.frost.gemm.graph_analyzer import analyze
 from cudnn.frost.gemm.tile_config import CATALOG, DEFAULT_CONFIG, by_name
 
+pytestmark = pytest.mark.L0
+
 
 class _Plan:
     """JIT-compiles a recorded graph with a forced tile config; callable with a variant pack."""

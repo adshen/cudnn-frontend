@@ -12,6 +12,8 @@ from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
 from cudnn.frost.gemm.graph_analyzer import analyze, analyze_with_binding
 from cudnn.frost.gemm.tile_config import by_name
 
+pytestmark = pytest.mark.L0
+
 
 def _mkdata(M: int, N: int, K: int, B: int = 1):
     torch.manual_seed(0)

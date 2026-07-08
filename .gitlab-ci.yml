@@ -154,6 +154,7 @@ stages:
     - cpp_samples
     - oss_tests
     - cpp_tests
+    - frost_tests
     - python_samples
     - python_tests
     - mha_v1_tests
@@ -383,6 +384,22 @@ backend:dev:
     stage: backend_triggers
     needs: []
     interruptible: true
+
+
+# ==============================================================================
+# Frost engine test
+# ==============================================================================
+
+frost_engine_test:
+    stage: frost_tests
+    extends:
+        - .default_job_template
+        - .cudnn_dev_image:template
+        - .fetch_cudnn_dev:template
+    tags: ["Blackwell"]
+    needs: ["build:dev"]
+    script:
+        - ci/run_frost_engine_tests.sh
 
 # ==============================================================================
 # Slack Notification

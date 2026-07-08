@@ -18,7 +18,7 @@ import pytest
 import torch
 
 # Module-wide GPU gate — every test here is end-to-end and needs a B200.
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+pytestmark = [pytest.mark.L0, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")]
 
 
 import cudnn

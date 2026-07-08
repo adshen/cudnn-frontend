@@ -26,6 +26,8 @@ from cudnn.frost.gemm.kernel_registry import (
 )
 from cudnn.frost.gemm.tile_config import CATALOG, DEFAULT_CONFIG, by_name
 
+pytestmark = pytest.mark.L0
+
 
 def _matmul_chain(dtype: str = "bf16") -> FusionChain:
     return FusionChain(

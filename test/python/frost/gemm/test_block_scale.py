@@ -14,6 +14,8 @@ import re
 
 from cudnn.frost.gemm.tile_config import by_name
 
+pytestmark = pytest.mark.L0
+
 
 class _Plan:
     """JIT-compiles a recorded graph with a forced tile config (sweeps pin a

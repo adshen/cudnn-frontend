@@ -21,6 +21,8 @@ from test_block_scale import (
     _reduction_ref,
 )
 
+pytestmark = pytest.mark.L0
+
 
 class _Plan:
     """JIT-compiles a recorded graph with a forced tile config (sweeps pin a

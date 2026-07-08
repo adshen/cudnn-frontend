@@ -14,6 +14,8 @@ from cudnn.frost.gemm.fusion_ir import (
     UNARY_OPS,
 )
 
+pytestmark = pytest.mark.L0
+
 
 def _mm(M=128, N=128, K=64) -> MatmulSpec:
     return MatmulSpec(M=M, N=N, K=K, batch=1, a_dtype="bf16", b_dtype="bf16", accum_dtype="fp32")

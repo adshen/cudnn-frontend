@@ -14,7 +14,7 @@ import torch
 from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
 from cudnn.frost.gemm.tile_config import CATALOG
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+pytestmark = [pytest.mark.L0, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")]
 
 
 class _Plan:

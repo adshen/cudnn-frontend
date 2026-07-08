@@ -10,6 +10,8 @@ import pytest
 
 from cudnn.frost.gemm.tile_config import CATALOG, DEFAULT_CONFIG, TileConfig, by_name
 
+pytestmark = pytest.mark.L0
+
 
 def _mk(N: int) -> TileConfig:
     """A pure-geometry TileConfig with the requested tile N."""

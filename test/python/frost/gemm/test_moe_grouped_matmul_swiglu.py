@@ -12,6 +12,8 @@ from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
 from cudnn.frost.gemm.graph_analyzer import analyze
 from cudnn.frost.gemm.tile_config import CATALOG
 
+pytestmark = pytest.mark.L0
+
 
 class _Plan:
     """JIT-compiles a recorded graph with a forced tile config; callable with a variant pack."""

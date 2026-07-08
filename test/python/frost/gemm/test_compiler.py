@@ -24,6 +24,8 @@ from cudnn.frost.gemm.fusion_ir import (
 )
 from cudnn.frost.gemm.kernel_registry import MMA_TYPE_SUPPORT, GraphType
 
+pytestmark = pytest.mark.L0
+
 # Plain-matmul mma-type table (dict half of the unified support entry).
 _MATMUL_MMA_TABLE = MMA_TYPE_SUPPORT[GraphType.MATMUL][1]
 from cudnn.frost.gemm.tile_config import DEFAULT_CONFIG, by_name
