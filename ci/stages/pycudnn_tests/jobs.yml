@@ -1,0 +1,22 @@
+.pycudnntest:template:
+  stage: pycudnnTest
+  script:
+    - ci/stages/pycudnn_tests/run_pycudnntest.sh
+
+pycudnn:dev:
+  extends:
+    - .default_job_template
+    - .device_matrix:template
+    - .cudnn_dev_image:template
+    - .fetch_cudnn_dev:template
+    - .pycudnntest:template
+  needs: ["build:dev"]
+
+pycudnn:rel:
+  extends:
+    - .default_job_template
+    - .device_matrix:template
+    - .cudnn_rel_image:template
+    - .fetch_cudnn_rel:template
+    - .pycudnntest:template
+  needs: ["build:rel"]

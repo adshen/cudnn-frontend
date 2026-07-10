@@ -1,11 +1,12 @@
 deploy:build_bdist_wheels:
-    image: gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:pip_wheels_cuda_13.3_cudnn_9.24.0
+    extends:
+        - .pip_wheel_builder_image:template
     tags:
         - wheel_builder
     needs: []
     stage: deploy
     script:
-        - ci/build_pip_wheels.sh
+        - ci/stages/deploy/build_pip_wheels.sh
     rules:
         - if: $CI_PIPELINE_SOURCE == "schedule"
     artifacts:

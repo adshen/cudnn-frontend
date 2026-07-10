@@ -1,0 +1,10 @@
+frost_engine_test:
+  stage: frost_tests
+  extends:
+    - .default_job_template
+    - .cudnn_dev_image:template
+    - .fetch_cudnn_dev:template
+  tags: ["Blackwell"]
+  needs: ["build:dev"]
+  script:
+    - ci/stages/frost_tests/run_frost_engine_tests.sh

@@ -1,0 +1,22 @@
+.python_tests:template:
+  stage: python_tests
+  script:
+    - ci/stages/python_tests/run_python_tests.sh
+
+py_test:dev:
+  extends:
+    - .default_job_template
+    - .device_matrix:template
+    - .cudnn_dev_image:template
+    - .fetch_cudnn_dev:template
+    - .python_tests:template
+  needs: ["build:dev"]
+
+py_test:rel:
+  extends:
+    - .default_job_template
+    - .device_matrix:template
+    - .cudnn_rel_image:template
+    - .fetch_cudnn_rel:template
+    - .python_tests:template
+  needs: ["build:rel"]

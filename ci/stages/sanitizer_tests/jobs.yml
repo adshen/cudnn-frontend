@@ -1,0 +1,37 @@
+.sanitizer_env:template:
+  variables:
+    ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:print_stacktrace=1:protect_shadow_gap=0"
+    LSAN_OPTIONS: "suppressions=$CI_PROJECT_DIR/ci/stages/sanitizer_tests/sanitizer_suppressions.txt:print_suppressions=0"
+    UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+
+build:san:
+  needs: []
+  stage: analysis
+  script:
+    - ci/stages/sanitizer_tests/build_sanitizer.sh
+  tags:
+    - Blackwell
+  artifacts:
+    paths:
+      - build/
+  extends:
+    - .default_job_template
+    - .cudnn_dev_image:template
+    - .fetch_cudnn_dev:template
+
+# Python sanitizer tests are skipped: ASan must be the first library loaded
+# in the process, but the Python interpreter isn't built with ASan. This is a
+# known pybind11+ASan incompatibility (https://github.com/pybind/pybind11/issues/3655).
+# The C++ tests provide sanitizer coverage for the same underlying code.
+
+cpp_test:san:
+  stage: sanitizer_tests
+  extends:
+    - .default_job_template
+    - .device_matrix:template
+    - .cudnn_dev_image:template
+    - .fetch_cudnn_dev:template
+    - .sanitizer_env:template
+  script:
+    - ci/stages/sanitizer_tests/run_cpp_tests.sh
+  needs: ["build:san"]

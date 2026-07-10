@@ -1,0 +1,30 @@
+.python_samples:template:
+  stage: python_samples
+  script:
+    - pip install -v .
+    - ci/stages/python_samples/run_python_samples.sh
+
+py_samples:rel:
+  parallel:
+    matrix:
+      - ARCH: ["Hopper", "Ampere", "Blackwell"]
+  tags:
+    - ${ARCH}
+  extends:
+    - .default_job_template
+    - .python_samples:template
+    - .cudnn_rel_image:template
+    - .fetch_cudnn_rel:template
+  needs: []
+
+py_samples:ga:
+  parallel:
+    matrix:
+      - ARCH: ["Hopper", "Ampere", "Blackwell"]
+  tags:
+    - ${ARCH}
+  extends:
+    - .default_job_template
+    - .python_samples:template
+    - .cudnn_ga_image:template
+  needs: []

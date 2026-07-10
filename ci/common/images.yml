@@ -1,0 +1,17 @@
+.cudnn_dev_image:template:
+  image: gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_13.3.0
+
+.cudnn_rel_image:template:
+  image: gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_13.3.0
+
+.cudnn_ga_image:template:
+  image: gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.24.0.43_13.3.0
+
+.pip_wheel_builder_image:template:
+  image: gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:pip_wheels_cuda_13.3_cudnn_9.24.0
+
+.cuda_12_1_cudnn_8_image:template:
+  image: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+.python_3_12_image:template:
+  image: python:3.12

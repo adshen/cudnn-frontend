@@ -1,0 +1,28 @@
+slack_notification:
+  stage: notify
+  extends:
+    - .cudnn_ga_image:template
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - pip install requests --quiet
+  script:
+    - |
+      curl -s -H "PRIVATE-TOKEN: $GITLAB_ALL_KEY" \
+        "$CI_SERVER_URL/api/v4/projects/$CI_PROJECT_ID/repository/files/ci%2Fstages%2Fnotify%2Fpipeline_slack_notifier.py/raw?ref=$CI_COMMIT_REF_NAME" \
+        -o pipeline_slack_notifier.py
+
+      curl -s -H "PRIVATE-TOKEN: $GITLAB_ALL_KEY" \
+        "$CI_SERVER_URL/api/v4/projects/$CI_PROJECT_ID/repository/files/ci%2Fstages%2Fnotify%2Fgitlab_pipeline_monitor.py/raw?ref=$CI_COMMIT_REF_NAME" \
+        -o gitlab_pipeline_monitor.py
+
+      python pipeline_slack_notifier.py \
+        --bot-token "$CUDNN_FE_SLACK_BOT_TOKEN" \
+        --token "$GITLAB_ALL_KEY" \
+        --channel "#swdl-cudnn-frontend-dev" \
+        --ref "$CI_COMMIT_REF_NAME"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_REF_NAME == "develop"'
+      when: always
+  when: always
+  allow_failure: true

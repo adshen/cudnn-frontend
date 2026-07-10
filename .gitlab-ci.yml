@@ -21,415 +21,49 @@ workflow:
     - when: never
 
 default:
-    interruptible: true
-
-.default_job_template:
-  rules:
-    # CI_MERGE_REQUEST_DRAFT is not available in older GitLab versions (requires 17.10+), commented until GitLab is upgraded
-    # - if: $CI_MERGE_REQUEST_DRAFT == "true"
-    #   when: never
-    # Workaround: Check MR title for draft prefixes (Draft:, WIP:, [WIP])
-    - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
-
-.cudnn_dev_image:template:
-    image: gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_13.3.0
-
-.cudnn_rel_image:template:
-    image: gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_13.3.0
-
-.cudnn_ga_image:template:
-    image: gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_9.24.0.43_13.3.0
-
-.device_matrix:template:
-    parallel:
-        matrix:
-            - ARCH: ["Hopper", "Ampere", "Blackwell"]
-    tags:
-        - ${ARCH}
-
-.fetch_cudnn_dev:template:
-    cache:
-        - key: dev_cudnn_9_26_cuda_13_4
-          paths:
-              - downloads
-    before_script:
-        - mkdir -p downloads
-        - ls -1 downloads/
-        - python3 ci/fetch_cudnn.py --base-url https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/BLOSSOM/v9.26 --cuda-version 13.4 --require-artifact-prop pipeline_type=merge_request
-        - find /debug_cudnn
-        - export CUDNN_PATH=/debug_cudnn # This is required for source building FE
-        - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/debug_cudnn/lib64 # This is required for dlopening BE
-        - export CUDNN_VERSION_=$(ls /debug_cudnn/lib/libcudnn.so.*.*.* | sed 's/.*libcudnn\.so\.//')
-
-.fetch_cudnn_rel:template:
-    cache:
-        - key: rel_cudnn_9_25_cuda_13_4
-          paths:
-              - downloads
-    before_script:
-        - mkdir -p downloads
-        - ls -1 downloads
-        - python3 ci/fetch_cudnn.py --base-url https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/BLOSSOM/v9.25 --cuda-version 13.4 --require-artifact-prop pipeline_type=merge_train
-        - find /debug_cudnn
-        - export CUDNN_PATH=/debug_cudnn # This is required for source building FE
-        - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/debug_cudnn/lib64 # This is required for dlopening BE
-        - export CUDNN_VERSION_=$(ls /debug_cudnn/lib/libcudnn.so.*.*.* | sed 's/.*libcudnn\.so\.//')
-
-.build:template:
-    stage: build
-    script:
-        - ci/build.sh
-    tags:
-        - Blackwell
-    artifacts:
-        paths:
-            - build/
-
-.cpp_samples:template:
-    stage: cpp_samples
-    script:
-        - ci/run_cpp_samples.sh
-
-.oss_tests:template:
-    stage: oss_tests
-    allow_failure: true
-    script:
-        - pip install -v .[cutedsl]
-        - ci/run_test_oss.sh
-
-.python_tests:template:
-    stage: python_tests
-    script:
-        - ci/run_python_tests.sh
-
-# .mha_v1_tests:template:
-#     stage: mha_v1_tests
-#     script:
-#         - ci/run_test_mhas_v1.sh
-
-# .mha_v2_tests:template:
-#     stage: mha_v2_tests
-#     script:
-#         - ci/run_test_mhas_v2.sh
-
-.pycudnntest:template:
-    stage: pycudnnTest
-    script:
-        - ci/run_pycudnntest.sh
-
-# .cpp_tests:template:
-#     stage: cpp_tests
-#     script:
-#         - ci/run_cpp_tests.sh
-
-.python_samples:template:
-    stage: python_samples
-    script:
-        - pip install -v .
-        - ci/run_python_samples.sh
-
-.L4_graph_runner_large:template:
-    stage: L4_graph_runner
-    script:
-        - ci/run_L4_streams.sh
+  interruptible: true
 
 include:
-  - 'ci/build_test_wheels.yml'
-  - 'ci/analysis.yml'
-
-  - local: ci/job-template.yml
+  - local: ci/common/rules.yml
+  - local: ci/common/images.yml
+  - local: ci/common/matrices.yml
+  - local: ci/common/cudnn.yml
+  - local: ci/stages/analysis/jobs.yml
+  - local: ci/stages/build/jobs.yml
+  - local: ci/stages/sanitizer_tests/jobs.yml
+  - local: ci/stages/cpp_samples/jobs.yml
+  - local: ci/stages/oss_tests/jobs.yml
+  - local: ci/stages/frost_tests/jobs.yml
+  - local: ci/stages/python_samples/jobs.yml
+  - local: ci/stages/python_tests/jobs.yml
+  - local: ci/stages/multi_gpu_tests/jobs.yml
+  - local: ci/stages/pycudnn_tests/jobs.yml
+  - local: ci/stages/l4_graph_runner/jobs.yml
+  - local: ci/stages/backend_triggers/jobs.yml
+  - local: ci/stages/deploy/jobs.yml
+  - local: ci/stages/notify/jobs.yml
+  - local: ci/qa_matrix/jobs.yml
     inputs:
-        cuda_version: "13.1.0"
-        cudnn_version: "9.19.0.56"
+      cuda_version: "13.1.0"
+      cudnn_version: "9.19.0.56"
     rules:
-        - if: $CI_PIPELINE_SOURCE == "schedule"
+      - if: $CI_PIPELINE_SOURCE == "schedule"
 
 stages:
-    - analysis
-    - build
-    - sanitizer_tests
-    - cpp_samples
-    - oss_tests
-    - cpp_tests
-    - frost_tests
-    - python_samples
-    - python_tests
-    - mha_v1_tests
-    - mha_v2_tests
-    - backend_triggers
-    - pycudnnTest
-    - L4_graph_runner
-    - deploy
-    - notify
-
-# ==============================================================================
-# Dev builds (cuDNN dev latest)
-# ==============================================================================
-
-build:dev:
-    needs: []
-    extends:
-        - .default_job_template
-        - .cudnn_dev_image:template
-        - .fetch_cudnn_dev:template
-        - .build:template
-
-# cpp_test:dev:
-#     extends:
-#         - .default_job_template
-#         - .device_matrix:template
-#         - .cudnn_dev_image:template
-#         - .fetch_cudnn_dev:template
-#         - .cpp_tests:template
-#     needs: ["build:dev"]
-
-py_test:dev:
-    extends:
-        - .default_job_template
-        - .device_matrix:template
-        - .cudnn_dev_image:template
-        - .fetch_cudnn_dev:template
-        - .python_tests:template
-    needs: ["build:dev"]
-
-# mha_v1:dev:
-#     extends:
-#         - .default_job_template
-#         - .device_matrix:template
-#         - .cudnn_dev_image:template
-#         - .fetch_cudnn_dev:template
-#         - .mha_v1_tests:template
-#     needs: ["build:dev"]
-
-pycudnn:dev:
-    extends:
-        - .default_job_template
-        - .device_matrix:template
-        - .cudnn_dev_image:template
-        - .fetch_cudnn_dev:template
-        - .pycudnntest:template
-    needs: ["build:dev"]
-
-L4:dev:
-    extends:
-        - .device_matrix:template
-        - .cudnn_dev_image:template
-        - .fetch_cudnn_dev:template
-        - .L4_graph_runner_large:template
-    needs: ["build:dev"]
-    rules:
-        - if: $CI_PIPELINE_SOURCE == "schedule"
-
-# ==============================================================================
-# Rel builds (cuDNN release latest)
-# ==============================================================================
-
-build:rel:
-    needs: []
-    extends:
-        - .default_job_template
-        - .cudnn_rel_image:template
-        - .fetch_cudnn_rel:template
-        - .build:template
-
-# cpp_test:rel:
-#     extends:
-#         - .default_job_template
-#         - .device_matrix:template
-#         - .cudnn_rel_image:template
-#         - .fetch_cudnn_rel:template
-#         - .cpp_tests:template
-#     needs: ["build:rel"]
-
-py_test:rel:
-    extends:
-        - .default_job_template
-        - .device_matrix:template
-        - .cudnn_rel_image:template
-        - .fetch_cudnn_rel:template
-        - .python_tests:template
-    needs: ["build:rel"]
-
-# mha_v1:rel:
-#     extends:
-#         - .default_job_template
-#         - .device_matrix:template
-#         - .cudnn_rel_image:template
-#         - .fetch_cudnn_rel:template
-#         - .mha_v1_tests:template
-#     needs: ["build:rel"]
-
-pycudnn:rel:
-    extends:
-        - .default_job_template
-        - .device_matrix:template
-        - .cudnn_rel_image:template
-        - .fetch_cudnn_rel:template
-        - .pycudnntest:template
-    needs: ["build:rel"]
-
-oss:rel:
-    extends:
-        - .default_job_template
-        - .device_matrix:template
-        - .cudnn_rel_image:template
-        - .fetch_cudnn_rel:template
-        - .oss_tests:template
-    needs: []
-
-L4:rel:
-    extends:
-        - .device_matrix:template
-        - .cudnn_rel_image:template
-        - .fetch_cudnn_rel:template
-        - .L4_graph_runner_large:template
-    needs: ["build:rel"]
-    rules:
-        - if: $CI_PIPELINE_SOURCE == "schedule"
-
-# ==============================================================================
-# Other builds
-# ==============================================================================
-
-build:win:
-    tags:
-        - Windows
-    needs: []
-    stage: build
-    script:
-        - $Env:CUDNN_PATH = "C:\Users\Public\Downloads\cudnn-9.18.1.3"
-        - mkdir build
-        - cd build
-        - cmake ../
-        - cmake --build . -j16 --verbose
-    extends:
-        - .default_job_template
-
-py_samples:rel:
-    parallel:
-        matrix:
-            - ARCH: ["Hopper", "Ampere", "Blackwell"]
-    tags:
-        - ${ARCH}
-    extends:
-        - .default_job_template
-        - .python_samples:template
-        - .cudnn_rel_image:template
-        - .fetch_cudnn_rel:template
-    needs: []
-
-py_samples:ga:
-    parallel:
-        matrix:
-            - ARCH: ["Hopper", "Ampere", "Blackwell"]
-    tags:
-        - ${ARCH}
-    extends:
-        - .default_job_template
-        - .python_samples:template
-        - .cudnn_ga_image:template
-    needs: []
-
-# ==============================================================================
-# Backend trigger jobs
-# ==============================================================================
-
-backend:rel:
-    trigger:
-        project:  cudnn/cudnn
-        branch:   release/9.25.0
-        strategy: depend
-    inherit:
-        variables: false
-    variables:
-        CI_CUDNN_FRONTEND_REF_NAME: $CI_COMMIT_REF_NAME
-        CI_CUDNN_FRONTEND_COMMIT_SHA: $CI_COMMIT_SHA
-        CI_CUDNN_FRONTEND_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
-    rules:
-        - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
-          when: never
-        - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
-          variables:
-              CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-        - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
-          variables:
-              CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_COMMIT_REF_NAME
-    stage: backend_triggers
-    needs: []
-    interruptible: true
-
-backend:dev:
-    trigger:
-        project:  cudnn/cudnn
-        branch:   dev
-        strategy: depend
-    inherit:
-        variables: false
-    variables:
-        CI_CUDNN_FRONTEND_REF_NAME: $CI_COMMIT_REF_NAME
-        CI_CUDNN_FRONTEND_COMMIT_SHA: $CI_COMMIT_SHA
-        CI_CUDNN_FRONTEND_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
-    rules:
-        - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
-          when: never
-        - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
-          variables:
-              CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-        - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
-          variables:
-              CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_COMMIT_REF_NAME
-    stage: backend_triggers
-    needs: []
-    interruptible: true
-
-
-# ==============================================================================
-# Frost engine test
-# ==============================================================================
-
-frost_engine_test:
-    stage: frost_tests
-    extends:
-        - .default_job_template
-        - .cudnn_dev_image:template
-        - .fetch_cudnn_dev:template
-    tags: ["Blackwell"]
-    needs: ["build:dev"]
-    script:
-        - ci/run_frost_engine_tests.sh
-
-# ==============================================================================
-# Slack Notification
-# ==============================================================================
-
-slack_notification:
-    stage: notify
-    extends:
-        - .cudnn_ga_image:template
-    variables:
-        GIT_STRATEGY: none
-    before_script:
-        - pip install requests --quiet
-    script:
-        - |
-          curl -s -H "PRIVATE-TOKEN: $GITLAB_ALL_KEY" \
-            "$CI_SERVER_URL/api/v4/projects/$CI_PROJECT_ID/repository/files/ci%2Fscripts%2Fpipeline_slack_notifier.py/raw?ref=$CI_COMMIT_REF_NAME" \
-            -o pipeline_slack_notifier.py
-
-          curl -s -H "PRIVATE-TOKEN: $GITLAB_ALL_KEY" \
-            "$CI_SERVER_URL/api/v4/projects/$CI_PROJECT_ID/repository/files/ci%2Fscripts%2Fgitlab_pipeline_monitor.py/raw?ref=$CI_COMMIT_REF_NAME" \
-            -o gitlab_pipeline_monitor.py
-
-          python pipeline_slack_notifier.py \
-            --bot-token "$CUDNN_FE_SLACK_BOT_TOKEN" \
-            --token "$GITLAB_ALL_KEY" \
-            --channel "#swdl-cudnn-frontend-dev" \
-            --ref "$CI_COMMIT_REF_NAME"
-    rules:
-        - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_REF_NAME == "develop"'
-          when: always
-    when: always
-    allow_failure: true
+  - analysis
+  - build
+  - sanitizer_tests
+  - cpp_samples
+  - oss_tests
+  - cpp_tests
+  - frost_tests
+  - python_samples
+  - python_tests
+  - multi-gpu-run
+  - mha_v1_tests
+  - mha_v2_tests
+  - backend_triggers
+  - pycudnnTest
+  - L4_graph_runner
+  - deploy
+  - notify

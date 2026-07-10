@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-input_file="./ci/L4_testlist.txt"
+input_file="./ci/stages/l4_graph_runner/L4_testlist.txt"
 total_lines=$(wc -l < "$input_file")
 stream_group_size=16
 

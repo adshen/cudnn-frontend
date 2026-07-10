@@ -1,0 +1,4 @@
+.cpp_samples:template:
+  stage: cpp_samples
+  script:
+    - ci/stages/cpp_samples/run_cpp_samples.sh

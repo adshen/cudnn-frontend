@@ -45,7 +45,6 @@ analysis:cudnn_clang:
         - .analysis_job_template
 
 analysis:check-relative-includes:
-    image: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
     stage: analysis
     script:
         - echo "#include \"$CI_PROJECT_DIR/include/cudnn_frontend.h\"" > test_build.cpp
@@ -53,11 +52,12 @@ analysis:check-relative-includes:
         - g++ -o test_build test_build.cpp -std=c++17 -I/usr/local/cuda/include/ -L/usr/lib/x86_64-linux-gnu/ -lcudnn
     extends:
         - .analysis_job_template
+        - .cuda_12_1_cudnn_8_image:template
 
 analysis:check-CUDNN_FRONTEND_SKIP_JSON_LIB:
     stage: analysis
     script:
-        - ci/build_wo_json.sh
+        - ci/stages/analysis/build_wo_json.sh
     extends:
         - .analysis_job_template
 
@@ -65,7 +65,7 @@ analysis:clang-format:
     stage: analysis
     allow_failure: true
     script:
-        - ci/run_style_check_diff.sh
+        - ci/stages/analysis/run_style_check_diff.sh
     extends:
         - .analysis_job_template
 
@@ -89,55 +89,12 @@ analysis:guardwords_scan:
 analysis:github-file-sync:
     needs: []
     stage: analysis
-    image: python:3.12
     tags:
         - Blackwell
     rules:
         - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "develop"'
     script:
-        - python3 ci/check_github_file_sync.py
+        - python3 ci/stages/analysis/check_github_file_sync.py
     extends:
         - .default_job_template
-
-# ==============================================================================
-# Sanitizer (ASan + UBSan) Jobs
-# Build once, then run all test suites with sanitizer-instrumented binaries.
-# ==============================================================================
-
-.sanitizer_env:template:
-    variables:
-        ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:print_stacktrace=1:protect_shadow_gap=0"
-        LSAN_OPTIONS: "suppressions=$CI_PROJECT_DIR/ci/sanitizer_suppressions.txt:print_suppressions=0"
-        UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
-
-build:san:
-    needs: []
-    stage: analysis
-    script:
-        - ci/build_sanitizer.sh
-    tags:
-        - Blackwell
-    artifacts:
-        paths:
-            - build/
-    extends:
-        - .default_job_template
-        - .cudnn_dev_image:template
-        - .fetch_cudnn_dev:template
-
-# Python sanitizer tests are skipped: ASan must be the first library loaded
-# in the process, but the Python interpreter isn't built with ASan. This is a
-# known pybind11+ASan incompatibility (https://github.com/pybind/pybind11/issues/3655).
-# The C++ tests provide sanitizer coverage for the same underlying code.
-
-cpp_test:san:
-    stage: sanitizer_tests
-    extends:
-        - .default_job_template
-        - .device_matrix:template
-        - .cudnn_dev_image:template
-        - .fetch_cudnn_dev:template
-        - .sanitizer_env:template
-    script:
-        - ci/run_cpp_tests.sh
-    needs: ["build:san"]
+        - .python_3_12_image:template

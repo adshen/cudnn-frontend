@@ -1,0 +1,39 @@
+.build:template:
+  stage: build
+  script:
+    - ci/stages/build/build.sh
+  tags:
+    - Blackwell
+  artifacts:
+    paths:
+      - build/
+
+build:dev:
+  needs: []
+  extends:
+    - .default_job_template
+    - .cudnn_dev_image:template
+    - .fetch_cudnn_dev:template
+    - .build:template
+
+build:rel:
+  needs: []
+  extends:
+    - .default_job_template
+    - .cudnn_rel_image:template
+    - .fetch_cudnn_rel:template
+    - .build:template
+
+build:win:
+  tags:
+    - Windows
+  needs: []
+  stage: build
+  script:
+    - $Env:CUDNN_PATH = "C:\Users\Public\Downloads\cudnn-9.18.1.3"
+    - mkdir build
+    - cd build
+    - cmake ../
+    - cmake --build . -j16 --verbose
+  extends:
+    - .default_job_template

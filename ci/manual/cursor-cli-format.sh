@@ -4,7 +4,7 @@
 #   curl https://cursor.com/install -fsSL | bash
 #
 # Usage:
-#   ./ci/cursor-cli-format.sh ci/cursor-cli-format-py.txt
+#   ./ci/manual/cursor-cli-format.sh ci/manual/cursor-cli-format-py.txt
 #
 
 if [ -z "$1" ]; then

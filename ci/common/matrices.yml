@@ -1,0 +1,6 @@
+.device_matrix:template:
+  parallel:
+    matrix:
+      - ARCH: ["Hopper", "Ampere", "Blackwell"]
+  tags:
+    - ${ARCH}

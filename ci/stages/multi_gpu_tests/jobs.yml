@@ -1,0 +1,111 @@
+# ==============================================================================
+# Multi-GPU tests on SLURM pre-clusters (sybil run-as-user runners, srun +
+# enroot/pyxis). Modeled on dl/flashinfer/flashinfer-ci `.test_on_cluster`.
+#
+# Runner: project runner tagged `lyris`
+# (https://gitlab-master.nvidia.com/cudnn/cudnn_frontend/-/runners/1277767).
+# The sybil executor runs this job ON THE CLUSTER LOGIN NODE as the user who
+# triggered the pipeline. That user must be onboarded to the cluster:
+# unix account + SLURM account (lyris-coreai_libraries_cudnn DL) + kerberos.
+#
+# Lyris nodes are GB200 (aarch64 Grace, 4 GPUs per node) -> 8 GPUs = 2 nodes.
+# The project's x86-only registry images cannot run there; we use the
+# multi-arch nvcr.io/nvidia/pytorch base (same DLFW base the GA image builds
+# from), which ships torch + cuDNN on both architectures.
+# ==============================================================================
+
+.multi_gpu_cluster:template:
+    stage: multi-gpu-run
+    needs: []
+    allow_failure: true          # infra-proving phase; must not block MRs
+    timeout: 1h
+    retry:
+        max: 1
+        when:
+            - runner_system_failure
+            - stuck_or_timeout_failure
+    variables:
+        GIT_STRATEGY: clone
+        GIT_DEPTH: 20
+        SLURM_ACCOUNT: "coreai_libraries_cudnn"
+        SLURM_NODES: 1
+        GPUS_PER_NODE: 4
+        SRUN_TIMELIMIT: 30       # minutes, well under the job timeout
+        # Pre-cluster cli_filter requires --account and this --job-name format:
+        # <account>-<subproject>.<details>
+        SLURM_JOBNAME: "${SLURM_ACCOUNT}-cudnn_frontend.ci.${CI_JOB_ID}"
+        ENROOT_IMAGE: "docker://nvcr.io#nvidia/pytorch:26.06-py3"
+        ENROOT_CACHE_ROOT: "/lustre/fsw/coreai_libraries_cudnn/cudnn-frontend-ci/enroot"
+        RESULTS_DIR_HOST: "${CI_PROJECT_DIR}/multigpu-results"
+    rules:
+        # NOTE: no Draft-skip while the infra is proven out, so the job can be
+        # iterated from a Draft MR without running the full pipeline. Re-add the
+        # .default_job_template draft rule before flipping allow_failure.
+        # api/cudnn-gh pipelines are deliberately excluded: they run as a bot
+        # user that has no cluster account (sybil would reject the job).
+        - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
+    script:
+        - hostname && whoami && id
+        - rm -rf "${RESULTS_DIR_HOST}" && mkdir -p "${RESULTS_DIR_HOST}"
+        # --- enroot config isolated to this job (the login node is shared) ---
+        - export ENROOT_CONFIG_PATH="${CI_PROJECT_DIR}/.enroot-${CI_JOB_ID}"
+        - mkdir -p "${ENROOT_CONFIG_PATH}"
+        - |
+            # Optional registry credentials: set NGC_API_KEY as a masked CI/CD
+            # variable if anonymous nvcr.io pulls are rejected from the cluster.
+            if [ -n "${NGC_API_KEY:-}" ]; then
+              printf 'machine nvcr.io login $oauthtoken password %s\n' "${NGC_API_KEY}" > "${ENROOT_CONFIG_PATH}/.credentials"
+            fi
+        - |
+            # Shared enroot cache on lustre; fall back to the build dir if the
+            # project path is not writable for this user.
+            if mkdir -p "${ENROOT_CACHE_ROOT}/cache" "${ENROOT_CACHE_ROOT}/temp" 2>/dev/null; then
+              cache_root="${ENROOT_CACHE_ROOT}"
+            else
+              cache_root="${CI_PROJECT_DIR}/.enroot-cache"
+              mkdir -p "${cache_root}/cache" "${cache_root}/temp"
+            fi
+            printf 'ENROOT_CACHE_PATH %s/cache\nENROOT_TEMP_PATH %s/temp\n' "${cache_root}" "${cache_root}" > "${ENROOT_CONFIG_PATH}/enroot.conf"
+            echo "enroot cache: ${cache_root}"
+        # --- submit to SLURM: one task per node, each in its own container ---
+        - |
+            set +e
+            srun -p "${SLURM_PARTITION}" \
+                 -A "${SLURM_ACCOUNT}" \
+                 -N "${SLURM_NODES}" \
+                 --ntasks-per-node=1 \
+                 -t "${SRUN_TIMELIMIT}" \
+                 --job-name "${SLURM_JOBNAME}" \
+                 --container-image="${ENROOT_IMAGE}" \
+                 --container-mounts="${CI_PROJECT_DIR}:/workspace" \
+                 --container-workdir=/workspace \
+                 --container-env=GPUS_PER_NODE,SLURM_NODES \
+                 /bin/bash ci/stages/multi_gpu_tests/run_multigpu_smoke.sh
+            run_status=$?
+            set -e
+            completed=$(find "${RESULTS_DIR_HOST}" -maxdepth 1 -type f -name 'complete-*.ok' | wc -l)
+            echo "Nodes completed: ${completed}/${SLURM_NODES} (srun exit status: ${run_status})"
+            if [ "${completed}" -ne "${SLURM_NODES}" ] && [ "${run_status}" -eq 0 ]; then
+              echo "ERROR: completion markers missing; a node script died silently."
+              run_status=1
+            fi
+            exit "${run_status}"
+    after_script:
+        - rm -rf "${CI_PROJECT_DIR}/.enroot-${CI_JOB_ID}" || true
+    artifacts:
+        when: always
+        paths:
+            - multigpu-results/
+
+# 8 GPUs on lyris = 2 GB200 nodes x 4 GPUs. Adding another cluster/target is a
+# new job with tags + SLURM_PARTITION/SLURM_NODES/GPUS_PER_NODE overrides
+# (e.g. bia: B300 NVL8 = 8 GPUs in a single node, tags: [bia], SLURM_NODES: 1,
+# GPUS_PER_NODE: 8, SLURM_PARTITION: batch).
+multi_gpu_smoke:lyris:
+    extends: .multi_gpu_cluster:template
+    tags:
+        - lyris
+    variables:
+        SLURM_PARTITION: "gb200"
+        SLURM_NODES: 2
+        GPUS_PER_NODE: 4

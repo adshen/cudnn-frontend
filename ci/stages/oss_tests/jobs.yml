@@ -1,0 +1,15 @@
+.oss_tests:template:
+  stage: oss_tests
+  allow_failure: true
+  script:
+    - pip install -v .[cutedsl]
+    - ci/stages/oss_tests/run_test_oss.sh
+
+oss:rel:
+  extends:
+    - .default_job_template
+    - .device_matrix:template
+    - .cudnn_rel_image:template
+    - .fetch_cudnn_rel:template
+    - .oss_tests:template
+  needs: []

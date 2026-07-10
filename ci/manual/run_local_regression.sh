@@ -2,8 +2,8 @@
 # Example usage
 # export CUDNN_PATH=/home/scratch.agopal_sw/cudnn_frontend_0.9/debug_cudnn 
 # export CUDA_PATH=/home/scratch.agopal_sw/cuda_12.8
-# Usage: source /home/scratch.agopal_sw/lightning/cudnn_frontend/ci/run_local_regression.sh fe_regress  --build_fe=true
-# Usage: source /home/scratch.agopal_sw/lightning/cudnn_frontend/ci/run_local_regression.sh fe_regress  --build_fe=false
+# Usage: source /home/scratch.agopal_sw/lightning/cudnn_frontend/ci/manual/run_local_regression.sh fe_regress  --build_fe=true
+# Usage: source /home/scratch.agopal_sw/lightning/cudnn_frontend/ci/manual/run_local_regression.sh fe_regress  --build_fe=false
 
 # Function to display help message
 show_help() {
@@ -12,7 +12,7 @@ show_help() {
     echo "export CUDNN_PATH=/path/to/cudnn  eg. export CUDNN_PATH=/home/scratch.agopal_sw/cudnn_frontend_0.9/debug_cudnn"
     echo "export CUDA_PATH=/path/to/cuda  eg. export CUDA_PATH=/home/scratch.agopal_sw/cuda_12.8"
     echo ""
-    echo "source ci/run_local_regression.sh [--help] --build_fe=true|false (default=false)"
+    echo "source ci/manual/run_local_regression.sh [--help] --build_fe=true|false (default=false)"
     echo ""
     echo ""
     echo ""
@@ -22,7 +22,7 @@ show_help() {
     echo "  --build_fe=true|false (default=false)"
     echo ""
     echo "Example:"
-    echo "source ci/run_local_regression.sh fe_regress --build_fe=true"
+    echo "source ci/manual/run_local_regression.sh fe_regress --build_fe=true"
     echo "To extract TK from your container use: https://confluence.nvidia.com/display/GCA/3.+Basic%3A+Build+cuDNN+with+Container#id-3.Basic:BuildcuDNNwithContainer-Testingoutsideofacontainer"
 }
 
