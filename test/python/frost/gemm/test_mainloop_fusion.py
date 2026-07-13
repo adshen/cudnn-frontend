@@ -11,43 +11,19 @@ import cudnn.frost.gemm  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-import re
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    vp as _vp,
+    kw as _kw,
+)
+
 
 from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
 from cudnn.frost.gemm.epilogue_codegen import generate_mainloop
-from cudnn.frost.gemm.graph_analyzer import analyze, analyze_with_binding
-from cudnn.frost.gemm.tile_config import by_name
+from cudnn.frost.gemm.graph_analyzer import analyze
 
 pytestmark = pytest.mark.L0
-
-
-def _vp(g, a, b, outs, *aux):
-    """Variant-pack dict keyed by the graph's tensors (binding from the public analyzer)."""
-    bd = analyze_with_binding(g)[1]
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-    vp = {bd.a_operands[0]: a, bd.b_operands[0]: b}
-    vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
-    vp.update({x: buf for x, buf in zip(bd.aux, aux)})
-    return vp
-
-
-_LEGACY_RE = re.compile(r"^(CONFIG_sm100_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
-
-
-def _kw(legacy_name):
-    """Legacy config-name -> jit kwargs (pure-geometry config + cta_group + scheduler)."""
-    m = _LEGACY_RE.match(legacy_name)
-    assert m, legacy_name
-    return dict(
-        config=by_name(m.group(1)),
-        cta_group=int(m.group(2)),
-        scheduler="static" if m.group(3) else "clc",
-    )
-
-
-def _plan(g, **kw):
-    """JIT-compile with a forced tile config; returns the callable kernel."""
-    return jit_from_cudnn_graph(g, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +139,6 @@ def test_zero_preserving_registry() -> None:
 
 
 def test_codegen_mainloop_b_snippet() -> None:
-    from cudnn.frost.gemm.epilogue_codegen import generate_mainloop
-
     chain = analyze(_mainloop_graph_ab("none", "relu", 256, 256, 128))
     snip = generate_mainloop(chain, "b")
     assert "ml_f32_b = ml_vec_b.to(cutlass.Float32)" in snip
@@ -234,7 +208,7 @@ def _run_e2e(op, cfg_name, M, N, K, io_dtype, torch_dtype, out_major="n"):
         c = torch.empty(1, N, M, dtype=torch_dtype, device="cuda").transpose(1, 2)
     else:
         c = torch.empty(1, M, N, dtype=torch_dtype, device="cuda")
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", _TORCH_OP[op](a.float()), b.float()).to(torch_dtype)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
@@ -250,6 +224,7 @@ def _run_e2e(op, cfg_name, M, N, K, io_dtype, torch_dtype, out_major="n"):
         "CONFIG_sm100_64x256x128_64x256x32_cluster2x1_2ctamma",  # CTA_2, cluster MMA m=128
     ],
 )
+@requires_sm100
 def test_e2e_mainloop_bf16(op, cfg) -> None:
     _run_e2e(op, cfg, 512, 512, 256, cudnn.data_type.BFLOAT16, torch.bfloat16)
 
@@ -262,6 +237,7 @@ def test_e2e_mainloop_bf16(op, cfg) -> None:
     ],
     ids=["relu-cta128", "relu-cta64"],
 )
+@requires_sm100
 def test_m_major_mainloop(op, cfg) -> None:
     _run_e2e(op, cfg, 512, 512, 256, cudnn.data_type.BFLOAT16, torch.bfloat16, out_major="m")
 
@@ -273,6 +249,7 @@ def test_m_major_mainloop(op, cfg) -> None:
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
     ],
 )
+@requires_sm100
 def test_e2e_mainloop_fp16(cfg) -> None:
     _run_e2e("abs", cfg, 512, 512, 256, cudnn.data_type.HALF, torch.float16)
 
@@ -285,6 +262,7 @@ def test_e2e_mainloop_fp16(cfg) -> None:
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
     ],
 )
+@requires_sm100
 def test_e2e_mainloop_int8(op, cfg) -> None:
     """INT8 mainloop fusion: f(int8 A) @ int8 B → int32 acc → fp32 out.
     Exercises the integer idesc + int32→fp32 widen; bit-exact vs int reference."""
@@ -310,7 +288,7 @@ def test_e2e_mainloop_int8(op, cfg) -> None:
     a = torch.randint(-8, 8, (1, M, K), dtype=torch.int8, device="cuda")
     b = torch.randint(-8, 8, (1, N, K), dtype=torch.int8, device="cuda")
     c = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
 
     ref = torch.einsum("bmk,bnk->bmn", _TORCH_OP[op](a.cpu().to(torch.int64)), b.cpu().to(torch.int64)).float()
@@ -318,6 +296,7 @@ def test_e2e_mainloop_int8(op, cfg) -> None:
     assert diff == 0.0, f"{cfg} {op}: max|diff|={diff} (expected bit-exact)"
 
 
+@requires_sm100
 def test_e2e_mainloop_multicast_and_oob() -> None:
     # multicast_a + multicast_b cluster, plus M-OOB / K-OOB shape.
     _run_e2e(
@@ -338,7 +317,7 @@ def _run_e2e_ab(aop, bop, cfg_name, M, N, K):
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-3, 3).to(dtype=torch.bfloat16, device="cuda")
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
     fa = _TORCH_OP[aop] if aop != "none" else (lambda x: x)
     fb = _TORCH_OP[bop] if bop != "none" else (lambda x: x)
@@ -361,6 +340,7 @@ def _run_e2e_ab(aop, bop, cfg_name, M, N, K):
         "CONFIG_sm100_64x256x128_64x256x32_cluster2x1_2ctamma",  # CTA_2 cluster MMA m=128
     ],
 )
+@requires_sm100
 def test_e2e_mainloop_ab(aop, bop, cfg) -> None:
     _run_e2e_ab(aop, bop, cfg, 512, 1024, 256)
 
@@ -429,7 +409,7 @@ def _run_scaled(scale_a, scale_b, cfg_name, M, N, K, av=2.0, bv=0.5):
         "alpha": torch.full((1, 1, 1), av, dtype=torch.bfloat16, device="cuda"),
         "beta": torch.full((1, 1, 1), bv, dtype=torch.bfloat16, device="cuda"),
     }
-    plan(_vp(g, a, b, c, *[auxmap[n] for n in [t.name for t in analyze(g).aux_tensors]]))
+    plan(_vp(plan, a, b, c, *[auxmap[n] for n in [t.name for t in analyze(g).aux_tensors]]))
     torch.cuda.synchronize()
     aa = a.float() * (av if scale_a else 1.0)
     bb = b.float() * (bv if scale_b else 1.0)
@@ -445,6 +425,7 @@ def _run_scaled(scale_a, scale_b, cfg_name, M, N, K, av=2.0, bv=0.5):
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
     ],
 )
+@requires_sm100
 def test_e2e_scalar_aux_mainloop(scale_a, scale_b, cfg) -> None:
     _run_scaled(scale_a, scale_b, cfg, 512, 512, 256)
 
@@ -463,7 +444,7 @@ def _run_cos2(cfg_name, M, N, K):
     a = (torch.rand(1, M, K, device="cuda") * 6 - 3).to(torch.bfloat16)
     b = (torch.rand(1, N, K, device="cuda") * 6 - 3).to(torch.bfloat16)
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", torch.cos(a.float()), torch.cos(b.float())).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=6e-1, rtol=2e-2)
@@ -478,10 +459,12 @@ def _run_cos2(cfg_name, M, N, K):
         "CONFIG_sm100_64x256x128_64x256x32_cluster2x1_2ctamma",  # CTA_2 cluster MMA m=128
     ],
 )
+@requires_sm100
 def test_e2e_cos_both_koob(cfg, K) -> None:
     _run_cos2(cfg, 240, 272, K)
 
 
+@requires_sm100
 def test_e2e_cos_a_only_oob_ok() -> None:
     # cos on A only: B's OOB is raw zero-fill, so A_oob*B_oob=0 with no mask
     # needed even though cos(0)=1. K=264 (partial OOB) must still be correct.
@@ -492,7 +475,7 @@ def test_e2e_cos_a_only_oob_ok() -> None:
     a = (torch.rand(1, M, K, device="cuda") * 6 - 3).to(torch.bfloat16)
     b = (torch.rand(1, N, K, device="cuda") * 6 - 3).to(torch.bfloat16)
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", torch.cos(a.float()), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=6e-1, rtol=2e-2)
@@ -602,6 +585,7 @@ def test_analyzer_same_dtype_mainloop_is_not_a_cast() -> None:
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
     ],
 )
+@requires_sm100
 def test_e2e_mixed_input_int8_bf16(cfg, cast_a, cast_b) -> None:
     M, N, K = 512, 512, 512
     g, A, B, C = _mixed_input_graph(cast_a, cast_b, M, N, K)
@@ -613,13 +597,14 @@ def test_e2e_mixed_input_int8_bf16(cfg, cast_a, cast_b) -> None:
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch.int8 if cast_a else torch.bfloat16).cuda()
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-4, 4).to(torch.int8 if cast_b else torch.bfloat16).cuda()
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     # Bit-exact: identity is lossless and the values fit bf16 mantissa exactly.
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
 
 
+@requires_sm100
 def test_e2e_mixed_input_koob() -> None:
     # K not a multiple of the K-tile (576 = 9 * 64): TMA zero-fills the partial
     # tile; int8 0 -> identity -> bf16 0, so K-OOB is harmless (no koob_fix).
@@ -630,7 +615,7 @@ def test_e2e_mixed_input_koob() -> None:
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch.int8).cuda()
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-4, 4).to(torch.bfloat16).cuda()
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
@@ -657,6 +642,7 @@ def test_e2e_mixed_input_koob() -> None:
         ("bf16", "e4m3", torch.bfloat16, cudnn.data_type.FP8_E4M3),  # narrowing to fp8
     ],
 )
+@requires_sm100
 def test_e2e_mixed_input_cast_targets(load, mma, torch_load, cu_mma) -> None:
     """Cast A (loaded `load`) -> `mma` dtype; B is the same `mma` dtype. int->fp8
     exercises the fold workaround (else int->fp32->fp8 folds to NaN)."""
@@ -697,7 +683,7 @@ def test_e2e_mixed_input_cast_targets(load, mma, torch_load, cu_mma) -> None:
         .cuda()
     )
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
@@ -738,6 +724,7 @@ def test_codegen_int_to_fp8_fold_war() -> None:
     assert "cutlass.full_like" not in generate_mainloop(chain_bf16, "a")
 
 
+@requires_sm100
 def test_e2e_mixed_input_int8_fp8_2ctamma() -> None:
     """int8 -> fp8 (fold workaround) on the 2-CTA template, to cover both staging
     paths (1ctamma is covered by test_e2e_mixed_input_cast_targets)."""
@@ -760,7 +747,7 @@ def test_e2e_mixed_input_int8_fp8_2ctamma() -> None:
     a = torch.empty(1, M, K, dtype=torch.int32).random_(-4, 4).to(torch.int8).cuda()
     b = torch.empty(1, N, K, dtype=torch.int32).random_(-4, 4).to(torch.float8_e4m3fn).cuda()
     c = torch.empty(1, M, N, dtype=torch.bfloat16).cuda()
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)

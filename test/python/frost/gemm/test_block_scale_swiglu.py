@@ -4,48 +4,25 @@ one epilogue, ``silu(dq(A) @ dq(B0)) * (dq(A) @ dq(B1))``. Dual N capped at 128
 
 import pytest
 import torch
+
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    kw as _kw,
+    E2M1 as _E2M1,
+    to_blocked as _to_blocked,
+    unpack_fp4 as _unpack_fp4,
+    rand_e8m0 as _rand_e8m0,
+    reduction_ref as _reduction_ref,
+    assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
+)
 import cudnn
 import cudnn.frost.gemm  # noqa: F401  installs the recorder
 
 from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
 from cudnn.frost.gemm.graph_analyzer import analyze
-from cudnn.frost.gemm.tile_config import by_name
-
-from test_block_scale import (
-    _to_blocked,
-    _unpack_fp4,
-    _E2M1,
-    _rand_e8m0,
-    _kw,
-    _assert_block_scale_reduction_close,
-    _reduction_ref,
-)
 
 pytestmark = pytest.mark.L0
-
-
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config (sweeps pin a
-    config directly). Exposes chain/binding/block_scale/aux_names; callable with
-    a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc"):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
 
 
 def _vp_bs_mg(compiled, gemm_pairs, outs, *aux):
@@ -153,7 +130,7 @@ def test_shared_dequant_reduction_detected():
 
 
 # End-to-end numerics
-_GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+_GPU = requires_sm100
 
 
 def _dual_bs_runtime(combo, M, N, K):

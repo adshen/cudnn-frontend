@@ -15,57 +15,19 @@ from typing import Callable
 import pytest
 import torch
 
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    vp as _vp,
+    resolve as _resolve,
+)
+
 # Module-wide GPU gate — every test here is end-to-end and needs a B200.
-pytestmark = [pytest.mark.L0, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")]
+pytestmark = [pytest.mark.L0, requires_sm100]
 
 
 import cudnn
 import cudnn.frost.gemm  # noqa: F401  — installs the cudnn.pygraph recorder hook
-import re
-
-from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
-from cudnn.frost.gemm.tile_config import CATALOG
-
-
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config (sweeps pin a
-    config directly). Exposes chain/binding/block_scale/aux_names; callable
-    with a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
-    return _Plan(
-        graph,
-        config=config,
-        cta_group=cta_group,
-        scheduler=scheduler,
-        force_stg_epi=force_stg_epi,
-    )
-
-
-def _vp(compiled, a, b, outs, *aux):
-    """Variant-pack dict from the compiled binding (A/B + outputs + aux)."""
-    bd = compiled.binding
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-    vp = {bd.a_operands[0]: a, bd.b_operands[0]: b}
-    vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
-    vp.update({x: buf for x, buf in zip(bd.aux, aux)})
-    return vp
-
 
 # Dtype tables (dup of test_matmul_sweep to keep the files independent)
 
@@ -798,23 +760,6 @@ def _reference(
     return cur.to(_TORCH_DTYPE[out_dt])
 
 
-def _batched_reference(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    aux_runtime: dict[str, torch.Tensor],
-    chain: Chain,
-    out_dt: str,
-) -> torch.Tensor:
-    cur = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
-    for i, (op, bcast) in enumerate(chain):
-        if bcast is None:
-            cur = _TORCH_UNARY[op](cur)
-        else:
-            aux_t = aux_runtime[f"aux{i}"].to(torch.float32)
-            cur = _TORCH_BINARY[op](cur, aux_t)
-    return cur.to(_TORCH_DTYPE[out_dt])
-
-
 def _rank3_broadcast_reference(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -832,22 +777,6 @@ def _rank3_broadcast_reference(
 
 
 # Config lookup
-
-
-_NAME_TO_CFG = {c.name: c for c in CATALOG}
-
-_LEGACY_RE = re.compile(r"^(CONFIG_sm100_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
-
-
-def _resolve(legacy_name):
-    """Legacy config-name -> (pure-geometry config, cta_group, scheduler)."""
-    m = _LEGACY_RE.match(legacy_name)
-    assert m, legacy_name
-    return (
-        _NAME_TO_CFG[m.group(1)],
-        int(m.group(2)),
-        "static" if m.group(3) else "clc",
-    )
 
 
 # Test bodies — each parametrized axis is a separate test for clear IDs
@@ -952,7 +881,7 @@ def _run_batched_case(
     compiled(_vp(compiled, a, b, c, *[aux_runtime[n] for n in aux_names]))
     torch.cuda.synchronize()
 
-    ref = _batched_reference(a, b, aux_runtime, case.chain, out_dt)
+    ref = _reference(a, b, aux_runtime, case.chain, out_dt)
     try:
         torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
     except AssertionError as e:

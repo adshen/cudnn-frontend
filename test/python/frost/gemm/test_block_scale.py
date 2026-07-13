@@ -8,108 +8,28 @@ import cudnn.frost.gemm  # noqa: F401  (installs recorder)
 import pytest
 import torch
 
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    vp_bs as _vp_bs,
+    kw as _kw,
+    E2M1 as _E2M1,
+    ceil_div as _ceil_div,
+    to_blocked as _to_blocked,
+    unpack_fp4 as _unpack_fp4,
+    rand_e8m0 as _rand_e8m0,
+    block_quant_ref as _block_quant_ref,
+    reduction_ref as _reduction_ref,
+    assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
+)
+
 from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
 from cudnn.frost.gemm.graph_analyzer import analyze
-import re
-
-from cudnn.frost.gemm.tile_config import by_name
 
 pytestmark = pytest.mark.L0
 
 
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config (sweeps pin a
-    config directly). Exposes chain/binding/block_scale/aux_names; callable with
-    a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc"):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
-
-
-def _vp_bs(compiled, a, b, outs, sfa, sfb, *aux):
-    """Block-scale single-GEMM variant-pack dict from the binding."""
-    bd = compiled.binding
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-    vp = {
-        bd.a_operands[0]: a,
-        bd.b_operands[0]: b,
-        bd.sfa_operands[0]: sfa,
-        bd.sfb_operands[0]: sfb,
-    }
-    vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
-    vp.update({x: buf for x, buf in zip(bd.aux, aux)})
-    return vp
-
-
-_LEGACY_RE = re.compile(r"^(CONFIG_sm100_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
-
-
-def _kw(legacy_name):
-    """Legacy config-name (with _Nctamma/_static) -> jit kwargs: pure-geometry
-    config + cta_group + scheduler."""
-    m = _LEGACY_RE.match(legacy_name)
-    assert m, legacy_name
-    return dict(
-        config=by_name(m.group(1)),
-        cta_group=int(m.group(2)),
-        scheduler="static" if m.group(3) else "clc",
-    )
-
-
 # Helpers
-
-_E2M1 = [
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
-
-
-def _ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def _to_blocked(x):
-    rows, cols = x.shape
-    nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
-    pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
-    pad[:rows, :cols] = x
-    blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
-
-
-def _unpack_fp4(u8, lut):
-    lo = lut[(u8 & 0xF).long()]
-    hi = lut[(u8 >> 4).long()]
-    return torch.stack([lo, hi], dim=-1).flatten(-2)
 
 
 def _build_nvfp4_graph(
@@ -289,31 +209,6 @@ def _build_block_scale_quant_graph(
     return g
 
 
-def _reduction_ref(x, mode, dims):
-    if mode == cudnn.reduction_mode.AMAX:
-        return x.abs().amax(dim=dims, keepdim=True)
-    if mode == cudnn.reduction_mode.MAX:
-        return x.amax(dim=dims, keepdim=True)
-    if mode == cudnn.reduction_mode.MIN:
-        return x.amin(dim=dims, keepdim=True)
-    return x.sum(dim=dims, keepdim=True)
-
-
-def _block_quant_ref(x, block_size, out_dtype, scale_dtype):
-    blocks = x.view(1, x.shape[0], x.shape[1] // block_size, block_size)
-    output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
-    scale_f = blocks.abs().amax(dim=-1) / output_max
-    if scale_dtype is torch.float8_e8m0fnu:
-        # Reference rounds E8M0 scale factors toward +inf.
-        safe = torch.where(scale_f > 0, scale_f, 1.0)
-        scale_f = torch.where(scale_f > 0, torch.pow(2.0, torch.ceil(torch.log2(safe))), 0.0)
-    scale = scale_f.to(scale_dtype)
-    inv = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
-    q = (blocks * inv.unsqueeze(-1)).clamp(-output_max, output_max)
-    q = q.to(out_dtype).view(1, x.shape[0], x.shape[1])
-    return q, scale
-
-
 # Compile-stage support gate: sm100_block_scale_matmul exact per-side cases
 
 _DT_FP4, _DT_E4M3, _DT_E5M2, _DT_E8M0 = (
@@ -442,12 +337,7 @@ def test_plain_matmul_has_no_block_scale():
 
 # End-to-end numerics (GPU)
 
-_GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
-
-
-def _rand_e8m0(shape, dev):
-    # E8M0 holds a power-of-2; small exponents around bias 127 keep the FP32 ref in range.
-    return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
+_GPU = requires_sm100
 
 
 def _make_block_scale_inputs(combo, M, N, K, dev="cuda"):
@@ -984,13 +874,6 @@ def test_block_scale_m_major(combo, config_name, M, N, K):
 )
 def test_block_scale_nonpacked_tensors(combo, config_name, mode):
     _run_bs_nonpacked_numeric(combo, config_name, 256, 256, 512, mode)
-
-
-def _assert_block_scale_reduction_close(actual, expected, mode):
-    if mode == cudnn.reduction_mode.ADD:
-        torch.testing.assert_close(actual, expected, atol=2.0, rtol=1e-4)
-    else:
-        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
 
 
 def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_stride, ref_dims):

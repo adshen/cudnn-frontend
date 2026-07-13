@@ -8,11 +8,12 @@ import cudnn.frost.gemm  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
-from cudnn.frost.gemm.graph_analyzer import analyze, analyze_with_binding
+from gemm_test_utils import requires_sm100, Plan as _plan, vp as _vp
+
+from cudnn.frost.gemm.graph_analyzer import analyze
 from cudnn.frost.gemm.tile_config import by_name
 
-pytestmark = pytest.mark.L0
+pytestmark = [pytest.mark.L0, requires_sm100]
 
 
 def _mkdata(M: int, N: int, K: int, B: int = 1):
@@ -20,23 +21,6 @@ def _mkdata(M: int, N: int, K: int, B: int = 1):
     a = torch.empty(B, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
     b = torch.empty(B, N, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch.bfloat16, device="cuda")
     return a, b
-
-
-def _vp(g, a, b, outs, *aux):
-    """Variant-pack dict keyed by the graph's tensors (via the analyzer binding).
-    ``outs`` fills chain.outputs slot order (terminal, then taps); ``aux`` the
-    epilogue aux tensors in order."""
-    bd = analyze_with_binding(g)[1]
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-    vp = {bd.a_operands[0]: a, bd.b_operands[0]: b}
-    vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
-    vp.update({x: buf for x, buf in zip(bd.aux, aux)})
-    return vp
-
-
-def _plan(g, **kw):
-    """JIT-compile the recorded graph; returns the compiled kernel."""
-    return jit_from_cudnn_graph(g, **kw)
 
 
 def test_matmul_tap_only() -> None:
@@ -58,7 +42,7 @@ def test_matmul_tap_only() -> None:
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_tap]))
+    plan(_vp(plan, a, b, [c_term, c_tap]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -100,7 +84,7 @@ def test_epilogue_reduction_tap_scalar(mode, ref_fn) -> None:
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_red = torch.empty(1, 1, 1, dtype=torch.float32, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_red]))
+    plan(_vp(plan, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -147,7 +131,7 @@ def test_epilogue_reduction_tap_scalar_int32(mode, ref_fn) -> None:
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.int32, device="cuda")
     c_red = torch.empty(1, 1, 1, dtype=torch.int32, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_red]))
+    plan(_vp(plan, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.int32)
@@ -200,7 +184,7 @@ def test_epilogue_reduction_tap_partial(mode, red_shape: str, ref_dims: tuple[in
     a, b = _mkdata(M, N, K, B)
     c_term = torch.empty(B, M, N, dtype=torch.bfloat16, device="cuda")
     c_red = torch.empty(*red_dims, dtype=torch.float32, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_red]))
+    plan(_vp(plan, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -254,7 +238,7 @@ def test_epilogue_reduction_tap_strided_output(mode, red_shape: str, ref_dims: t
     c_term = torch.empty(B, M, N, dtype=torch.bfloat16, device="cuda")
     c_red = torch.empty_strided(tuple(red_dims), tuple(red_stride), dtype=torch.float32, device="cuda")
     assert not c_red.is_contiguous()
-    plan(_vp(g, a, b, [c_term, c_red]))
+    plan(_vp(plan, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -301,7 +285,7 @@ def test_epilogue_reduction_tap_scalar_big_cgrp_multi_cta(mode, ref_fn) -> None:
     a, b = _mkdata(M, N, K, B)
     c_term = torch.empty(B, M, N, dtype=torch.float32, device="cuda")
     c_red = torch.empty(1, 1, 1, dtype=torch.float32, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_red]))
+    plan(_vp(plan, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -348,7 +332,7 @@ def test_epilogue_reduction_tap_scalar_int32_big_cgrp_multi_cta(mode, ref_fn) ->
     a, b = _mkdata(M, N, K, B)
     c_term = torch.empty(B, M, N, dtype=torch.int32, device="cuda")
     c_red = torch.empty(1, 1, 1, dtype=torch.int32, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_red]))
+    plan(_vp(plan, a, b, [c_term, c_red]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.int32)
@@ -379,7 +363,7 @@ def test_mid_op_tap() -> None:
     bias_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_tap], bias_t))
+    plan(_vp(plan, a, b, [c_term, c_tap], bias_t))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -409,7 +393,7 @@ def test_dag_two_branches_from_matmul() -> None:
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_tap]))
+    plan(_vp(plan, a, b, [c_term, c_tap]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -447,7 +431,7 @@ def test_dag_two_branches_with_per_branch_ops() -> None:
     bias2_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_tap], bias1_t, bias2_t))
+    plan(_vp(plan, a, b, [c_term, c_tap], bias1_t, bias2_t))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -476,7 +460,7 @@ def test_fan_in_relu_plus_gelu() -> None:
     plan = _plan(g)
     a, b = _mkdata(M, N, K)
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    plan(_vp(g, a, b, c))
+    plan(_vp(plan, a, b, c))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -505,7 +489,7 @@ def test_fan_in_with_intermediate_tap() -> None:
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_relu = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_relu]))
+    plan(_vp(plan, a, b, [c_term, c_relu]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -601,7 +585,7 @@ def test_complex_fusion_dag() -> None:
 
     plan(
         _vp(
-            g,
+            plan,
             a,
             b,
             [c_term, c_mm, c_bias, c_relu, c_addS],
@@ -659,7 +643,7 @@ def test_two_taps_matmul_and_mid_op() -> None:
     c_term = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     c_tap_mm = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
     c_tap_bias = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    plan(_vp(g, a, b, [c_term, c_tap_mm, c_tap_bias], bias_t))
+    plan(_vp(plan, a, b, [c_term, c_tap_mm, c_tap_bias], bias_t))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -698,7 +682,7 @@ def test_virtual_bf16_intermediate_loses_precision() -> None:
     a, b = _mkdata(M, N, K)
     scale_t = torch.randn(1, 1, N, device="cuda", dtype=torch.bfloat16)
     c_out = torch.empty(1, M, N, device="cuda", dtype=torch.float32)
-    plan(_vp(g, a, b, [c_out], scale_t))
+    plan(_vp(plan, a, b, [c_out], scale_t))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
@@ -743,7 +727,7 @@ def test_m_major_op_tap() -> None:
     a, b = _mkdata(M, N, K)
     c_term = torch.empty(1, N, M, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
     c_tap = torch.empty(1, N, M, dtype=tap_tdt, device="cuda").transpose(1, 2)
-    plan(_vp(g, a, b, [c_term, c_tap]))
+    plan(_vp(plan, a, b, [c_term, c_tap]))
     torch.cuda.synchronize()
 
     mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())

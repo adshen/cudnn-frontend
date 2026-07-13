@@ -13,35 +13,19 @@ import cudnn.frost.gemm  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    E2M1 as _E2M1,
+    to_blocked as _to_blocked,
+    unpack_fp4 as _unpack_fp4,
+    rand_e8m0 as _rand_e8m0,
+)
+
 from cudnn.frost.gemm.graph_analyzer import analyze
-from cudnn.frost.gemm.tile_config import CATALOG
+from cudnn.frost.gemm.tile_config import by_name
 
 pytestmark = pytest.mark.L0
-
-
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config (bypassing the
-    FROST engine's auto-select). Exposes chain / binding / block_scale / aux_names;
-    callable with a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc"):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
 
 
 def _vp_moe_bs_mg(compiled, gemm_pairs, fto, outs, *aux):
@@ -75,24 +59,6 @@ _GEOMETRIES = [
     ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
 ]
 
-_E2M1 = [
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
 
 # combo -> (block_size, data dtype, SF dtype).
 _COMBOS = {
@@ -100,29 +66,6 @@ _COMBOS = {
     "mxfp4": (32, cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E8M0),
     "mxfp8": (32, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0),
 }
-
-
-def _ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def _to_blocked(x: torch.Tensor) -> torch.Tensor:
-    rows, cols = x.shape
-    nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
-    pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
-    pad[:rows, :cols] = x
-    blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
-
-
-def _unpack_fp4(u8: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
-    lo = lut[(u8 & 0xF).long()]
-    hi = lut[(u8 >> 4).long()]
-    return torch.stack([lo, hi], dim=-1).flatten(-2)
-
-
-def _rand_e8m0(shape, dev):
-    return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
 
 
 def _build_graph(
@@ -266,7 +209,7 @@ def _mk_sf(combo, shape, dev):
     return _rand_e8m0(shape, dev)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
 def test_dual_moe_block_scale_swiglu(combo, cfg_name, cta_group) -> None:
@@ -289,7 +232,7 @@ def test_dual_moe_block_scale_swiglu(combo, cfg_name, cta_group) -> None:
     sfb1_log = _mk_sf(combo, (E, N, sf_k), dev)
     scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
 
-    cfg = next(c for c in CATALOG if c.name == cfg_name)
+    cfg = by_name(cfg_name)
     compiled = _plan(_build_graph(E, S, N, K, num_groups, combo), config=cfg, cta_group=cta_group)
     assert compiled.chain.block_scale.combo == combo
 
@@ -331,7 +274,7 @@ def test_dual_moe_block_scale_swiglu(combo, cfg_name, cta_group) -> None:
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 def test_dual_moe_block_scale_swiglu_reduction_scalar() -> None:
     dev = "cuda"
     torch.manual_seed(0)
@@ -352,7 +295,7 @@ def test_dual_moe_block_scale_swiglu_reduction_scalar() -> None:
     sfb1_log = _mk_sf(combo, (E, N, sf_k), dev)
     scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
 
-    cfg = next(c for c in CATALOG if c.name == _GEOMETRIES[1][0])
+    cfg = by_name(_GEOMETRIES[1][0])
     compiled = _plan(
         _build_graph(
             E,

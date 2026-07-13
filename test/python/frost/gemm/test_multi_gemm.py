@@ -8,53 +8,18 @@ import cudnn.frost.gemm  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    vp_mg as _vp_mg,
+    reduction_ref as _reduction_ref,
+)
+
 from cudnn.frost.gemm.epilogue_codegen import generate
 from cudnn.frost.gemm.graph_analyzer import analyze
 from cudnn.frost.gemm.tile_config import CATALOG, DEFAULT_CONFIG, by_name
 
 pytestmark = pytest.mark.L0
-
-
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config; callable with a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc"):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
-
-
-def _vp_mg(compiled, gemm_pairs, outs, *aux):
-    """Multi-GEMM variant-pack dict: dedup per-GEMM (a, b) pairs by identity into
-    the binding's distinct A/B slots (first-appearance order); + outputs + aux."""
-    bd = compiled.binding
-    a_seen, b_seen = [], []
-    for ag, bg in gemm_pairs:
-        if not any(ag is x for x in a_seen):
-            a_seen.append(ag)
-        if not any(bg is x for x in b_seen):
-            b_seen.append(bg)
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-    vp = {}
-    vp.update({t: buf for t, buf in zip(bd.a_operands, a_seen)})
-    vp.update({t: buf for t, buf in zip(bd.b_operands, b_seen)})
-    vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
-    vp.update({x: buf for x, buf in zip(bd.aux, aux)})
-    return vp
 
 
 def _graph(io=cudnn.data_type.BFLOAT16):
@@ -197,7 +162,7 @@ def test_heterogeneous_gemms_rejected() -> None:
     C1 = g.matmul(A=A2, B=B1, name="m1")
     Y = g.add(a=C0, b=C1, name="a")
     Y.set_output(True)
-    with pytest.raises((ValueError, Exception)):
+    with pytest.raises(ValueError, match="must share shape / layout / dtype"):
         analyze(g)
 
 
@@ -222,7 +187,6 @@ def test_multi_gemm_2ctamma_compiles() -> None:
 
 def test_multi_gemm_mainloop_template_rejected() -> None:
     """A multi-GEMM graph never selects a mainloop template (registry guard rejects it)."""
-    from cudnn.frost.gemm.graph_analyzer import analyze
     from cudnn.frost.gemm.kernel_registry import TEMPLATES
 
     M, N, K = 256, 256, 128
@@ -241,7 +205,7 @@ def test_multi_gemm_mainloop_template_rejected() -> None:
 
 # --- End-to-end correctness (GPU) ---
 
-_GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+_GPU = requires_sm100
 
 
 def _rand(M, N, K, scale=1.0):
@@ -268,16 +232,6 @@ def _mk_int8(M: int, N: int, K: int, B: int = 1):
     b0 = torch.randint(-4, 4, (B, N, K), dtype=torch.int8, device="cuda")
     b1 = torch.randint(-4, 4, (B, N, K), dtype=torch.int8, device="cuda")
     return a, b0, b1
-
-
-def _reduction_ref(x, mode, dims):
-    if mode == cudnn.reduction_mode.AMAX:
-        return x.abs().amax(dim=dims, keepdim=True)
-    if mode == cudnn.reduction_mode.MAX:
-        return x.amax(dim=dims, keepdim=True)
-    if mode == cudnn.reduction_mode.MIN:
-        return x.amin(dim=dims, keepdim=True)
-    return x.sum(dim=dims, keepdim=True)
 
 
 def _build_dual_add_reduction(

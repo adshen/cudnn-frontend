@@ -7,6 +7,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from gemm_test_utils import requires_sm100
+
 import cudnn
 import cudnn.frost.gemm  # noqa: F401  (registers frost_gemm_eng0 + installs lifecycle patches)
 from cudnn.frost import engine_names, is_frost_engine
@@ -14,7 +16,7 @@ from cudnn.frost.heuristics import _get_plan_state
 
 pytestmark = pytest.mark.L0
 
-_GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+_GPU = requires_sm100
 
 M, N, K = 256, 256, 128
 _FROST = "frost_gemm_eng0"
@@ -107,21 +109,21 @@ def test_select_frost_engine_runs_frost():
 
 
 @_GPU
-def test_default_and_deselect_run_native():
+@pytest.mark.parametrize("deselect", [False, True], ids=["default", "deselected"])
+def test_default_and_deselect_run_native(deselect):
     """No select (default) and FROST deselected both run native cuDNN."""
     a, b, bias_t, ref = _operands()
-    for deselect in (False, True):
-        g, A, B, bias, Y = _build_matmul_bias_relu()
-        _run_native(g)
-        if deselect:
-            g.deselect_engines([_FROST])
-        g.check_support()
-        g.build_plans()
-        ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-        y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-        g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
-        torch.cuda.synchronize()
-        torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
+    g, A, B, bias, Y = _build_matmul_bias_relu()
+    _run_native(g)
+    if deselect:
+        g.deselect_engines([_FROST])
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
 
 
 @_GPU

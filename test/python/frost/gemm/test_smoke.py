@@ -7,9 +7,10 @@ import sys
 from pathlib import Path
 
 import pytest
-import torch
 
-pytestmark = [pytest.mark.L0, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")]
+from gemm_test_utils import requires_sm100
+
+pytestmark = [pytest.mark.L0, requires_sm100]
 
 
 _EXAMPLES = Path(__file__).resolve().parent / "examples"

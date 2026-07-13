@@ -382,16 +382,19 @@ def test_extra_kernel_params_for_multiple_aux() -> None:
     assert out.host_args == ["bias", "scale"]
 
 
-def test_epilogue_dtype_casts_for_integer_and_e8m0_outputs() -> None:
-    # matmul out_dtype defaults to bf16 → accumulator rounded to bf16 (_r_mm) before terminal cast.
-    for dtype, cast_expr in (
+@pytest.mark.parametrize(
+    "dtype,cast_expr",
+    [
         ("fp8_e8m0", "(_r_mm).to(cutlass.Float8E8M0FNU)"),
         ("int8", "(_r_mm).to(cutlass.Int8)"),
         ("uint8", "(_r_mm).to(cutlass.Uint8).bitcast(cutlass.Int8)"),
         ("int32", "(_r_mm).to(cutlass.Int32)"),
-    ):
-        out = generate(FusionChain(matmul=_mm(), output_dtype=dtype))  # type: ignore[arg-type]
-        assert out.epilogue == (f"_r_mm = (vec_f32).to(cutlass.BFloat16)\nvec_out = {cast_expr}")
+    ],
+)
+def test_epilogue_dtype_casts_for_integer_and_e8m0_outputs(dtype, cast_expr) -> None:
+    # matmul out_dtype defaults to bf16 → accumulator rounded to bf16 (_r_mm) before terminal cast.
+    out = generate(FusionChain(matmul=_mm(), output_dtype=dtype))  # type: ignore[arg-type]
+    assert out.epilogue == (f"_r_mm = (vec_f32).to(cutlass.BFloat16)\nvec_out = {cast_expr}")
 
 
 def test_aux_kernel_param_accepts_integer_dtype() -> None:

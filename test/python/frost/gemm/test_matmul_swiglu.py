@@ -11,53 +11,11 @@ import cudnn.frost.gemm  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
+from gemm_test_utils import requires_sm100, Plan as _plan, vp_mg as _vp_mg
+
 from cudnn.frost.gemm.tile_config import CATALOG
 
-pytestmark = [pytest.mark.L0, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")]
-
-
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config (bypassing the
-    FROST engine's auto-select). Exposes chain / binding / block_scale / aux_names;
-    callable with a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc"):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
-
-
-def _vp_mg(compiled, gemm_pairs, outs, *aux):
-    """Multi-GEMM variant-pack dict: dedup pairs by identity → distinct A/B slots,
-    + outputs + aux."""
-    bd = compiled.binding
-    a_seen, b_seen = [], []
-    for ag, bg in gemm_pairs:
-        if not any(ag is x for x in a_seen):
-            a_seen.append(ag)
-        if not any(bg is x for x in b_seen):
-            b_seen.append(bg)
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-    vp = {}
-    vp.update({t: buf for t, buf in zip(bd.a_operands, a_seen)})
-    vp.update({t: buf for t, buf in zip(bd.b_operands, b_seen)})
-    vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
-    vp.update({x: buf for x, buf in zip(bd.aux, aux)})
-    return vp
+pytestmark = [pytest.mark.L0, requires_sm100]
 
 
 _CUDNN_DT = {"bf16": cudnn.data_type.BFLOAT16, "fp16": cudnn.data_type.HALF}

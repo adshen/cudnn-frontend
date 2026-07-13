@@ -8,52 +8,17 @@ import cudnn.frost.gemm  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    vp_mg as _vp_mg,
+    FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
+)
+
 from cudnn.frost.gemm.graph_analyzer import analyze
-from cudnn.frost.gemm.tile_config import CATALOG
+from cudnn.frost.gemm.tile_config import by_name
 
 pytestmark = pytest.mark.L0
-
-
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config; callable with a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc"):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
-
-
-def _vp_moe_mg(compiled, gemm_pairs, fto, outs, *aux):
-    """MoE multi-GEMM variant-pack dict: dedup (token, weight) pairs → distinct
-    A/B slots, + first_token_offset + outputs + aux."""
-    bd = compiled.binding
-    a_seen, b_seen = [], []
-    for ag, bg in gemm_pairs:
-        if not any(ag is x for x in a_seen):
-            a_seen.append(ag)
-        if not any(bg is x for x in b_seen):
-            b_seen.append(bg)
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-    vp = {bd.first_token_offset: fto}
-    vp.update({t: buf for t, buf in zip(bd.a_operands, a_seen)})
-    vp.update({t: buf for t, buf in zip(bd.b_operands, b_seen)})
-    vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
-    vp.update({x: buf for x, buf in zip(bd.aux, aux)})
-    return vp
 
 
 # (config name, cta_group): 1-CTA cluster1x1 + 2-CTA cluster2x1 (reference design)
@@ -192,51 +157,14 @@ def test_analyzer_detects_dual_moe_reduction() -> None:
 # --- End-to-end correctness (GPU) ---
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 def test_dual_moe_swiglu_exact_case(cfg_name, cta_group) -> None:
     """Spec case: S=2000, N=248, K=520, E=9, 36 routed groups (BxE > E)."""
     S, N, K, E = 2000, 248, 520, 9
-    offset_values = [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-        127,
-        255,
-        383,
-        483,
-        515,
-        643,
-        718,
-        924,
-        1100,
-        1200,
-        1300,
-        1400,
-        1500,
-        1600,
-        1700,
-        1800,
-        1900,
-    ]
+    offset_values = _FULL_EXPERT_REDUCE_OFFSETS
     num_groups = len(offset_values)
-    cfg = next(c for c in CATALOG if c.name == cfg_name)
+    cfg = by_name(cfg_name)
     compiled = _plan(_build_graph(E, S, N, K, num_groups), config=cfg, cta_group=cta_group)
 
     torch.manual_seed(0)
@@ -247,7 +175,7 @@ def test_dual_moe_swiglu_exact_case(cfg_name, cta_group) -> None:
     out = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
     offsets = torch.tensor(offset_values, dtype=torch.int32, device="cuda")
 
-    compiled(_vp_moe_mg(compiled, [(token, w0), (token, w1)], offsets, out, scale))
+    compiled(_vp_mg(compiled, [(token, w0), (token, w1)], out, scale, fto=offsets))
     torch.cuda.synchronize()
     torch.testing.assert_close(
         out[0],
@@ -257,7 +185,7 @@ def test_dual_moe_swiglu_exact_case(cfg_name, cta_group) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 @pytest.mark.parametrize(
     "group_sizes",
@@ -270,7 +198,7 @@ def test_dual_moe_swiglu_groups(group_sizes, cfg_name, cta_group) -> None:
     E, N, K = 8, 256, 128
     S = sum(group_sizes)
     num_groups = E
-    cfg = next(c for c in CATALOG if c.name == cfg_name)
+    cfg = by_name(cfg_name)
     compiled = _plan(_build_graph(E, S, N, K, num_groups), config=cfg, cta_group=cta_group)
 
     torch.manual_seed(0)
@@ -285,7 +213,7 @@ def test_dual_moe_swiglu_groups(group_sizes, cfg_name, cta_group) -> None:
         cur += gs
     offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
 
-    compiled(_vp_moe_mg(compiled, [(token, w0), (token, w1)], offsets, out, scale))
+    compiled(_vp_mg(compiled, [(token, w0), (token, w1)], out, scale, fto=offsets))
     torch.cuda.synchronize()
     torch.testing.assert_close(
         out[0],
@@ -295,13 +223,13 @@ def test_dual_moe_swiglu_groups(group_sizes, cfg_name, cta_group) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 def test_dual_moe_swiglu_reduction_scalar() -> None:
     E, N, K = 4, 128, 128
     group_sizes = [64, 0, 120, 72]
     S = sum(group_sizes)
     num_groups = E
-    cfg = next(c for c in CATALOG if c.name == _GEOMETRIES[0][0])
+    cfg = by_name(_GEOMETRIES[0][0])
     compiled = _plan(
         _build_graph(
             E,
@@ -329,7 +257,7 @@ def test_dual_moe_swiglu_reduction_scalar() -> None:
         cur += gs
     offsets = torch.tensor(starts, dtype=torch.int32, device="cuda")
 
-    compiled(_vp_moe_mg(compiled, [(token, w0), (token, w1)], offsets, [out, red], scale))
+    compiled(_vp_mg(compiled, [(token, w0), (token, w1)], [out, red], scale, fto=offsets))
     torch.cuda.synchronize()
 
     ref = _ref_f32(token, w0, w1, offsets, scale, S, N, E, num_groups)

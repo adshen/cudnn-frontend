@@ -801,7 +801,6 @@ def _kernel(
         ml_local = warp_idx - mainloop_warp_id_start
         ml_threads = num_mainloop_warps * 32
         ml_tid = ml_local * 32 + lane
-        # 16 B = widest SMEM load/store (128-bit LDS/STS)
         ml_vec_bytes = 16
         ml_vec_elems = ml_vec_bytes // (ab_dtype.width // 8)
         ml_chunks_a = (sA_elems // ml_vec_elems) // ml_threads

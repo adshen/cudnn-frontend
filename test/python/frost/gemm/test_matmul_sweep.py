@@ -10,62 +10,26 @@ CATALOG. Also runnable as a script (forwards argv to pytest).
 from __future__ import annotations
 
 import os
-import re
 import sys
-from typing import Iterable
 
 import pytest
 import torch
 
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    vp as _vp,
+    resolve as _resolve,
+)
+
 # Module-wide GPU gate — every test here is end-to-end and needs a B200.
-pytestmark = [pytest.mark.L0, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")]
+pytestmark = [pytest.mark.L0, requires_sm100]
 
 
 import cudnn
 import cudnn.frost.gemm  # noqa: F401  — installs the cudnn.pygraph recorder hook
-from cudnn.frost.gemm.compiler import _current_sm, jit_from_cudnn_graph
+from cudnn.frost.gemm.compiler import _current_sm
 from cudnn.frost.gemm.tile_config import CATALOG
-
-
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config (bypassing the
-    FROST engine's auto-select). Exposes chain / binding / block_scale / aux_names;
-    callable with a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler, force_stg_epi=force_stg_epi)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc", force_stg_epi=False):
-    return _Plan(
-        graph,
-        config=config,
-        cta_group=cta_group,
-        scheduler=scheduler,
-        force_stg_epi=force_stg_epi,
-    )
-
-
-def _vp(compiled, a, b, outs, *aux):
-    """Variant-pack dict {cuDNN tensor: buffer}: A/B operands, outputs, then aux."""
-    bd = compiled.binding
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-    vp = {bd.a_operands[0]: a, bd.b_operands[0]: b}
-    vp.update({o: buf for o, buf in zip(bd.outputs, outs)})
-    vp.update({x: buf for x, buf in zip(bd.aux, aux)})
-    return vp
-
 
 # INT8 matmul runs only on SM 100 or SM 110 (disjoint range).
 _INT8_SM_RANGES = ((100, 101), (110, 111))
@@ -205,23 +169,6 @@ _NONPACKED_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
     ("bf16", "bf16"),
     ("fp8_e4m3", "fp16"),
 )
-
-
-_NAME_TO_CFG = {c.name: c for c in CATALOG}
-
-_LEGACY_RE = re.compile(r"^(CONFIG_sm100_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
-
-
-def _resolve(legacy_name):
-    """Legacy config-name (with _Nctamma/_static, kept as readable test IDs) ->
-    (pure-geometry config, cta_group, scheduler)."""
-    m = _LEGACY_RE.match(legacy_name)
-    assert m, legacy_name
-    return (
-        _NAME_TO_CFG[m.group(1)],
-        int(m.group(2)),
-        "static" if m.group(3) else "clc",
-    )
 
 
 def _sweep_config_names() -> list[str]:
@@ -594,11 +541,6 @@ def _block_quant_reference(
     inv = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
     q = (blocks * inv.unsqueeze(-1)).clamp(-output_max, output_max)
     return q.to(out_dtype).view(B, M, N), scale
-
-
-def _batched_reference(a: torch.Tensor, b: torch.Tensor, out_dtype: str) -> torch.Tensor:
-    ref = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
-    return ref.to(_TORCH_DTYPE[out_dtype])
 
 
 def _batch_broadcast_reference(a: torch.Tensor, b: torch.Tensor, batch: int, out_dtype: str) -> torch.Tensor:
@@ -1011,7 +953,7 @@ def test_nonpacked_batched_matmul(
     compiled(_vp(compiled, a, b, c))
     torch.cuda.synchronize()
 
-    ref = _batched_reference(a, b, out_dt)
+    ref = _reference(a, b, out_dt)
     diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
     tol = _tolerance(in_dt, out_dt)
     bad = int((diff > tol).sum().item())
@@ -1059,7 +1001,7 @@ def test_zero_stride_broadcast_input_matmul(
     compiled(_vp(compiled, a, b, c))
     torch.cuda.synchronize()
 
-    ref = _batched_reference(a, b, out_dt)
+    ref = _reference(a, b, out_dt)
     torch.testing.assert_close(c, ref, atol=0, rtol=0)
 
 
@@ -1106,7 +1048,7 @@ def test_batched_matmul(
     compiled(_vp(compiled, a, b, c))
     torch.cuda.synchronize()
 
-    ref = _batched_reference(a, b, out_dt)
+    ref = _reference(a, b, out_dt)
     diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
     tol = _tolerance(in_dt, out_dt)
     bad = int((diff > tol).sum().item())
@@ -1157,7 +1099,7 @@ def test_input_layout_batched_matmul(
     compiled(_vp(compiled, a, b, c))
     torch.cuda.synchronize()
 
-    ref = _batched_reference(a, b, out_dt)
+    ref = _reference(a, b, out_dt)
     diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
     assert int((diff > _tolerance(in_dt, out_dt)).sum().item()) == 0
 

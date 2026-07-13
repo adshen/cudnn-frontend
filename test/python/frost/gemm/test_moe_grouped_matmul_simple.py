@@ -8,35 +8,21 @@ import cudnn.frost.gemm  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    ceil_div as _ceil_div,
+    to_blocked as _to_blocked,
+    block_quant_ref as _block_quant_ref,
+    reduction_ref as _reduction_ref,
+    reduction_dims as _reduction_dims,
+    FULL_EXPERT_REDUCE_OFFSETS as _FULL_EXPERT_REDUCE_OFFSETS,
+)
+
 from cudnn.frost.gemm.graph_analyzer import analyze
-from cudnn.frost.gemm.tile_config import CATALOG
+from cudnn.frost.gemm.tile_config import by_name
 
 pytestmark = pytest.mark.L0
-
-
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config (bypassing the
-    FROST engine's auto-select). Exposes chain / binding / block_scale / aux_names;
-    callable with a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc"):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
 
 
 def _vp_moe(compiled, token, weight, fto, output):
@@ -57,44 +43,6 @@ _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
 _GEOMETRIES = [
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
     ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", 1),
-]
-_FULL_EXPERT_REDUCE_OFFSETS = [
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    15,
-    16,
-    17,
-    18,
-    127,
-    255,
-    383,
-    483,
-    515,
-    643,
-    718,
-    924,
-    1100,
-    1200,
-    1300,
-    1400,
-    1500,
-    1600,
-    1700,
-    1800,
-    1900,
 ]
 
 _QUANT_CASES = [
@@ -141,23 +89,10 @@ _QUANT_CASES = [
 ]
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
 def _quant_scale_shape(S: int, N: int, reorder: bool) -> tuple[int, int, int]:
     if reorder:
         return (1, _ceil_div(S, 128) * 128, _ceil_div(N // 32, 4) * 4)
     return (1, S, N // 32)
-
-
-def _to_blocked(x: torch.Tensor) -> torch.Tensor:
-    rows, cols = x.shape
-    nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
-    pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
-    pad[:rows, :cols] = x
-    blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
 
 
 def _build_graph(
@@ -388,18 +323,6 @@ def _offsets(group_sizes, S, dtype=torch.int32):
     return torch.tensor(starts, dtype=dtype, device="cuda")
 
 
-def _ref(token, weight, offsets, S, N, E):
-    out = torch.zeros((S, N), dtype=torch.float32, device="cuda")
-    starts = offsets.tolist()
-    for g in range(len(starts)):
-        b = starts[g]
-        e = starts[g + 1] if g + 1 < len(starts) else S
-        if b == e:
-            continue
-        out[b:e] = token[0, b:e].float() @ weight[g % E].float().T
-    return out.to(torch.bfloat16)
-
-
 def _ref_f32(token, weight, offsets, S, N, E):
     out = torch.zeros((S, N), dtype=torch.float32, device="cuda")
     starts = offsets.tolist()
@@ -412,34 +335,10 @@ def _ref_f32(token, weight, offsets, S, N, E):
     return out
 
 
-def _block_quant_ref(x, block_size, out_dtype, scale_dtype):
-    blocks = x.view(1, x.shape[0], x.shape[1] // block_size, block_size)
-    output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
-    scale_f = blocks.abs().amax(dim=-1) / output_max
-    if scale_dtype is torch.float8_e8m0fnu:
-        safe = torch.where(scale_f > 0, scale_f, 1.0)
-        scale_f = torch.where(scale_f > 0, torch.pow(2.0, torch.ceil(torch.log2(safe))), 0.0)
-    scale = scale_f.to(scale_dtype)
-    inv = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
-    q = (blocks * inv.unsqueeze(-1)).clamp(-output_max, output_max)
-    q = q.to(out_dtype).view(1, x.shape[0], x.shape[1])
-    return q, scale
-
-
 def _block_quant_q_atol(scale_dtype) -> float:
     # Non-pow2 E4M3 scales use the kernel's approximate reciprocal → up to one
     # smallest E4M3 output step off the torch reference.
     return 1.0 / 512.0 if scale_dtype is torch.float8_e4m3fn else 0.0
-
-
-def _reduction_ref(x: torch.Tensor, mode, dims: tuple[int, ...]) -> torch.Tensor:
-    if mode == cudnn.reduction_mode.AMAX:
-        return x.abs().amax(dim=dims, keepdim=True)
-    if mode == cudnn.reduction_mode.MAX:
-        return x.amax(dim=dims, keepdim=True)
-    if mode == cudnn.reduction_mode.MIN:
-        return x.amin(dim=dims, keepdim=True)
-    return x.sum(dim=dims, keepdim=True)
 
 
 def _group_reduction_ref(
@@ -480,10 +379,6 @@ def _group_sizes_from_offsets(offsets: list[int], total: int) -> list[int]:
     return [(offsets[i + 1] if i + 1 < len(offsets) else total) - offsets[i] for i in range(len(offsets))]
 
 
-def _reduction_dims(out_dims: tuple[int, int, int], full: tuple[int, int, int]):
-    return tuple(i for i, (out_extent, full_extent) in enumerate(zip(out_dims, full)) if out_extent == 1 and full_extent != 1)
-
-
 def _mk_nonpacked_data(S, N, K, E, mode):
     torch.manual_seed(0)
     if mode == "zero_stride":
@@ -509,7 +404,7 @@ _OFFSET_DTYPES = [
 ]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 @pytest.mark.parametrize("offset_cudnn_dt,offset_torch_dt", _OFFSET_DTYPES)
 @pytest.mark.parametrize(
@@ -523,7 +418,7 @@ _OFFSET_DTYPES = [
 def test_moe_e2e(group_sizes, offset_cudnn_dt, offset_torch_dt, cfg_name, cta_group) -> None:
     E, N, K = 8, 256, 128
     S = sum(group_sizes)
-    cfg = next(c for c in CATALOG if c.name == cfg_name)
+    cfg = by_name(cfg_name)
     compiled = _plan(
         _build_graph(E, S, N, K, offset_dt=offset_cudnn_dt),
         config=cfg,
@@ -538,10 +433,10 @@ def test_moe_e2e(group_sizes, offset_cudnn_dt, offset_torch_dt, cfg_name, cta_gr
 
     compiled(_vp_moe(compiled, token, weight, offsets, output))
     torch.cuda.synchronize()
-    torch.testing.assert_close(output[0], _ref(token, weight, offsets, S, N, E), atol=1e-1, rtol=1e-2)
+    torch.testing.assert_close(output[0], _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 @pytest.mark.parametrize(
     "case_name,out_dt,out_torch_dt,scale_dt,scale_torch_dt,scale_reorder,group_sizes,N",
@@ -564,7 +459,7 @@ def test_moe_block_quant_epilogue(
     N = int(N)
     S = sum(group_sizes)
     scale_shape = _quant_scale_shape(S, N, scale_reorder)
-    cfg = next(c for c in CATALOG if c.name == cfg_name)
+    cfg = by_name(cfg_name)
     compiled = _plan(
         _build_graph(
             E,
@@ -627,7 +522,7 @@ def _run_moe_reduction(
     if group_sizes is None:
         group_sizes = [64, 0, 120, 72]
     S = sum(group_sizes)
-    cfg = next(c for c in CATALOG if c.name == cfg_name)
+    cfg = by_name(cfg_name)
     compiled = _plan(
         _build_graph(
             E,
@@ -679,7 +574,7 @@ def _run_moe_reduction(
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 @pytest.mark.parametrize(
     "mode",
@@ -694,7 +589,7 @@ def test_moe_reduction_scalar_fp32(mode, cfg_name, cta_group) -> None:
     _run_moe_reduction(cfg_name, cta_group, mode, [1, 1, 1])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize(
     "mode,red_dims,red_stride",
     [
@@ -713,7 +608,7 @@ def test_moe_reduction_partial_strided_fp32(mode, red_dims, red_stride) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize(
     "mode",
     [
@@ -736,7 +631,7 @@ def test_moe_reduction_scalar_int32(mode) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 def test_moe_group_reduction_amax_scalar_fp32(cfg_name, cta_group) -> None:
     _run_moe_reduction(
@@ -749,7 +644,7 @@ def test_moe_group_reduction_amax_scalar_fp32(cfg_name, cta_group) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 def test_moe_group_reduction_full_expert_amax_fp32() -> None:
     group_sizes = _group_sizes_from_offsets(_FULL_EXPERT_REDUCE_OFFSETS, 2000)
     _run_moe_reduction(
@@ -765,7 +660,7 @@ def test_moe_group_reduction_full_expert_amax_fp32() -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize(
     "mode",
     [
@@ -786,7 +681,7 @@ def test_moe_group_reduction_per_col_fp32(mode) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize(
     "cfg_name,cta_group,mode",
     [
@@ -799,7 +694,7 @@ def test_moe_nonpacked_tensors(cfg_name, cta_group, mode) -> None:
     group_sizes = [64, 0, 200, 128, 100, 12, 196, 68]
     E, N, K = 8, 256, 128
     S = sum(group_sizes)
-    cfg = next(c for c in CATALOG if c.name == cfg_name)
+    cfg = by_name(cfg_name)
     compiled = _plan(_build_graph(E, S, N, K), config=cfg, cta_group=cta_group)
 
     token, weight, output = _mk_nonpacked_data(S, N, K, E, mode)
@@ -811,70 +706,19 @@ def test_moe_nonpacked_tensors(cfg_name, cta_group, mode) -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(
         output[0],
-        _ref(token, weight, offsets, S, N, E),
+        _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16),
         atol=1e-1,
         rtol=1e-2,
     )
 
 
-def _ref_bxe(token, weight, offsets, S, N, num_experts, num_groups):
-    """Reference for BxE > E: group g uses expert g % num_experts."""
-    out = torch.zeros((S, N), dtype=torch.float32, device="cuda")
-    starts = offsets.tolist()
-    for g in range(num_groups):
-        b = starts[g]
-        e = starts[g + 1] if g + 1 < num_groups else S
-        if b == e:
-            continue
-        out[b:e] = token[0, b:e].float() @ weight[g % num_experts].float().T
-    return out.to(torch.bfloat16)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
 def test_moe_bxe_gt_e(cfg_name, cta_group) -> None:
     """num_groups (BxE) > num_experts (E): expert = group % E."""
     S, N, K, E = 2000, 248, 520, 9
-    offset_values = [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-        127,
-        255,
-        383,
-        483,
-        515,
-        643,
-        718,
-        924,
-        1100,
-        1200,
-        1300,
-        1400,
-        1500,
-        1600,
-        1700,
-        1800,
-        1900,
-    ]
-    num_groups = len(offset_values)  # 36 > E=9
-    cfg = next(c for c in CATALOG if c.name == cfg_name)
+    offset_values = _FULL_EXPERT_REDUCE_OFFSETS
+    cfg = by_name(cfg_name)
     compiled = _plan(_build_graph(E, S, N, K), config=cfg, cta_group=cta_group)
 
     torch.manual_seed(0)
@@ -889,7 +733,7 @@ def test_moe_bxe_gt_e(cfg_name, cta_group) -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(
         output[0],
-        _ref_bxe(token, weight, offsets, S, N, E, num_groups),
+        _ref_f32(token, weight, offsets, S, N, E).to(torch.bfloat16),
         atol=2e-1,
         rtol=5e-2,
     )

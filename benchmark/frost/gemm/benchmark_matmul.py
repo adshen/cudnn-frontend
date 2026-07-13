@@ -241,8 +241,6 @@ def _nsys_run_and_parse(
 ) -> dict[str, float]:
     """Re-exec self under nsys, parse `cuda_gpu_kern_sum` for median kernel
     time (ms) per config. Returns {config_name_or_'cuBLAS': median_ms}."""
-    # Prefer the system-wide nsys; the PATH cuda-13.x bundle has a broken
-    # libbpf.so.1 dependency on B200.
     nsys = "/usr/local/bin/nsys" if os.path.exists("/usr/local/bin/nsys") else shutil.which("nsys")
     if nsys is None:
         sys.exit("nsys not found — install nsight-systems or use the default events mode.")

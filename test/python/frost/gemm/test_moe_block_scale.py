@@ -9,110 +9,30 @@ import cudnn.frost.gemm  # noqa: F401  (installs hook)
 import pytest
 import torch
 
+from gemm_test_utils import (
+    requires_sm100,
+    Plan as _plan,
+    vp_bs as _vp_bs,
+    E2M1 as _E2M1,
+    ceil_div as _ceil_div,
+    to_blocked as _to_blocked,
+    unpack_fp4 as _unpack_fp4,
+    rand_e8m0 as _rand_e8m0,
+    block_quant_ref as _block_quant_ref,
+    reduction_ref as _reduction_ref,
+    reduction_dims as _reduction_dims,
+    assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
+)
+
 from cudnn.frost.gemm.compiler import jit_from_cudnn_graph
 from cudnn.frost.gemm.graph_analyzer import analyze
-from cudnn.frost.gemm.tile_config import CATALOG
+from cudnn.frost.gemm.tile_config import by_name
 
 pytestmark = pytest.mark.L0
 
 
-class _Plan:
-    """JIT-compiles a recorded graph with a forced tile config (bypassing the
-    FROST engine's auto-select). Exposes chain / binding / block_scale / aux_names;
-    callable with a variant pack."""
-
-    def __init__(self, graph, config=None, cta_group=2, scheduler="clc"):
-        self.g = graph
-        kw = dict(cta_group=cta_group, scheduler=scheduler)
-        if config is not None:
-            kw["config"] = config
-        self._compiled = jit_from_cudnn_graph(graph, **kw)
-        self.chain = self._compiled.chain
-        self.binding = self._compiled.binding
-        self.block_scale = self.chain.has_block_scale
-        self.aux_names = [t.name for t in self.chain.aux_tensors]
-
-    def __call__(self, variant_pack):
-        return self._compiled(variant_pack)
-
-
-def _plan(graph, config=None, cta_group=2, scheduler="clc"):
-    return _Plan(graph, config=config, cta_group=cta_group, scheduler=scheduler)
-
-
-def _vp_moe_bs(compiled, token, weight, sfa, sfb, fto, output):
-    """MoE block-scale single-GEMM variant-pack dict from the binding."""
-    bd = compiled.binding
-    outs = list(output) if isinstance(output, (list, tuple)) else [output]
-    vp = {
-        bd.a_operands[0]: token,
-        bd.b_operands[0]: weight,
-        bd.sfa_operands[0]: sfa,
-        bd.sfb_operands[0]: sfb,
-        bd.first_token_offset: fto,
-    }
-    vp.update({t: buf for t, buf in zip(bd.outputs, outs)})
-    return vp
-
-
 _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
 _CFG_1CTA = "CONFIG_sm100_128x256x128_128x256x32_cluster1x1"
-
-_E2M1 = [
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
-
-
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def _to_blocked(x: torch.Tensor) -> torch.Tensor:
-    rows, cols = x.shape
-    nrb, ncb = _ceil_div(rows, 128), _ceil_div(cols, 4)
-    pad = torch.zeros(nrb * 128, ncb * 4, dtype=x.dtype, device=x.device)
-    pad[:rows, :cols] = x
-    blocks = pad.view(nrb, 128, ncb, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
-
-
-def _unpack_fp4(u8: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
-    lo = lut[(u8 & 0xF).long()]
-    hi = lut[(u8 >> 4).long()]
-    return torch.stack([lo, hi], dim=-1).flatten(-2)
-
-
-def _rand_e8m0(shape, dev):
-    return torch.randint(125, 129, shape, dtype=torch.uint8, device=dev).view(torch.float8_e8m0fnu)
-
-
-def _block_quant_ref(x, block_size, out_dtype, scale_dtype):
-    blocks = x.view(1, x.shape[0], x.shape[1] // block_size, block_size)
-    output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
-    scale_f = blocks.abs().amax(dim=-1) / output_max
-    if scale_dtype is torch.float8_e8m0fnu:
-        safe = torch.where(scale_f > 0, scale_f, 1.0)
-        scale_f = torch.where(scale_f > 0, torch.pow(2.0, torch.ceil(torch.log2(safe))), 0.0)
-    scale = scale_f.to(scale_dtype)
-    inv = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
-    q = (blocks * inv.unsqueeze(-1)).clamp(-output_max, output_max)
-    q = q.to(out_dtype).view(1, x.shape[0], x.shape[1])
-    return q, scale
 
 
 def _block_quant_q_atol(scale_dtype) -> float:
@@ -356,27 +276,6 @@ def test_analyzer_detects_moe_block_scale_reduction() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _reduction_ref(x: torch.Tensor, mode, dims: tuple[int, ...]) -> torch.Tensor:
-    if mode == cudnn.reduction_mode.AMAX:
-        return x.abs().amax(dim=dims, keepdim=True)
-    if mode == cudnn.reduction_mode.MAX:
-        return x.amax(dim=dims, keepdim=True)
-    if mode == cudnn.reduction_mode.MIN:
-        return x.amin(dim=dims, keepdim=True)
-    return x.sum(dim=dims, keepdim=True)
-
-
-def _reduction_dims(out_dims: tuple[int, int, int], full: tuple[int, int, int]):
-    return tuple(i for i, (out_extent, full_extent) in enumerate(zip(out_dims, full)) if out_extent == 1 and full_extent != 1)
-
-
-def _assert_block_scale_reduction_close(actual, expected, mode):
-    if mode == cudnn.reduction_mode.ADD:
-        torch.testing.assert_close(actual, expected, atol=2.0, rtol=1e-4)
-    else:
-        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
-
-
 def _run_e2e(
     E,
     S,
@@ -403,7 +302,7 @@ def _run_e2e(
 ):
     dev = "cuda"
     torch.manual_seed(0)
-    block_size, _, sf_dt = _COMBOS[combo]
+    block_size = _COMBOS[combo][0]
     is_fp4 = combo in ("nvfp4", "mxfp4")
     sf_k = K // block_size
     num_groups = len(offsets_list)
@@ -428,7 +327,7 @@ def _run_e2e(
         sfa_log = _rand_e8m0((S, sf_k), dev)
         sfb_log = _rand_e8m0((E, N, sf_k), dev)
 
-    cfg = next(c for c in CATALOG if c.name == config_name)
+    cfg = by_name(config_name)
     quant_scale_shape = _quant_scale_shape(S, N, quant_scale_reorder)
     compiled = _plan(
         _build_graph(
@@ -488,7 +387,7 @@ def _run_e2e(
     else:
         output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
 
-    compiled(_vp_moe_bs(compiled, tok_rt, w_rt, sfa_blk, sfb_blk, offsets, output))
+    compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
     torch.cuda.synchronize()
 
     tok_s = tok_deq * sfa_log.float().repeat_interleave(block_size, 1)
@@ -531,7 +430,7 @@ def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
     torch.manual_seed(0)
     E, S, N, K = 2, 512, 256, 512
     offsets_list = [0, 100, 300]
-    block_size, _, sf_dt = _COMBOS[combo]
+    block_size = _COMBOS[combo][0]
     is_fp4 = combo in ("nvfp4", "mxfp4")
     sf_k = K // block_size
 
@@ -575,7 +474,7 @@ def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
         sfa_log = _rand_e8m0((S, sf_k), dev)
         sfb_log = _rand_e8m0((E, N, sf_k), dev)
 
-    cfg = next(c for c in CATALOG if c.name == config_name)
+    cfg = by_name(config_name)
     compiled = _plan(
         _build_graph(E, S, N, K, len(offsets_list), combo),
         config=cfg,
@@ -593,7 +492,7 @@ def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
     assert not tok_rt.is_contiguous() or not w_rt.is_contiguous()
     assert not output.is_contiguous()
 
-    compiled(_vp_moe_bs(compiled, tok_rt, w_rt, sfa_blk, sfb_blk, offsets, output))
+    compiled(_vp_bs(compiled, tok_rt, w_rt, output, sfa_blk, sfb_blk, fto=offsets))
     torch.cuda.synchronize()
 
     tok_s = tok_deq * sfa_log.float().repeat_interleave(block_size, 1)
@@ -615,17 +514,20 @@ def _run_nonpacked_e2e(combo, config_name, cta_group, mode):
         [0, 256, 384, 512],  # 4 groups, last extends to S
     ],
 )
+@requires_sm100
 def test_e2e_nvfp4_groups(offsets_list) -> None:
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=offsets_list)
 
 
 @pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])
+@requires_sm100
 def test_e2e_mx_combos(combo) -> None:
     # mxfp4 (FP4 + E8M0, block32) / mxfp8 (FP8 E4M3 + E8M0, block32), K-major.
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=[0, 256, 384, 512], combo=combo)
 
 
 @pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@requires_sm100
 def test_e2e_1ctamma(combo) -> None:
     # 1-CTA MMA path (cluster1x1), all three block-scale combos. BxE>E groups.
     _run_e2e(
@@ -645,6 +547,7 @@ def test_e2e_1ctamma(combo) -> None:
     _QUANT_CASES,
     ids=[case[0] for case in _QUANT_CASES],
 )
+@requires_sm100
 def test_e2e_block_quant_epilogue(
     case_name,
     combo,
@@ -677,7 +580,7 @@ def test_e2e_block_quant_epilogue(
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", [(_CFG, 2), (_CFG_1CTA, 1)])
 @pytest.mark.parametrize(
     "mode",
@@ -702,7 +605,7 @@ def test_e2e_reduction_epilogue(mode, cfg_name, cta_group) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@requires_sm100
 @pytest.mark.parametrize(
     "mode,red_dims,red_stride",
     [
@@ -737,7 +640,7 @@ def test_moe_block_scale_reduction_rejects_int32() -> None:
         reduction_dt=cudnn.data_type.INT32,
         reduction_compute_dt=cudnn.data_type.INT32,
     )
-    cfg = next(c for c in CATALOG if c.name == _CFG_1CTA)
+    cfg = by_name(_CFG_1CTA)
     with pytest.raises(
         NotImplementedError,
         match="MoE block-scale reduction supports only fp32 compute/output",
@@ -755,6 +658,7 @@ def test_moe_block_scale_reduction_rejects_int32() -> None:
         (1, _CFG_1CTA),
     ],
 )
+@requires_sm100
 def test_e2e_unaligned_groups(cta_group, config_name) -> None:
     _run_e2e(
         E=2,
@@ -768,6 +672,7 @@ def test_e2e_unaligned_groups(cta_group, config_name) -> None:
     )
 
 
+@requires_sm100
 def test_e2e_nvfp4_offset_int64() -> None:
     _run_e2e(
         E=2,
@@ -780,6 +685,7 @@ def test_e2e_nvfp4_offset_int64() -> None:
     )
 
 
+@requires_sm100
 def test_e2e_nvfp4_empty_group() -> None:
     # An empty routed group (begin == end) must be skipped cleanly.
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=[0, 256, 256, 512])
@@ -793,5 +699,6 @@ def test_e2e_nvfp4_empty_group() -> None:
         ("mxfp8", _CFG_1CTA, 1, "zero_stride"),
     ],
 )
+@requires_sm100
 def test_e2e_nonpacked_tensors(combo, config_name, cta_group, mode) -> None:
     _run_nonpacked_e2e(combo, config_name, cta_group, mode)
