@@ -12,4 +12,9 @@ oss:rel:
     - .cudnn_rel_image:template
     - .fetch_cudnn_rel:template
     - .oss_tests:template
+  parallel:
+    matrix:
+      - ARCH: ["Hopper", "Ampere"]
+      - ARCH: ["Blackwell"]
+        OSS_TEST_SHARD: ["shard0", "shard1"]
   needs: []
