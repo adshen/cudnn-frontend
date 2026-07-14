@@ -1,8 +1,4 @@
-"""Shared FROST engine DISPATCH: registry, pygraph lifecycle patches, strict
-select, knob-request plumbing. Deliberately no ranking intelligence — real
-heuristics are per operation and live next to the op's facts/knobs types when
-they earn their existence (see "Heuristics are per operation" in README.md).
-
+"""Shared FROST engine dispatch for the ``cudnn.frost`` OSS engines.
 
 FROST engines are named engines appended (by name, e.g. GEMM = ``frost_gemm_eng0``) to the
 plan list produced by the native cuDNN heuristics; the default stays cuDNN and
@@ -29,39 +25,6 @@ _LOG = logging.getLogger(__name__)
 # FROST engines are OFF by default; opt in via this env var.
 _ENABLE_ENV = "NV_CUDNN_FE_ENABLE_FROST_ENGINES"
 
-# The in-tree OPSETS: one module per operation family (op + pass), imported
-# lazily at first probe when FROST is enabled. An opset module owns one
-# operation's engines end to end — its analyzer's pattern match is the
-# graph->opset membership test, and importing it runs the register_engine()
-# calls for every engine it serves (see "Opsets" in frost/README.md). This
-# tuple is a manifest, not a registry of behavior; the env var stays the ONE
-# user-facing opt-in — users never need to know which module registers which
-# engine name. Out-of-tree opsets can still register by importing their own
-# module before building plans (or via entry points, if that ever lands).
-_OPSET_MODULES = (
-    "cudnn.frost.gemm",
-    "cudnn.sdpa.fwd.engines",
-)
-_OPSETS_LOADED = False
-
-
-def _ensure_opsets_loaded() -> None:
-    """Lazily import the in-tree opset modules (once) when FROST is enabled.
-
-    Deferred to first probe so that `import cudnn` never pays the opsets'
-    import cost (torch / CuTe DSL) for users who never enable FROST."""
-    global _OPSETS_LOADED
-    if _OPSETS_LOADED or not frost_engines_enabled():
-        return
-    _OPSETS_LOADED = True
-    import importlib
-
-    for mod in _OPSET_MODULES:
-        try:
-            importlib.import_module(mod)
-        except Exception:  # noqa: BLE001 — one opset's import failure must not kill the rest
-            _LOG.warning("cudnn.frost: failed to import opset module %s", mod, exc_info=True)
-
 
 def frost_engines_enabled() -> bool:
     """Whether FROST engines are enabled (env ``NV_CUDNN_FE_ENABLE_FROST_ENGINES``;
@@ -80,17 +43,13 @@ _ENGINES: "dict[str, tuple[Callable[[Any], bool], Callable[[Any], Any]]]" = {}
 
 
 def register_engine(name: str, probe: Callable[[Any], bool], build: Callable[[Any], Any]) -> None:
-    """Register a named FROST engine (idempotent). ``name`` is what
-    ``select_engines`` / ``deselect_engines`` match (e.g. ``frost_gemm_eng0``,
-    ``sdpa_fwd_prefill_sm100_d512`` — naming is the op's choice; see the op's
-    engines module and python/cudnn/frost/README.md)."""
+    """Register a named FROST engine (idempotent). ``name`` (``frost_<op>_eng<N>``,
+    e.g. ``frost_gemm_eng0``) is what ``select_engines`` / ``deselect_engines`` match."""
     _ENGINES[name] = (probe, build)
 
 
 def engine_names() -> "list[str]":
-    """Registered FROST engine names, in registration order (loads the
-    in-tree opset modules first if FROST is enabled)."""
-    _ensure_opsets_loaded()
+    """Registered FROST engine names, in registration order."""
     return list(_ENGINES)
 
 
@@ -114,8 +73,6 @@ def _plan_state(graph: cudnn.pygraph) -> dict:
             "selected": None,  # name pinned via select_engines, else None
             "barred": set(),  # names removed via deselect_engines
             "compiled": {},  # name -> compiled plan (filled lazily)
-            "knobs": None,  # per-graph tuning request (op-specific dataclass), see set_engine_knobs
-            "probed": False,  # whether _probe_and_append has run (re-probe trigger for knob changes)
         }
         _PLAN_STATES[graph] = state
     return state
@@ -146,10 +103,8 @@ def _probe_and_append(graph: cudnn.pygraph) -> None:
     """Probe every registered FROST engine and record the eligible ones (no compile)."""
     state = _plan_state(graph)
     state["eligible"] = []
-    state["probed"] = True
     if not frost_engines_enabled():
         return
-    _ensure_opsets_loaded()
     for name, (probe, _build) in _ENGINES.items():
         try:
             ok = probe(graph)
@@ -220,9 +175,6 @@ def _patched_select_engines(self, engine_names):
     best-effort (cuDNN keeps its own candidate — no C++ hook)."""
     if isinstance(engine_names, str):
         engine_names = [engine_names]
-    # A user may select before create_execution_plans has probed; make sure
-    # the in-tree opsets are loaded so their engine names are recognized.
-    _ensure_opsets_loaded()
     state = _plan_state(self)
     frost = [n for n in engine_names if is_frost_engine(n)]
     if frost:
@@ -246,52 +198,8 @@ def _patched_deselect_engines(self, engine_names):
     return self
 
 
-def _raise_if_selected_but_ineligible(graph: cudnn.pygraph) -> None:
-    """A selected FROST engine must run — never silently fall back to native.
-
-    ``select_engines([<frost name>])`` records the pin; if the probe deemed the
-    graph ineligible (or the engine was deselected afterwards), running the
-    native path instead would be a silent false positive, so fail loudly.
-    """
-    state = _get_plan_state(graph)
-    if state is None:
-        return
-    sel = state["selected"]
-    if sel is not None and _active_frost(graph) is None:
-        raise ValueError(
-            f"cudnn.frost: engine {sel!r} was selected via select_engines() but "
-            f"is not eligible for this graph (probe rejected it or it was "
-            f"deselected); eligible FROST engines: {_live_frost_engines(state)}"
-        )
-
-
-def _patched_set_engine_knobs(self, knobs):
-    """Attach a per-graph tuning request (an op-specific knobs dataclass, e.g.
-    ``cudnn.sdpa.fwd.SdpaFwdKnobs``). Knob requests change eligibility — an
-    engine that cannot honor a requested value is ineligible — so if the
-    engines were already probed, they are re-probed against the new request.
-    There is deliberately no global knob enum: each operation defines its own
-    typed vocabulary, each engine advertises the domains it honors."""
-    state = _plan_state(self)
-    state["knobs"] = knobs
-    state["compiled"] = {}  # a different request may lower differently
-    # Re-probe on the "probed" flag, NOT on a non-empty eligible list: if a
-    # previous request made every engine ineligible, eligible is [] but a new
-    # (honorable) request must still restore eligibility.
-    if state["probed"]:
-        _probe_and_append(self)
-    return self
-
-
-def requested_knobs(graph: cudnn.pygraph):
-    """The tuning request attached via ``set_engine_knobs``, or None."""
-    state = _get_plan_state(graph)
-    return None if state is None else state.get("knobs")
-
-
 def _patched_check_support(self, *args, **kwargs):
     # FROST eligibility already decided by the probe; native check for cuDNN plans.
-    _raise_if_selected_but_ineligible(self)
     if _active_frost(self) is not None:
         return None
     return _ORIGINALS["check_support"](self, *args, **kwargs)
@@ -299,7 +207,6 @@ def _patched_check_support(self, *args, **kwargs):
 
 def _patched_build_plans(self, *args, **kwargs):
     # Selected FROST engine → lazy JIT-compile now; else native build.
-    _raise_if_selected_but_ineligible(self)
     if _active_frost(self) is not None:
         _compile_selected(self)
         return None
@@ -307,7 +214,6 @@ def _patched_build_plans(self, *args, **kwargs):
 
 
 def _patched_execute(self, *args, **kwargs):
-    _raise_if_selected_but_ineligible(self)
     if _active_frost(self) is not None:
         compiled = _compile_selected(self)  # cached if build_plans already ran
         variant_pack = args[0] if args else kwargs.get("tensor_to_device_buffer")
@@ -342,7 +248,6 @@ def install_lifecycle_patches() -> None:
         "build": _patched_build,
         "select_engines": _patched_select_engines,
         "deselect_engines": _patched_deselect_engines,
-        "set_engine_knobs": _patched_set_engine_knobs,
         "check_support": _patched_check_support,
         "build_plans": _patched_build_plans,
         "execute": _patched_execute,

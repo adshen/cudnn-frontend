@@ -1916,7 +1916,7 @@ def probe_supported(
 ) -> None:
     """Cheap eligibility check — the :func:`jit_from_cudnn_graph` gates WITHOUT
     ``cute.compile``. Raises if the engine can't run the graph. Used by the FROST
-    engine probe to decide whether to list ``frost_gemm_eng0`` (see cudnn.frost.dispatch).
+    engine probe to decide whether to list ``frost_gemm_eng0`` (see cudnn.frost.heuristics).
 
     Block-scale / MoE gate inside their ``_jit_*`` compile paths; here a
     successful analysis is treated as eligible (full validation at compile)."""

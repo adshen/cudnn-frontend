@@ -482,7 +482,7 @@ def _graph_has_gemm(graph: cudnn.pygraph) -> bool:
 
 
 # GEMM engine ("frost_gemm_eng0"), registered with the shared cudnn.frost dispatch (see
-# cudnn/frost/dispatch.py). probe_gemm_plan = eligibility (no compile);
+# cudnn/frost/heuristics.py). probe_gemm_plan = eligibility (no compile);
 # build_gemm_plan = JIT when selected. Forced-config callers use jit_from_cudnn_graph.
 
 

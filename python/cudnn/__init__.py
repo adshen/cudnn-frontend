@@ -273,13 +273,6 @@ from .nodes import Node
 from .graph import graph, jit, graph_cache
 from .wrapper import Graph
 
-# FROST engine dispatch: installs the (inert) pygraph lifecycle patches so
-# select_engines / set_engine_knobs work without a magic per-op import. The
-# patches no-op unless NV_CUDNN_FE_ENABLE_FROST_ENGINES=1, and the opset
-# modules themselves are imported lazily at first probe (frost.heuristics
-# _ensure_opsets_loaded) — plain `import cudnn` stays light.
-from . import frost  # noqa: F401
-
 from typing import Any
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"

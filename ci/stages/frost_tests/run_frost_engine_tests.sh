@@ -16,7 +16,7 @@ function run_frost_tests() {
     export NV_CUDNN_FE_ENABLE_FROST_ENGINES=1
     
     echo "Running frost tests."
-    pytest test/python/frost/gemm test/python/frost/sdpa -n 4 --junit-xml=result-junit.xml --no-header --tb=short
+    pytest test/python/frost/gemm -n 4 --junit-xml=result-junit.xml --no-header --tb=short
 }
 
 display_header
