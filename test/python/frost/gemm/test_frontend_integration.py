@@ -12,7 +12,7 @@ from gemm_test_utils import requires_sm100
 import cudnn
 import cudnn.frost.gemm  # noqa: F401  (registers frost_gemm_eng0 + installs lifecycle patches)
 from cudnn.frost import engine_names, is_frost_engine
-from cudnn.frost.heuristics import _get_plan_state
+from cudnn.frost.dispatch import _get_plan_state
 
 pytestmark = pytest.mark.L0
 
@@ -190,7 +190,7 @@ def test_probe_exception_marks_ineligible(monkeypatch, caplog):
     path."""
     import logging
 
-    from cudnn.frost import heuristics as _h
+    from cudnn.frost import dispatch as _h
 
     def _raising_probe(_g):
         raise RuntimeError("probe boom")
@@ -206,7 +206,7 @@ def test_probe_exception_marks_ineligible(monkeypatch, caplog):
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    with caplog.at_level(logging.DEBUG, logger="cudnn.frost.heuristics"):
+    with caplog.at_level(logging.DEBUG, logger="cudnn.frost.dispatch"):
         _h._probe_and_append(g)  # must not raise despite one probe throwing
 
     state = _h._get_plan_state(g)

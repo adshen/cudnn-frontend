@@ -5,7 +5,7 @@ Importing this installs the shared FROST-engine lifecycle patch on
 via :func:`register_engine`; the user pins one via ``select_engines``.
 """
 
-from .heuristics import (
+from .dispatch import (
     engine_names,
     frost_engines_enabled,
     install_lifecycle_patches,
