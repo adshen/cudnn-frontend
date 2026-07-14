@@ -1,4 +1,4 @@
-"""Correctness sweep over (config × dtype-pair × shape) — the matmul regression gate.
+"""Matmul correctness regression gate over (config × dtype-pair × shape).
 
 Each case builds a frontend graph, JITs through the GEMM hook, and asserts
 bit-tight equality vs torch-fp32 (small-integer inputs keep the reduction exact).
@@ -146,15 +146,8 @@ _INPUT_LAYOUTS: tuple[tuple[str, str], ...] = (
     ("k", "n"),
     ("m", "n"),
 )
-_LAYOUT_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
-    ("bf16", "bf16"),
-    ("fp16", "fp16"),
-    ("fp8_e4m3", "fp16"),
-)
-_LAYOUT_CONFIGS: tuple[str, ...] = (
-    "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
-    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
-)
+# ("k", "k") is exactly test_matmul's matrix — sweep only the non-canonical combos.
+_NONCANONICAL_LAYOUTS: tuple[tuple[str, str], ...] = tuple(p for p in _INPUT_LAYOUTS if p != ("k", "k"))
 _NONPACKED_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
     "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
@@ -225,6 +218,7 @@ def _compatible(
     a_major: str = "k",
     b_major: str = "k",
     cta_group: int = 2,
+    out_major: str = "n",
 ) -> tuple[bool, str]:
     """Reject only shapes the kernel can't service. Returns (ok, reason)."""
     in_eb = _ELEM_BYTES[in_dtype]
@@ -251,9 +245,12 @@ def _compatible(
         return False, (f"A M-major per-CTA SMEM M={cta_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
     if b_major == "n" and (cta_smem_n < mn_group_elems or cta_smem_n % mn_group_elems != 0):
         return False, (f"B N-major per-CTA SMEM N={cta_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
-    if (N * out_eb) % 32 != 0:
+    out_contig_name, out_contig_extent = ("N", N) if out_major == "n" else ("M", M)
+    if (out_contig_extent * out_eb) % 32 != 0:
         return False, (
-            f"N*out_eb={N * out_eb} not 32B-aligned — STG full-vec store bakes " f"alignment=VEC_BYTES=32 at JIT. {out_dtype!r} needs N % {32 // out_eb} == 0."
+            f"{out_contig_name}*out_eb={out_contig_extent * out_eb} not 32B-aligned — "
+            f"STG full-vec store bakes alignment=VEC_BYTES=32 at JIT. "
+            f"{out_dtype!r} needs {out_contig_name} % {32 // out_eb} == 0."
         )
     return True, ""
 
@@ -574,16 +571,18 @@ def _pick_anchor(
     a_major: str = "k",
     b_major: str = "k",
     cta_group: int = 2,
+    out_major: str = "n",
 ) -> tuple[int, int, int] | None:
     """First menu shape compatible with (cfg, in_dt, out_dt), as the JIT anchor.
     The kernel is M/N/K-symbolic so any compatible shape works.
 
-    Foot-gun: the C row-stride alignment is baked at JIT from the anchor's N, so
-    the menu must be uniform in N-alignment class (enforced by `_compatible`)
-    for runtime shapes to be drop-in.
+    Foot-gun: the C row-stride alignment is baked at JIT from the anchor's
+    contiguous output dim (N, or M for M-major output), so the menu must be
+    uniform in that dim's alignment class (enforced by `_compatible`) for
+    runtime shapes to be drop-in.
     """
     for shape in _WEIRD_SHAPES:
-        ok, _ = _compatible(cfg, *shape, in_dt, out_dt, a_major, b_major, cta_group)
+        ok, _ = _compatible(cfg, *shape, in_dt, out_dt, a_major, b_major, cta_group, out_major)
         if ok:
             return shape
     return None
@@ -608,7 +607,7 @@ def _get_compiled(
             pytest.fail(entry, pytrace=False)
         return entry
 
-    anchor = _pick_anchor(cfg, in_dt, out_dt, a_major, b_major, cta_group)
+    anchor = _pick_anchor(cfg, in_dt, out_dt, a_major, b_major, cta_group, out_major)
     if anchor is None:
         # No compatible anchor to build against (rare; e.g. K_BYTES vs elem_bytes mismatch).
         msg = f"no menu shape is compatible with ({cfg.name}, {in_dt}->{out_dt})"
@@ -636,12 +635,13 @@ def _pick_batched_anchor(
     a_major: str = "k",
     b_major: str = "k",
     cta_group: int = 2,
+    out_major: str = "n",
 ) -> tuple[int, int, int] | None:
     """Pick a compatible M/N/K anchor for a fixed batch size."""
     for b, M, N, K in _BATCHED_SHAPES:
         if b != batch:
             continue
-        ok, _ = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
+        ok, _ = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group, out_major)
         if ok:
             return M, N, K
     return None
@@ -678,7 +678,7 @@ def _get_batched_compiled(
             pytest.fail(entry, pytrace=False)
         return entry
 
-    anchor = _pick_batched_anchor(cfg, in_dt, out_dt, batch, a_major, b_major, cta_group)
+    anchor = _pick_batched_anchor(cfg, in_dt, out_dt, batch, a_major, b_major, cta_group, out_major)
     if anchor is None:
         msg = f"no batched menu shape is compatible with " f"({cfg.name}, {in_dt}->{out_dt}, batch={batch})"
         cache[key] = msg
@@ -850,20 +850,21 @@ def test_dense_block_scale_quant_epilogue() -> None:
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("shape", _WEIRD_SHAPES, ids=[_shape_id(s) for s in _WEIRD_SHAPES])
 @pytest.mark.parametrize(
     "a_major,b_major",
-    _INPUT_LAYOUTS,
-    ids=[_layout_id(p) for p in _INPUT_LAYOUTS],
+    _NONCANONICAL_LAYOUTS,
+    ids=[_layout_id(p) for p in _NONCANONICAL_LAYOUTS],
 )
 @pytest.mark.parametrize(
     "in_dt,out_dt",
-    _LAYOUT_DTYPE_PAIRS,
-    ids=[_dtype_id(p) for p in _LAYOUT_DTYPE_PAIRS],
+    _CORE_DTYPE_PAIRS,
+    ids=[_dtype_id(p) for p in _CORE_DTYPE_PAIRS],
 )
 @pytest.mark.parametrize(
     "config_name",
-    _LAYOUT_CONFIGS,
-    ids=[_config_id(n) for n in _LAYOUT_CONFIGS],
+    _sweep_config_names(),
+    ids=[_config_id(n) for n in _sweep_config_names()],
 )
 def test_input_layout_matmul(
     _compile_cache,
@@ -872,9 +873,10 @@ def test_input_layout_matmul(
     out_dt: str,
     a_major: str,
     b_major: str,
+    shape: tuple[int, int, int],
 ) -> None:
-    """Pure matmul coverage for A K/M-major and B K/N-major inputs."""
-    M, N, K = 256, 256, 256
+    """A M-major / B N-major inputs over the full (config, dtype, shape) matrix."""
+    M, N, K = shape
     cfg, cta_group, scheduler = _resolve(config_name)
     ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, cta_group)
     if not ok:
@@ -902,6 +904,8 @@ def test_input_layout_matmul(
         f"\n  config:    {config_name}"
         f"\n  dtype:     {in_dt} -> {out_dt}"
         f"\n  layout:    A{a_major}/B{b_major}"
+        f"\n  shape:     {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()}"
         f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
     )
 
@@ -1344,24 +1348,34 @@ def test_int8_matmul(config_name: str, out_dt: str) -> None:
     assert diff == 0.0, f"{config_name} -> {out_dt}: max|diff|={diff} (expected bit-exact)"
 
 
-# M-major batched output.
-_M_MAJOR_BATCHED_CASES: tuple[tuple[str, str, str], ...] = (
-    ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma", "bf16", "bf16"),
-    ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma", "bf16", "fp16"),
-    ("CONFIG_sm100_64x128x128_64x128x32_cluster1x1_1ctamma", "bf16", "bf16"),
-)
+# M-major batched output. The 32B store-alignment rule moves from N to M
+# (out_major="m"), so M-OOB menu shapes SKIP here.
 
 
+@pytest.mark.parametrize("shape", _WEIRD_SHAPES, ids=[_shape_id(s) for s in _WEIRD_SHAPES])
 @pytest.mark.parametrize(
-    "config_name,in_dt,out_dt",
-    _M_MAJOR_BATCHED_CASES,
-    ids=[f"{_config_id(c)}-{i}-{o}" for c, i, o in _M_MAJOR_BATCHED_CASES],
+    "in_dt,out_dt",
+    _CORE_DTYPE_PAIRS,
+    ids=[_dtype_id(p) for p in _CORE_DTYPE_PAIRS],
 )
-def test_m_major_output_batched(_compile_cache, config_name: str, in_dt: str, out_dt: str) -> None:
-    """M-major + batch>1: covers TMA-store and STG m-major store paths."""
-    batch, M, N, K = 3, 256, 256, 256
+@pytest.mark.parametrize(
+    "config_name",
+    _sweep_config_names(),
+    ids=[_config_id(n) for n in _sweep_config_names()],
+)
+def test_m_major_output_batched(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    shape: tuple[int, int, int],
+) -> None:
+    """M-major + batch>1 over the full (config, dtype, shape) matrix: covers
+    the TMA-store and STG m-major store paths."""
+    batch = 3
+    M, N, K = shape
     cfg, cta_group, scheduler = _resolve(config_name)
-    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, cta_group=cta_group)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, cta_group=cta_group, out_major="m")
     if not ok:
         pytest.skip(reason)
     compiled = _get_batched_compiled(
@@ -1377,7 +1391,17 @@ def test_m_major_output_batched(_compile_cache, config_name: str, in_dt: str, ou
     a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt, out_major="m")
     compiled(_vp(compiled, a, b, c))
     torch.cuda.synchronize()
-    torch.testing.assert_close(c, _reference(a, b, out_dt), atol=_tolerance(in_dt, out_dt), rtol=0)
+    ref = _reference(a, b, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance(in_dt, out_dt)
+    bad = int((diff > tol).sum().item())
+    assert bad == 0, (
+        f"\n  config:    {config_name}"
+        f"\n  dtype:     {in_dt} -> {out_dt}"
+        f"\n  shape:     B{batch}_{M}x{N}x{K} (M-major out)"
+        f"\n  bad:       {bad}/{diff.numel()}"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+    )
 
 
 # Standalone CLI shim — forwards remaining argv to pytest on this file.

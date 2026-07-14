@@ -229,14 +229,14 @@ _SUPPORTED_BS_CASES = [
 
 
 @pytest.mark.parametrize("a_dt,sf_dt,b_dt,bs", _SUPPORTED_BS_CASES)
-def test_block_scale_gate_accepts_supported(a_dt, sf_dt, b_dt, bs):
+def test_block_scale_matmul_gate_accepts_supported(a_dt, sf_dt, b_dt, bs):
     from cudnn.frost.gemm.compiler import _check_block_scale_supported
 
     chain = analyze(_build_nvfp4_graph(256, 256, 512, block_size=bs, sf_dt=sf_dt, a_dt=a_dt, b_dt=b_dt))
     _check_block_scale_supported(chain)
 
 
-def test_block_scale_gate_rejects_mismatches():
+def test_block_scale_matmul_gate_rejects_mismatches():
     from cudnn.frost.gemm.compiler import _check_block_scale_supported
 
     # Missing F8_128x4 SF reorder layout.
@@ -262,7 +262,7 @@ def test_block_scale_gate_rejects_mismatches():
         )
 
 
-def test_block_scale_gate_rejects_wrong_arch(monkeypatch):
+def test_block_scale_matmul_gate_rejects_wrong_arch(monkeypatch):
     import cudnn.frost.gemm.compiler as compiler
     from cudnn.frost.gemm.compiler import _check_block_scale_supported
 
@@ -275,7 +275,7 @@ def test_block_scale_gate_rejects_wrong_arch(monkeypatch):
 # Analyzer pattern matching (no GPU)
 
 
-def test_analyze_detects_nvfp4_block_scale():
+def test_analyze_detects_nvfp4_block_scale_matmul():
     chain = analyze(_build_nvfp4_graph(128, 256, 256, block_size=16))
     assert chain.has_block_scale
     bs = chain.block_scale
@@ -295,7 +295,7 @@ def test_analyze_detects_nvfp4_block_scale():
     assert bs.sf_dtype_a == "fp8_e4m3" and bs.sf_dtype_b == "fp8_e4m3"
 
 
-def test_analyze_detects_mxfp8_block_scale():
+def test_analyze_detects_mxfp8_block_scale_matmul():
     chain = analyze(
         _build_nvfp4_graph(
             128,
@@ -314,7 +314,7 @@ def test_analyze_detects_mxfp8_block_scale():
     assert bs.sf_scale_format == 1
 
 
-def test_analyze_detects_mxfp4_block_scale():
+def test_analyze_detects_mxfp4_block_scale_matmul():
     chain = analyze(_build_nvfp4_graph(128, 256, 256, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0))
     bs = chain.block_scale
     assert bs.combo == "mxfp4"
@@ -322,7 +322,7 @@ def test_analyze_detects_mxfp4_block_scale():
     assert bs.mma_block_scale_kind == "MXF4NVF4"
 
 
-def test_plain_matmul_has_no_block_scale():
+def test_plain_matmul_has_no_block_scale_matmul():
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -662,7 +662,7 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
         ),  # mx + overlap
     ],
 )
-def test_block_scale_numerics(combo, config_name, M, N, K):
+def test_block_scale_matmul_numerics(combo, config_name, M, N, K):
     _run_bs_numeric(combo, config_name, M, N, K)
 
 
@@ -774,7 +774,7 @@ def _run_bs_quant_numeric(
         "e4m3_out_e8m0_scale_f8_128x4",
     ),
 )
-def test_block_scale_quant_epilogue_1cta(out_dt, out_torch_dt, scale_dt, scale_torch_dt, scale_reorder):
+def test_block_scale_matmul_quant_epilogue_1cta(out_dt, out_torch_dt, scale_dt, scale_torch_dt, scale_reorder):
     _run_bs_quant_numeric(
         "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
         128,
@@ -789,7 +789,7 @@ def test_block_scale_quant_epilogue_1cta(out_dt, out_torch_dt, scale_dt, scale_t
 
 
 @_GPU
-def test_block_scale_quant_epilogue_2cta():
+def test_block_scale_matmul_quant_epilogue_2cta():
     _run_bs_quant_numeric(
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
         256,
@@ -803,7 +803,7 @@ def test_block_scale_quant_epilogue_2cta():
 
 
 @_GPU
-def test_block_scale_quant_epilogue_fp4_input_global_scale_padded_f8_scale():
+def test_block_scale_matmul_quant_epilogue_fp4_input_global_scale_padded_f8_scale():
     _run_bs_quant_numeric(
         "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
         144,
@@ -854,7 +854,7 @@ def test_block_scale_quant_epilogue_fp4_input_global_scale_padded_f8_scale():
         ),
     ],
 )
-def test_block_scale_m_major(combo, config_name, M, N, K):
+def test_block_scale_matmul_m_major(combo, config_name, M, N, K):
     """M-major block-scale output across dynamic/static 1-CTA and 2-CTA."""
     _run_bs_numeric(combo, config_name, M, N, K, out_major="m")
 
@@ -872,7 +872,7 @@ def test_block_scale_m_major(combo, config_name, M, N, K):
         ),
     ],
 )
-def test_block_scale_nonpacked_tensors(combo, config_name, mode):
+def test_block_scale_matmul_nonpacked_tensors(combo, config_name, mode):
     _run_bs_nonpacked_numeric(combo, config_name, 256, 256, 512, mode)
 
 
@@ -954,7 +954,7 @@ def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_s
         ),
     ],
 )
-def test_block_scale_reduction_scalar(mode, combo, config_name, M, N, K):
+def test_block_scale_matmul_reduction_scalar(mode, combo, config_name, M, N, K):
     _run_bs_reduction_numeric(
         combo,
         config_name,
@@ -986,7 +986,7 @@ def test_block_scale_reduction_scalar(mode, combo, config_name, M, N, K):
         ),
     ],
 )
-def test_block_scale_reduction_static_templates(config_name, M, N, K):
+def test_block_scale_matmul_reduction_static_templates(config_name, M, N, K):
     _run_bs_reduction_numeric(
         "nvfp4",
         config_name,
@@ -1009,7 +1009,7 @@ def test_block_scale_reduction_static_templates(config_name, M, N, K):
     ],
     ids=("add_per_col_strided_n", "amax_per_row_strided_m"),
 )
-def test_block_scale_reduction_strided_output(mode, red_dims, red_stride, ref_dims):
+def test_block_scale_matmul_reduction_strided_output(mode, red_dims, red_stride, ref_dims):
     _run_bs_reduction_numeric(
         "nvfp4",
         "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
@@ -1023,7 +1023,7 @@ def test_block_scale_reduction_strided_output(mode, red_dims, red_stride, ref_di
     )
 
 
-def test_block_scale_reduction_rejects_int32():
+def test_block_scale_matmul_reduction_rejects_int32():
     g = _build_block_scale_reduction_graph(
         128,
         128,

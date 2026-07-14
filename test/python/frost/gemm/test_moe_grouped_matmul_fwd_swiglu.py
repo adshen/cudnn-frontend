@@ -124,7 +124,7 @@ def _ref(token, w0, w1, offsets, scale, S, N, num_experts, num_groups):
 # --- Analyzer (no GPU needed) ---
 
 
-def test_analyzer_detects_dual_moe() -> None:
+def test_analyzer_detects_dual_moe_grouped_matmul_fwd() -> None:
     chain = analyze(_build_graph(9, 2000, 248, 520, 36))
     assert chain.has_moe and chain.is_multi_gemm
     assert chain.num_gemms == 2
@@ -136,7 +136,7 @@ def test_analyzer_detects_dual_moe() -> None:
     assert len(chain.outputs) == 1 and chain.outputs[0].source == "terminal"
 
 
-def test_analyzer_detects_dual_moe_reduction() -> None:
+def test_analyzer_detects_dual_moe_grouped_matmul_fwd_reduction() -> None:
     chain = analyze(
         _build_graph(
             9,
@@ -159,7 +159,7 @@ def test_analyzer_detects_dual_moe_reduction() -> None:
 
 @requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
-def test_dual_moe_swiglu_exact_case(cfg_name, cta_group) -> None:
+def test_dual_moe_grouped_matmul_fwd_swiglu_exact_case(cfg_name, cta_group) -> None:
     """Spec case: S=2000, N=248, K=520, E=9, 36 routed groups (BxE > E)."""
     S, N, K, E = 2000, 248, 520, 9
     offset_values = _FULL_EXPERT_REDUCE_OFFSETS
@@ -194,7 +194,7 @@ def test_dual_moe_swiglu_exact_case(cfg_name, cta_group) -> None:
         [96, 96, 96, 96, 96, 96, 96, 96],
     ],
 )
-def test_dual_moe_swiglu_groups(group_sizes, cfg_name, cta_group) -> None:
+def test_dual_moe_grouped_matmul_fwd_swiglu_groups(group_sizes, cfg_name, cta_group) -> None:
     E, N, K = 8, 256, 128
     S = sum(group_sizes)
     num_groups = E
@@ -224,7 +224,7 @@ def test_dual_moe_swiglu_groups(group_sizes, cfg_name, cta_group) -> None:
 
 
 @requires_sm100
-def test_dual_moe_swiglu_reduction_scalar() -> None:
+def test_dual_moe_grouped_matmul_fwd_swiglu_reduction_scalar() -> None:
     E, N, K = 4, 128, 128
     group_sizes = [64, 0, 120, 72]
     S = sum(group_sizes)

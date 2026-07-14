@@ -870,9 +870,10 @@ def _build_multi_moe_chain(
 
     All GEMMs must share the routed-group layout (same fto), shape / major / dtype,
     and expert count. Operands deduped by tensor id (shared token → one A operand).
-    POC scope: mode=="none", no mainloop fusion, terminal must be a fusion op.
-    Block-scale supported (dequant folds into a shared :class:`BlockScaleSpec`)."""
-    from .fusion_ir import BlockScaleSpec, MoeSpec
+    POC scope: mode=="none", no mainloop fusion, terminal must be a fusion op or a
+    block_scale_quantize fed by one. Block-scale supported (dequant folds into a
+    shared :class:`BlockScaleSpec`)."""
+    from .fusion_ir import BlockQuantizeSpec, BlockScaleSpec, MoeSpec
 
     for moe in moe_ops:
         if moe.moe_mode != "none":
@@ -1026,7 +1027,10 @@ def _build_multi_moe_chain(
             if op.output not in reachable_op_ids:
                 reachable_op_ids.add(op.output)
                 bfs_queue.append(op.output)
-    reachable_ops = [op for op in ops if op.output in reachable_op_ids and op.cudnn_name not in {"moe_grouped_matmul", "matmul", "reduction"}]
+    reachable_ops = [
+        op for op in ops if op.output in reachable_op_ids and op.cudnn_name not in {"moe_grouped_matmul", "matmul", "reduction", "block_scale_quantize"}
+    ]
+    reachable_quant_ops = [op for op in ops if op.cudnn_name == "block_scale_quantize" and op.output in reachable_op_ids]
 
     def _is_in_chain(tid: int) -> bool:
         return tid in gemm_idx_by_output or tid in reachable_op_ids
@@ -1111,10 +1115,24 @@ def _build_multi_moe_chain(
 
     set_output_ids_in_order = [tid for tid in _TENSOR_OUTPUT_FLAG if _TENSOR_OUTPUT_FLAG[tid]]
     terminal_id: int | None = None
+    terminal_quant: _RecordedOp | None = None
+    terminal_source_ref: int | None = None
     for tid in reversed(set_output_ids_in_order):
-        if tid in op_position_by_id:
-            terminal_id = tid
-            break
+        qop = next((q for q in reachable_quant_ops if q.output == tid), None)
+        if qop is None:
+            continue
+        (input_id,) = qop.inputs
+        if input_id not in op_position_by_id:
+            raise ValueError(f"block_scale_quantize {qop.op_name!r} input must be a fusion-op output " "of the shared multi-MoE epilogue")
+        terminal_source_ref = op_position_by_id[input_id]
+        terminal_id = qop.output
+        terminal_quant = qop
+        break
+    if terminal_id is None:
+        for tid in reversed(set_output_ids_in_order):
+            if tid in op_position_by_id:
+                terminal_id = tid
+                break
     if terminal_id is None:
         raise ValueError("multi-MoE graph has no fusion-op output marked set_output(True); " "the fused (terminal) output must be a pointwise op")
 
@@ -1125,7 +1143,7 @@ def _build_multi_moe_chain(
     for fop, out_id in pending_ops:
         recorded = recorded_by_out[out_id]
         op_compute = recorded.compute_dtype if recorded.compute_dtype is not None else compute_dtype
-        if out_id == terminal_id:
+        if out_id == terminal_id or (terminal_quant is not None and terminal_source_ref == op_position_by_id[out_id]):
             fusion_ops.append(_replace(fop, compute_dtype=op_compute))
         else:
             op_out_dtype = _resolve_out_dtype(out_id, recorded.output_tensor, io_dtype, intermediate_dtype)
@@ -1139,18 +1157,27 @@ def _build_multi_moe_chain(
             )
 
     output_dtype: Dtype = io_dtype
-    for op in ops:
-        if op.output == terminal_id and op.output_tensor is not None:
-            explicit = op.output_tensor.get_data_type()
-            if explicit != cudnn.data_type.NOT_SET and explicit in _DTYPE_FROM_CUDNN:
-                output_dtype = _DTYPE_FROM_CUDNN[explicit]
-            break
+    if terminal_quant is not None:
+        explicit = terminal_quant.output_tensor.get_data_type()
+        if explicit != cudnn.data_type.NOT_SET and explicit in _DTYPE_FROM_CUDNN:
+            output_dtype = _DTYPE_FROM_CUDNN[explicit]
+    else:
+        for op in ops:
+            if op.output == terminal_id and op.output_tensor is not None:
+                explicit = op.output_tensor.get_data_type()
+                if explicit != cudnn.data_type.NOT_SET and explicit in _DTYPE_FROM_CUDNN:
+                    output_dtype = _DTYPE_FROM_CUDNN[explicit]
+                break
 
     terminal_op_idx_explicit = -2
-    for pos, (_, out_id) in enumerate(pending_ops):
-        if out_id == terminal_id:
-            terminal_op_idx_explicit = pos
-            break
+    if terminal_quant is not None:
+        assert terminal_source_ref is not None
+        terminal_op_idx_explicit = terminal_source_ref
+    else:
+        for pos, (_, out_id) in enumerate(pending_ops):
+            if out_id == terminal_id:
+                terminal_op_idx_explicit = pos
+                break
 
     def _reduction_output(red: _RecordedOp) -> tuple[tuple[int, int, int], bool]:
         dim = _TENSOR_DIM_OVERRIDE.get(red.output)
@@ -1209,6 +1236,59 @@ def _build_multi_moe_chain(
         )
         reduction_objs.append(red.output_tensor)
 
+    block_quant: BlockQuantizeSpec | None = None
+    quant_scale_obj: Any = None
+    if terminal_quant is not None:
+        if terminal_quant.scale_output is None or terminal_quant.scale_output_tensor is None:
+            raise AssertionError("block_scale_quantize recorded without scale output")
+        if not _TENSOR_OUTPUT_FLAG.get(terminal_quant.scale_output, False):
+            raise ValueError("block_scale_quantize scale output must be materialized with set_output(True)")
+        scale_dtype = _resolve_out_dtype(
+            terminal_quant.scale_output,
+            terminal_quant.scale_output_tensor,
+            io_dtype,
+            intermediate_dtype,
+        )
+        scale_reorder = _TENSOR_REORDERING_OVERRIDE.get(terminal_quant.scale_output)
+        if scale_reorder is None:
+            scale_meta = meta.get(terminal_quant.scale_output)
+            scale_reorder = scale_meta.reordering if scale_meta is not None else None
+        bs = int(terminal_quant.block_size[0]) if terminal_quant.block_size else 0
+        if bs <= 0:
+            raise ValueError(f"block_scale_quantize block_size must be positive; got {bs}")
+        if int(N) % bs != 0:
+            raise ValueError(f"block_scale_quantize requires N divisible by block_size; got N={N}, block_size={bs}")
+        logical_scale_dim = (1, int(M), int(N) // bs)
+        expected_scale_dim = logical_scale_dim
+        if scale_reorder == "F8_128x4":
+            expected_scale_dim = (
+                logical_scale_dim[0],
+                _round_up(logical_scale_dim[1], 128),
+                _round_up(logical_scale_dim[2], 4),
+            )
+        scale_dim = _TENSOR_DIM_OVERRIDE.get(terminal_quant.scale_output)
+        if scale_dim is None:
+            scale_meta = meta.get(terminal_quant.scale_output)
+            scale_dim = scale_meta.dim if scale_meta is not None else ()
+        if not scale_dim:
+            scale_dim = expected_scale_dim
+        if len(scale_dim) != 3:
+            raise ValueError(f"block_scale_quantize scale output must be rank-3; got {scale_dim}")
+        if tuple(scale_dim) != expected_scale_dim:
+            raise ValueError(f"block_scale_quantize scale dim must be {expected_scale_dim}; got {scale_dim}")
+        compute = terminal_quant.compute_dtype if terminal_quant.compute_dtype is not None else compute_dtype
+        block_quant = BlockQuantizeSpec(
+            source_ref=terminal_source_ref,
+            block_size=bs,
+            axis=-1 if terminal_quant.quant_axis is None else terminal_quant.quant_axis,
+            transpose=terminal_quant.quant_transpose,
+            scale_dtype=scale_dtype,
+            scale_dim=tuple(scale_dim),
+            scale_reorder=scale_reorder,
+            compute_dtype=compute,
+        )
+        quant_scale_obj = terminal_quant.scale_output_tensor
+
     matmul_out_dtype = _resolve_out_dtype(moe_ops[0].output, moe_ops[0].output_tensor, io_dtype, intermediate_dtype)
     matmul_spec = MatmulSpec(
         M=M,
@@ -1236,12 +1316,19 @@ def _build_multi_moe_chain(
         moe=MoeSpec(num_experts=int(E), mode=moe_ops[0].moe_mode, offset_dtype=offset_dtype),
         block_scale=block_scale_spec,
         reductions=reductions,
+        block_quant=block_quant,
     )
-    output_objs: list[Any] = [recorded_by_out[terminal_id].output_tensor]
+    if terminal_quant is not None:
+        terminal_obj = terminal_quant.output_tensor
+    else:
+        terminal_obj = recorded_by_out[terminal_id].output_tensor
+    output_objs: list[Any] = [terminal_obj]
     for i, fop in enumerate(fusion_ops):
         if fop.output_tap:
             output_objs.append(recorded_by_out[pending_ops[i][1]].output_tensor)
     output_objs.extend(reduction_objs)
+    if quant_scale_obj is not None:
+        output_objs.append(quant_scale_obj)
     binding = _make_multi_binding(
         meta,
         a_ids,
@@ -1270,8 +1357,9 @@ def _build_multi_gemm_chain(
     operands (deduped by tensor id). GEMM outputs are the DAG roots; an op refs a
     GEMM output via a negative ``parent_idx`` (``gemm_source(g)``). Block-scale
     supported (dequant folds into the packed tensor; shared dequant → one operand).
-    POC scope: no mainloop fusion, no per-GEMM taps, terminal must be a fusion op."""
-    from .fusion_ir import BlockScaleSpec
+    POC scope: no mainloop fusion, no per-GEMM taps, terminal must be a fusion op
+    or a block_scale_quantize fed by one."""
+    from .fusion_ir import BlockQuantizeSpec, BlockScaleSpec
 
     # Resolve each matmul operand through any dequant, then dedup by PACKED data
     # tensor id (shared dequant → one distinct operand), matching the runtime dedup.
@@ -1417,7 +1505,8 @@ def _build_multi_gemm_chain(
             if op.output not in reachable_op_ids:
                 reachable_op_ids.add(op.output)
                 bfs_queue.append(op.output)
-    reachable_ops = [op for op in ops if op.output in reachable_op_ids and op.cudnn_name not in {"matmul", "reduction"}]
+    reachable_ops = [op for op in ops if op.output in reachable_op_ids and op.cudnn_name not in {"matmul", "reduction", "block_scale_quantize"}]
+    reachable_quant_ops = [op for op in ops if op.cudnn_name == "block_scale_quantize" and op.output in reachable_op_ids]
 
     def _is_in_chain(tid: int) -> bool:
         return tid in gemm_idx_by_output or tid in reachable_op_ids
@@ -1548,13 +1637,28 @@ def _build_multi_gemm_chain(
         )
         return chain, binding
 
-    # Terminal = last set_output(True) that is a fusion op.
+    # Terminal = last set_output(True) that is a fusion op (or a terminal
+    # block_scale_quantize fed by one).
     set_output_ids_in_order = [tid for tid in _TENSOR_OUTPUT_FLAG if _TENSOR_OUTPUT_FLAG[tid]]
     terminal_id: int | None = None
+    terminal_quant: _RecordedOp | None = None
+    terminal_source_ref: int | None = None
     for tid in reversed(set_output_ids_in_order):
-        if tid in op_position_by_id:
-            terminal_id = tid
-            break
+        qop = next((q for q in reachable_quant_ops if q.output == tid), None)
+        if qop is None:
+            continue
+        (input_id,) = qop.inputs
+        if input_id not in op_position_by_id:
+            raise ValueError(f"block_scale_quantize {qop.op_name!r} input must be a fusion-op output " "of the shared multi-GEMM epilogue")
+        terminal_source_ref = op_position_by_id[input_id]
+        terminal_id = qop.output
+        terminal_quant = qop
+        break
+    if terminal_id is None:
+        for tid in reversed(set_output_ids_in_order):
+            if tid in op_position_by_id:
+                terminal_id = tid
+                break
     if terminal_id is None:
         raise ValueError("multi-GEMM graph has no fusion-op output marked set_output(True); " "the fused (terminal) output must be a pointwise op")
 
@@ -1565,7 +1669,7 @@ def _build_multi_gemm_chain(
     for fop, out_id in pending_ops:
         recorded = recorded_by_out[out_id]
         op_compute = recorded.compute_dtype if recorded.compute_dtype is not None else compute_dtype
-        if out_id == terminal_id:
+        if out_id == terminal_id or (terminal_quant is not None and terminal_source_ref == op_position_by_id[out_id]):
             fusion_ops.append(_replace(fop, compute_dtype=op_compute))
         else:
             op_out_dtype = _resolve_out_dtype(out_id, recorded.output_tensor, io_dtype, intermediate_dtype)
@@ -1579,18 +1683,27 @@ def _build_multi_gemm_chain(
             )
 
     output_dtype: Dtype = io_dtype
-    for op in ops:
-        if op.output == terminal_id and op.output_tensor is not None:
-            explicit = op.output_tensor.get_data_type()
-            if explicit != cudnn.data_type.NOT_SET and explicit in _DTYPE_FROM_CUDNN:
-                output_dtype = _DTYPE_FROM_CUDNN[explicit]
-            break
+    if terminal_quant is not None:
+        explicit = terminal_quant.output_tensor.get_data_type()
+        if explicit != cudnn.data_type.NOT_SET and explicit in _DTYPE_FROM_CUDNN:
+            output_dtype = _DTYPE_FROM_CUDNN[explicit]
+    else:
+        for op in ops:
+            if op.output == terminal_id and op.output_tensor is not None:
+                explicit = op.output_tensor.get_data_type()
+                if explicit != cudnn.data_type.NOT_SET and explicit in _DTYPE_FROM_CUDNN:
+                    output_dtype = _DTYPE_FROM_CUDNN[explicit]
+                break
 
     terminal_op_idx_explicit = -2
-    for pos, (_, out_id) in enumerate(pending_ops):
-        if out_id == terminal_id:
-            terminal_op_idx_explicit = pos
-            break
+    if terminal_quant is not None:
+        assert terminal_source_ref is not None
+        terminal_op_idx_explicit = terminal_source_ref
+    else:
+        for pos, (_, out_id) in enumerate(pending_ops):
+            if out_id == terminal_id:
+                terminal_op_idx_explicit = pos
+                break
 
     def _reduction_output_dim(red: _RecordedOp) -> tuple[int, int, int]:
         dim = _TENSOR_DIM_OVERRIDE.get(red.output)
@@ -1638,15 +1751,72 @@ def _build_multi_gemm_chain(
         )
         reduction_objs.append(red.output_tensor)
 
+    block_quant: BlockQuantizeSpec | None = None
+    quant_scale_obj: Any = None
+    if terminal_quant is not None:
+        if terminal_quant.scale_output is None or terminal_quant.scale_output_tensor is None:
+            raise AssertionError("block_scale_quantize recorded without scale output")
+        if not _TENSOR_OUTPUT_FLAG.get(terminal_quant.scale_output, False):
+            raise ValueError("block_scale_quantize scale output must be materialized with set_output(True)")
+        scale_dtype = _resolve_out_dtype(
+            terminal_quant.scale_output,
+            terminal_quant.scale_output_tensor,
+            io_dtype,
+            intermediate_dtype,
+        )
+        scale_reorder = _TENSOR_REORDERING_OVERRIDE.get(terminal_quant.scale_output)
+        if scale_reorder is None:
+            scale_meta = meta.get(terminal_quant.scale_output)
+            scale_reorder = scale_meta.reordering if scale_meta is not None else None
+        bs = int(terminal_quant.block_size[0]) if terminal_quant.block_size else 0
+        if bs <= 0:
+            raise ValueError(f"block_scale_quantize block_size must be positive; got {bs}")
+        if int(N) % bs != 0:
+            raise ValueError(f"block_scale_quantize requires N divisible by block_size; got N={N}, block_size={bs}")
+        logical_scale_dim = (int(batch), int(M), int(N) // bs)
+        expected_scale_dim = logical_scale_dim
+        if scale_reorder == "F8_128x4":
+            expected_scale_dim = (
+                logical_scale_dim[0],
+                _round_up(logical_scale_dim[1], 128),
+                _round_up(logical_scale_dim[2], 4),
+            )
+        scale_dim = _TENSOR_DIM_OVERRIDE.get(terminal_quant.scale_output)
+        if scale_dim is None:
+            scale_meta = meta.get(terminal_quant.scale_output)
+            scale_dim = scale_meta.dim if scale_meta is not None else ()
+        if not scale_dim:
+            scale_dim = expected_scale_dim
+        if len(scale_dim) != 3:
+            raise ValueError(f"block_scale_quantize scale output must be rank-3; got {scale_dim}")
+        if tuple(scale_dim) != expected_scale_dim:
+            raise ValueError(f"block_scale_quantize scale dim must be {expected_scale_dim}; got {scale_dim}")
+        compute = terminal_quant.compute_dtype if terminal_quant.compute_dtype is not None else compute_dtype
+        block_quant = BlockQuantizeSpec(
+            source_ref=terminal_source_ref,
+            block_size=bs,
+            axis=-1 if terminal_quant.quant_axis is None else terminal_quant.quant_axis,
+            transpose=terminal_quant.quant_transpose,
+            scale_dtype=scale_dtype,
+            scale_dim=tuple(scale_dim),
+            scale_reorder=scale_reorder,
+            compute_dtype=compute,
+        )
+        quant_scale_obj = terminal_quant.scale_output_tensor
+
     # GEMM output declared dtype — the epilogue rounds each accumulator to it
     # before the op chain. All GEMMs share it; resolve from GEMM 0.
     matmul_out_dtype = _resolve_out_dtype(matmuls[0].output, matmuls[0].output_tensor, io_dtype, intermediate_dtype)
 
-    _mg_term = recorded_by_out[terminal_id].output_tensor
-    out_major = _infer_out_major(
-        tuple(_mg_term.get_dim()) if _mg_term is not None else (),
-        tuple(_mg_term.get_stride()) if _mg_term is not None else (),
-    )
+    _mg_term = terminal_quant.output_tensor if terminal_quant is not None else recorded_by_out[terminal_id].output_tensor
+    _mg_term_dim = tuple(_mg_term.get_dim()) if _mg_term is not None else ()
+    _mg_term_stride = tuple(_mg_term.get_stride()) if _mg_term is not None else ()
+    if terminal_quant is not None and (not _mg_term_dim or not _mg_term_stride):
+        term_meta = meta.get(terminal_quant.output)
+        if term_meta is not None:
+            _mg_term_dim = term_meta.dim
+            _mg_term_stride = term_meta.stride
+    out_major = _infer_out_major(_mg_term_dim, _mg_term_stride)
     matmul_spec = MatmulSpec(
         M=M,
         N=N,
@@ -1673,13 +1843,17 @@ def _build_multi_gemm_chain(
         gemm_operands=gemm_operands,
         block_scale=block_scale_spec,
         reductions=reductions,
+        block_quant=block_quant,
     )
-    # Outputs in slot order: terminal, op taps (chain order), reductions (no matmul tap).
-    output_objs: list[Any] = [recorded_by_out[terminal_id].output_tensor]
+    # Outputs in slot order: terminal, op taps (chain order), reductions, quant
+    # scale (no matmul tap).
+    output_objs: list[Any] = [_mg_term]
     for i, fop in enumerate(fusion_ops):
         if fop.output_tap:
             output_objs.append(recorded_by_out[pending_ops[i][1]].output_tensor)
     output_objs.extend(reduction_objs)
+    if quant_scale_obj is not None:
+        output_objs.append(quant_scale_obj)
     binding = _make_multi_binding(
         meta,
         a_ids,

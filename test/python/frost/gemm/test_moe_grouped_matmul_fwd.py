@@ -186,7 +186,7 @@ def _build_graph(
 # --------------------------------------------------------------------------- #
 
 
-def test_analyzer_detects_moe() -> None:
+def test_analyzer_detects_moe_grouped_matmul_fwd() -> None:
     E, S, N, K = 8, 768, 256, 128
     chain = analyze(_build_graph(E, S, N, K))
     assert chain.has_moe
@@ -203,7 +203,7 @@ def test_analyzer_offset_dtype_int64() -> None:
     assert chain.moe.offset_dtype == "int64"
 
 
-def test_analyzer_detects_moe_reduction() -> None:
+def test_analyzer_detects_moe_grouped_matmul_fwd_reduction() -> None:
     chain = analyze(
         _build_graph(
             8,
@@ -222,7 +222,7 @@ def test_analyzer_detects_moe_reduction() -> None:
     assert [o.source for o in chain.outputs] == ["terminal", "reduction_0"]
 
 
-def test_analyzer_detects_moe_group_reduction() -> None:
+def test_analyzer_detects_moe_grouped_matmul_fwd_group_reduction() -> None:
     chain = analyze(
         _build_graph(
             8,
@@ -415,7 +415,7 @@ _OFFSET_DTYPES = [
         [768, 0, 0, 0, 0, 0, 0, 0],  # all tokens in group 0
     ],
 )
-def test_moe_e2e(group_sizes, offset_cudnn_dt, offset_torch_dt, cfg_name, cta_group) -> None:
+def test_moe_grouped_matmul_fwd_e2e(group_sizes, offset_cudnn_dt, offset_torch_dt, cfg_name, cta_group) -> None:
     E, N, K = 8, 256, 128
     S = sum(group_sizes)
     cfg = by_name(cfg_name)
@@ -443,7 +443,7 @@ def test_moe_e2e(group_sizes, offset_cudnn_dt, offset_torch_dt, cfg_name, cta_gr
     _QUANT_CASES,
     ids=[case[0] for case in _QUANT_CASES],
 )
-def test_moe_block_quant_epilogue(
+def test_moe_grouped_matmul_fwd_block_quant_epilogue(
     cfg_name,
     cta_group,
     case_name,
@@ -585,7 +585,7 @@ def _run_moe_reduction(
         cudnn.reduction_mode.MIN,
     ],
 )
-def test_moe_reduction_scalar_fp32(mode, cfg_name, cta_group) -> None:
+def test_moe_grouped_matmul_fwd_reduction_scalar_fp32(mode, cfg_name, cta_group) -> None:
     _run_moe_reduction(cfg_name, cta_group, mode, [1, 1, 1])
 
 
@@ -597,7 +597,7 @@ def test_moe_reduction_scalar_fp32(mode, cfg_name, cta_group) -> None:
         (cudnn.reduction_mode.AMAX, [1, 1, 128], [0, 0, 2]),
     ],
 )
-def test_moe_reduction_partial_strided_fp32(mode, red_dims, red_stride) -> None:
+def test_moe_grouped_matmul_fwd_reduction_partial_strided_fp32(mode, red_dims, red_stride) -> None:
     _run_moe_reduction(
         _CFG,
         2,
@@ -618,7 +618,7 @@ def test_moe_reduction_partial_strided_fp32(mode, red_dims, red_stride) -> None:
         cudnn.reduction_mode.MIN,
     ],
 )
-def test_moe_reduction_scalar_int32(mode) -> None:
+def test_moe_grouped_matmul_fwd_reduction_scalar_int32(mode) -> None:
     _run_moe_reduction(
         _GEOMETRIES[1][0],
         _GEOMETRIES[1][1],
@@ -633,7 +633,7 @@ def test_moe_reduction_scalar_int32(mode) -> None:
 
 @requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
-def test_moe_group_reduction_amax_scalar_fp32(cfg_name, cta_group) -> None:
+def test_moe_grouped_matmul_fwd_group_reduction_amax_scalar_fp32(cfg_name, cta_group) -> None:
     _run_moe_reduction(
         cfg_name,
         cta_group,
@@ -645,7 +645,7 @@ def test_moe_group_reduction_amax_scalar_fp32(cfg_name, cta_group) -> None:
 
 
 @requires_sm100
-def test_moe_group_reduction_full_expert_amax_fp32() -> None:
+def test_moe_grouped_matmul_fwd_group_reduction_full_expert_amax_fp32() -> None:
     group_sizes = _group_sizes_from_offsets(_FULL_EXPERT_REDUCE_OFFSETS, 2000)
     _run_moe_reduction(
         _CFG,
@@ -669,7 +669,7 @@ def test_moe_group_reduction_full_expert_amax_fp32() -> None:
         cudnn.reduction_mode.MIN,
     ],
 )
-def test_moe_group_reduction_per_col_fp32(mode) -> None:
+def test_moe_grouped_matmul_fwd_group_reduction_per_col_fp32(mode) -> None:
     _run_moe_reduction(
         _CFG,
         2,
@@ -690,7 +690,7 @@ def test_moe_group_reduction_per_col_fp32(mode) -> None:
         ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", 1, "zero_stride"),
     ],
 )
-def test_moe_nonpacked_tensors(cfg_name, cta_group, mode) -> None:
+def test_moe_grouped_matmul_fwd_nonpacked_tensors(cfg_name, cta_group, mode) -> None:
     group_sizes = [64, 0, 200, 128, 100, 12, 196, 68]
     E, N, K = 8, 256, 128
     S = sum(group_sizes)
@@ -714,7 +714,7 @@ def test_moe_nonpacked_tensors(cfg_name, cta_group, mode) -> None:
 
 @requires_sm100
 @pytest.mark.parametrize("cfg_name,cta_group", _GEOMETRIES)
-def test_moe_bxe_gt_e(cfg_name, cta_group) -> None:
+def test_moe_grouped_matmul_fwd_bxe_gt_e(cfg_name, cta_group) -> None:
     """num_groups (BxE) > num_experts (E): expert = group % E."""
     S, N, K, E = 2000, 248, 520, 9
     offset_values = _FULL_EXPERT_REDUCE_OFFSETS

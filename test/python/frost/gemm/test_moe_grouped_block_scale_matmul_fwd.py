@@ -234,7 +234,7 @@ def _build_graph(
 # --------------------------------------------------------------------------- #
 
 
-def test_analyzer_detects_moe_block_scale() -> None:
+def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd() -> None:
     E, S, N, K = 2, 1024, 256, 512
     chain = analyze(_build_graph(E, S, N, K, num_groups=4))
     assert chain.has_moe and chain.has_block_scale
@@ -253,7 +253,7 @@ def test_analyzer_offset_dtype_int64() -> None:
     assert chain.has_moe and chain.has_block_scale
 
 
-def test_analyzer_detects_moe_block_scale_reduction() -> None:
+def test_analyzer_detects_moe_grouped_block_scale_matmul_fwd_reduction() -> None:
     chain = analyze(
         _build_graph(
             2,
@@ -628,7 +628,7 @@ def test_e2e_reduction_epilogue_strided_output(mode, red_dims, red_stride) -> No
     )
 
 
-def test_moe_block_scale_reduction_rejects_int32() -> None:
+def test_moe_grouped_block_scale_matmul_fwd_reduction_rejects_int32() -> None:
     g = _build_graph(
         2,
         512,

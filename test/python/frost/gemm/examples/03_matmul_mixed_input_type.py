@@ -1,4 +1,4 @@
-"""Example 15: mixed-input mainloop — a fused operand LOADED at a narrower dtype
+"""Example 03: mixed-input mainloop — a fused operand LOADED at a narrower dtype
 than the MMA reads (int8-weight / bf16-activation GEMM: int8 A @ bf16 B).
 
 identity(A_int8).set_data_type(bf16) feeding the matmul is mainloop fusion whose
@@ -51,7 +51,7 @@ def _run(M: int, N: int, K: int) -> None:
 
     ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
     torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
-    print(f"[15] PASS  int8(A) -> bf16 @ bf16(B)  M={M} N={N} K={K}")
+    print(f"[03] PASS  int8(A) -> bf16 @ bf16(B)  M={M} N={N} K={K}")
 
 
 def main() -> None:

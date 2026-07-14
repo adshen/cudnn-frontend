@@ -15,6 +15,7 @@ from gemm_test_utils import (
     rand_e8m0 as _rand_e8m0,
     reduction_ref as _reduction_ref,
     assert_block_scale_reduction_close as _assert_block_scale_reduction_close,
+    block_quant_ref as _block_quant_ref,
 )
 import cudnn
 import cudnn.frost.gemm  # noqa: F401  installs the recorder
@@ -60,6 +61,7 @@ def _build_dual_bs_graph(
     red_dims=None,
     red_compute=cudnn.data_type.FLOAT,
     red_dtype=cudnn.data_type.FLOAT,
+    quant_block=None,
 ):
     is_fp4 = combo in ("nvfp4", "mxfp4")
     bs = 16 if combo == "nvfp4" else 32
@@ -86,7 +88,12 @@ def _build_dual_bs_graph(
     C0 = g.matmul(A=Ad, B=B0d, name="mm0")
     C1 = g.matmul(A=Ad, B=B1d, name="mm1")
     Y = g.mul(a=g.swish(input=C0), b=C1)
-    Y.set_output(True).set_data_type(out_dt)
+    if quant_block is not None:
+        Q, QS = g.block_scale_quantize(input=Y, block_size=quant_block, name="q")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    else:
+        Y.set_output(True).set_data_type(out_dt)
     if reduction_mode is not None:
         if red_dims is None:
             red_dims = [1, 1, 1]
@@ -127,6 +134,16 @@ def test_shared_dequant_reduction_detected():
     assert len(chain.reductions) == 1
     assert chain.reductions[0].mode == "amax"
     assert chain.outputs[1].source == "reduction_0"
+
+
+def test_shared_dequant_quant_epilogue_detected():
+    chain = analyze(_build_dual_bs_graph(256, 128, 512, quant_block=32))
+    assert chain.is_multi_gemm and chain.has_block_scale
+    assert chain.block_quant is not None
+    assert chain.block_quant.block_size == 32
+    assert chain.block_quant.scale_dtype == "fp8_e8m0"
+    assert chain.block_quant.source_ref == 1  # the mul feeding the quant
+    assert chain.output_dtype == "fp8_e4m3"
 
 
 # End-to-end numerics
@@ -324,8 +341,41 @@ def _run_reduction(
         ),
     ],
 )
-def test_dual_block_scale_numerics(combo, config_name, M, N, K):
+def test_dual_block_scale_matmul_numerics(combo, config_name, M, N, K):
     _run(combo, config_name, M, N, K)
+
+
+@_GPU
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+    ],
+)
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+def test_dual_block_scale_matmul_swiglu_quant_epilogue(combo, config_name):
+    """Terminal block_scale_quantize on the dual block-scale SwiGLU chain: the
+    fused result is re-quantized to FP8 E4M3 + per-32-block E8M0 scale."""
+    dev = "cuda"
+    M, N, K = 256, 128, 512
+    qblock = 32
+    pairs, ref = _dual_bs_runtime(combo, M, N, K)
+
+    g = _build_dual_bs_graph(M, N, K, combo=combo, quant_block=qblock)
+    compiled = _plan(g, **_kw(config_name))
+    assert compiled.chain.block_quant is not None
+
+    q = torch.zeros(1, M, N, dtype=torch.float8_e4m3fn, device=dev)
+    q_scale = torch.zeros(1, M, N // qblock, dtype=torch.float8_e8m0fnu, device=dev)
+    compiled(_vp_bs_mg(compiled, pairs, [q, q_scale]))
+    torch.cuda.synchronize()
+
+    q_ref, scale_ref = _block_quant_ref(ref, qblock, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    # The kernel's swish uses fast __expf → pre-quant values sit within ~1e-3
+    # rel of torch; allow one E4M3 mantissa step where that crosses a boundary.
+    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=2**-8, rtol=1 / 8)
 
 
 @_GPU
@@ -339,7 +389,7 @@ def test_dual_block_scale_numerics(combo, config_name, M, N, K):
     ),
     ids=("add", "amax", "max", "min"),
 )
-def test_dual_block_scale_reduction_scalar_fp32(mode):
+def test_dual_block_scale_matmul_reduction_scalar_fp32(mode):
     _run_reduction(
         "nvfp4",
         "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
@@ -400,7 +450,7 @@ def test_dual_block_scale_reduction_scalar_fp32(mode):
         ),
     ],
 )
-def test_dual_block_scale_reduction_configs(combo, config_name, M, N, K):
+def test_dual_block_scale_matmul_reduction_configs(combo, config_name, M, N, K):
     _run_reduction(
         combo,
         config_name,
@@ -422,7 +472,7 @@ def test_dual_block_scale_reduction_configs(combo, config_name, M, N, K):
     ),
     ids=("add_per_col", "amax_per_row"),
 )
-def test_dual_block_scale_reduction_strided_output(mode, red_dims, red_stride, ref_dims):
+def test_dual_block_scale_matmul_reduction_strided_output(mode, red_dims, red_stride, ref_dims):
     _run_reduction(
         "nvfp4",
         "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
@@ -436,7 +486,7 @@ def test_dual_block_scale_reduction_strided_output(mode, red_dims, red_stride, r
     )
 
 
-def test_dual_block_scale_reduction_rejects_int32():
+def test_dual_block_scale_matmul_reduction_rejects_int32():
     g = _build_dual_bs_graph(
         256,
         128,
