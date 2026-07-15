@@ -18,6 +18,9 @@ py_samples:rel:
   needs: []
 
 py_samples:ga:
+  script:
+    - pip install -v .
+    - ci/common/run_with_expiring_waiver.sh 2026-08-15 ci/stages/python_samples/run_python_samples.sh
   parallel:
     matrix:
       - ARCH: ["Hopper", "Ampere", "Blackwell"]
