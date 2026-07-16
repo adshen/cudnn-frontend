@@ -62,8 +62,8 @@ stages:
   - multi-gpu-run
   - mha_v1_tests
   - mha_v2_tests
-  - backend_triggers
   - pycudnnTest
   - L4_graph_runner
   - deploy
   - notify
+  - backend_triggers

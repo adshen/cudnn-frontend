@@ -1,47 +1,37 @@
-backend:rel:
-  trigger:
-    project: cudnn/cudnn
-    branch: release/9.25.0
-    strategy: depend
+.backend-trigger:
   inherit:
     variables: false
   variables:
     CI_CUDNN_FRONTEND_REF_NAME: $CI_COMMIT_REF_NAME
     CI_CUDNN_FRONTEND_COMMIT_SHA: $CI_COMMIT_SHA
     CI_CUDNN_FRONTEND_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
+    CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
   rules:
     - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
       when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
-      variables:
-        CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: true
     - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
+      when: manual
+      allow_failure: true
       variables:
         CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_COMMIT_REF_NAME
   stage: backend_triggers
   needs: []
   interruptible: true
 
+backend:rel:
+  extends: .backend-trigger
+  trigger:
+    project: cudnn/cudnn
+    branch: release/9.25.0
+    strategy: depend
+
 backend:dev:
+  extends: .backend-trigger
   trigger:
     project: cudnn/cudnn
     branch: dev
     strategy: depend
-  inherit:
-    variables: false
-  variables:
-    CI_CUDNN_FRONTEND_REF_NAME: $CI_COMMIT_REF_NAME
-    CI_CUDNN_FRONTEND_COMMIT_SHA: $CI_COMMIT_SHA
-    CI_CUDNN_FRONTEND_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
-  rules:
-    - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
-      variables:
-        CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-    - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
-      variables:
-        CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_COMMIT_REF_NAME
-  stage: backend_triggers
-  needs: []
-  interruptible: true
