@@ -104,6 +104,6 @@ deploy:test_bdist_wheels_ga_cudnn_3.12:
         - pip uninstall -y nvidia_cudnn_frontend
         - ls many_linux_wheels/*.whl
         - pip install -v many_linux_wheels/nvidia_cudnn_frontend*cp312*.whl
-        - pip install -r /tmp/requirements.txt
+        - pip install --group dev
         - pip uninstall -y nvidia-cudnn-cu12 # Only removing it because the test is meant for 8907
         - pytest test/python -n 4 -k "not test_mhas and not fe_api"

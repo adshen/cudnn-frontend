@@ -76,7 +76,7 @@ conda activate fe_regress
 
 pip install --upgrade pip
 pip uninstall -y pytest
-pip install -r requirements.txt
+pip install --group dev
 
 
 if ! pip show torch > /dev/null 2>&1; then

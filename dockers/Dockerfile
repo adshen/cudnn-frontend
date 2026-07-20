@@ -53,8 +53,8 @@ RUN CUDNN_VERSION_M=${CUDNN_VERSION_%%.*} && \
     fi
 
 RUN sed -i '/nvidia-cudnn-frontend\|ninja/d' /etc/pip/constraint.txt
-COPY requirements.txt /tmp/
-RUN pip install -U --no-cache-dir -r /tmp/requirements.txt
+COPY pyproject.toml /tmp/
+RUN pip install -U --no-cache-dir --group /tmp/pyproject.toml:dev
 RUN pip install -U --no-cache-dir cupy-cuda13x
 
 RUN pip install -U --no-cache-dir nvidia-cutlass-dsl apache-tvm-ffi torch-c-dlpack-ext cuda-python
