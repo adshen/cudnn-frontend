@@ -1,8 +1,10 @@
 .oss_tests:template:
   stage: oss_tests
   allow_failure: true
+  variables:
+    CUTLASS_DSL_VERSION: "4.5.0"
   script:
-    - pip install -v .[cutedsl]
+    - pip install -v .[cutedsl] "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
     - ci/stages/oss_tests/run_test_oss.sh
 
 oss:rel:
@@ -18,3 +20,22 @@ oss:rel:
       - ARCH: ["Blackwell"]
         OSS_TEST_SHARD: ["shard0", "shard1"]
   needs: []
+
+# Nightly-only duplicates of oss:rel against newer cutlass-dsl versions.
+oss:rel:cutlass_dsl_4.6:
+  extends: oss:rel
+  variables:
+    CUTLASS_DSL_VERSION: "4.6.1"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+# nvidia-cutlass-dsl-internal tracks the unreleased 4.7.0 line (not on PyPI).
+oss:rel:cutlass_dsl_internal:
+  extends: oss:rel
+  script:
+    - pip install -v .[cutedsl]
+    - pip uninstall -y nvidia-cutlass-dsl
+    - pip install nvidia-cutlass-dsl-internal --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+    - ci/stages/oss_tests/run_test_oss.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
