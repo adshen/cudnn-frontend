@@ -35,7 +35,7 @@ oss:rel:cutlass_dsl_internal:
   script:
     - pip install -v .[cutedsl]
     - pip uninstall -y nvidia-cutlass-dsl
-    - pip install nvidia-cutlass-dsl-internal --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+    - pip install "nvidia-cutlass-dsl==4.7.0a0" --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
     - ci/stages/oss_tests/run_test_oss.sh
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
