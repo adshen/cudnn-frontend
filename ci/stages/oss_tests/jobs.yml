@@ -39,3 +39,141 @@ oss:rel:cutlass_dsl_internal:
     - ci/stages/oss_tests/run_test_oss.sh
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
+
+# ==============================================================================
+# Rubin (sm107) OSS tests on the hecate SLURM pre-cluster.
+#
+# Unlike oss:rel above — which runs directly in a docker-executor container on a
+# tagged GPU box — Rubin hardware only exists behind SLURM. This job lands on the
+# project's hecate sybil runners (runner-hecate01 / runner-hecate02), which
+# execute the script ON THE CLUSTER LOGIN NODE as the user who triggered the
+# pipeline, then submit the real work to a compute node with srun + enroot/pyxis.
+# Same mechanism as multi_gpu_smoke:lyris in ci/stages/multi_gpu_tests/jobs.yml.
+#
+# Prerequisites, both of which fail the job rather than silently degrade it:
+#   * The triggering user must be onboarded to hecate: unix account, SLURM
+#     account (hecate-coreai_libraries_cudnn), and kerberos.
+#   * The runner must be able to pull the Rubin image out of the gitlab-master
+#     registry, which needs the project's GITLAB_ALL_KEY PAT (or a
+#     RUBIN_REGISTRY_TOKEN override) — see the credentials step below.
+#
+# The image ships CUDA/cuDNN/torch for Rubin, so there is no fetch_cudnn step;
+# the fe_api tests exercise the cutedsl kernels, and the internal cutlass-dsl
+# wheel from urm is what carries the sm107 kernel variants.
+# ==============================================================================
+
+.oss_tests_rubin:template:
+  stage: oss_tests
+  needs: []
+  allow_failure: true          # bring-up phase; must not block MRs
+  timeout: 2h
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: 20
+    SLURM_ACCOUNT: "coreai_libraries_cudnn"
+    # Empty -> no -p flag, i.e. the cluster's default partition. hecate has no
+    # `batch` partition; set this only if a specific one turns out to be needed.
+    SLURM_PARTITION: ""
+    SLURM_NODES: 1
+    GPUS_PER_NODE: 4
+    SRUN_TIMELIMIT: 100        # minutes, well under the 2h job timeout
+    # Pre-cluster cli_filter requires --account and this --job-name format:
+    # <account>-<subproject>.<details>
+    SLURM_JOBNAME: "${SLURM_ACCOUNT}-cudnn_frontend.oss_rubin.${CI_JOB_ID}"
+    ENROOT_IMAGE: "docker://gitlab-master.nvidia.com:5005#dl/dgx/pytorch:rubin-py3-devel"
+    ENROOT_CACHE_ROOT: "/lustre/fsw/coreai_libraries_cudnn/cudnn-frontend-ci/enroot"
+    # The Rubin/sm107 kernels live in the internal (unreleased) cutedsl wheel.
+    CUTLASS_DSL_PACKAGE: "nvidia-cutlass-dsl-internal"
+    CUTLASS_DSL_INDEX_URL: "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple"
+    EXPECTED_COMPUTE_CAP: "107"
+    RESULTS_DIR_NAME: "rubin-oss-results"
+  rules:
+    # No Draft-skip while the infra is proven out, so the job can be iterated
+    # from a Draft MR without running the full pipeline. Re-add the
+    # .default_job_template draft rule before flipping allow_failure.
+    # api/cudnn-gh pipelines are deliberately excluded: they run as a bot user
+    # that has no cluster account (sybil would reject the job).
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - hostname && whoami && id
+    - export RESULTS_DIR_HOST="${CI_PROJECT_DIR}/${RESULTS_DIR_NAME}"
+    - rm -rf "${RESULTS_DIR_HOST}" && mkdir -p "${RESULTS_DIR_HOST}"
+    # --- enroot config isolated to this job (the login node is shared) ---
+    - export ENROOT_CONFIG_PATH="${CI_PROJECT_DIR}/.enroot-${CI_JOB_ID}"
+    - mkdir -p "${ENROOT_CONFIG_PATH}"
+    # The Rubin image lives in a private gitlab-master registry, so enroot needs
+    # credentials. Resolve and *verify* them here rather than on the compute
+    # node, where a bad token is only ever reported as a bare 401 from pyxis.
+    - ci/stages/oss_tests/setup_registry_credentials.sh
+        umask 077
+        {
+          printf 'machine gitlab-master.nvidia.com login %s password %s\n' "${registry_user}" "${registry_token}"
+          printf 'machine gitlab-master.nvidia.com:5005 login %s password %s\n' "${registry_user}" "${registry_token}"
+        } > "${ENROOT_CONFIG_PATH}/.credentials"
+        umask 022
+    - |
+        # Shared enroot cache on lustre; fall back to the build dir if the
+        # project path is not writable for this user.
+        if mkdir -p "${ENROOT_CACHE_ROOT}/cache" "${ENROOT_CACHE_ROOT}/temp" 2>/dev/null; then
+          cache_root="${ENROOT_CACHE_ROOT}"
+        else
+          cache_root="${CI_PROJECT_DIR}/.enroot-cache"
+          mkdir -p "${cache_root}/cache" "${cache_root}/temp"
+        fi
+        printf 'ENROOT_CACHE_PATH %s/cache\nENROOT_TEMP_PATH %s/temp\n' "${cache_root}" "${cache_root}" > "${ENROOT_CONFIG_PATH}/enroot.conf"
+        echo "enroot cache: ${cache_root}"
+    # --- submit to SLURM: a single task owning the whole Rubin node ---
+    - |
+        # -p is omitted unless SLURM_PARTITION is set: hecate has no `batch`
+        # partition and rejects the job outright ("invalid partition specified"),
+        # so let the cluster pick its default. Set SLURM_PARTITION (job variable
+        # or CI/CD variable) to pin one once the right name is known.
+        srun_args=()
+        if [ -n "${SLURM_PARTITION:-}" ]; then
+          srun_args+=(-p "${SLURM_PARTITION}")
+        fi
+        srun_args+=(
+          -A "${SLURM_ACCOUNT}"
+          -N "${SLURM_NODES}"
+          --ntasks-per-node=1
+          -t "${SRUN_TIMELIMIT}"
+          --job-name "${SLURM_JOBNAME}"
+          --container-image="${ENROOT_IMAGE}"
+          --container-mounts="${CI_PROJECT_DIR}:/workspace"
+          --container-workdir=/workspace
+          --container-env=RESULTS_DIR_NAME,EXPECTED_COMPUTE_CAP,GPUS_PER_NODE,CUTLASS_DSL_PACKAGE,CUTLASS_DSL_INDEX_URL,PYTEST_WORKERS
+        )
+        echo "srun ${srun_args[*]}"
+        set +e
+        srun "${srun_args[@]}" /bin/bash ci/stages/oss_tests/run_test_oss_rubin.sh
+        run_status=$?
+        set -e
+        # srun can report success while the payload dies before pytest runs
+        # (bad image, no GPUs, pip failure), which would look like a green job.
+        if [ ! -f "${RESULTS_DIR_HOST}/complete.ok" ] && [ "${run_status}" -eq 0 ]; then
+          echo "ERROR: completion marker missing; the node script died silently."
+          run_status=1
+        fi
+        echo "oss:rubin srun exit status: ${run_status}"
+        exit "${run_status}"
+  after_script:
+    - rm -rf "${CI_PROJECT_DIR}/.enroot-${CI_JOB_ID}" || true
+  artifacts:
+    when: always
+    paths:
+      - rubin-oss-results/
+    reports:
+      junit: rubin-oss-results/result-junit.xml
+
+# The hecate runners carry only the `hecate` tag, so that is the whole selector.
+# Rubin-ness is not expressed in the tag set and is instead enforced at runtime:
+# run_test_oss_rubin.sh aborts unless the allocated node reports sm107.
+oss:rubin:
+  extends: .oss_tests_rubin:template
+  tags:
+    - hecate
