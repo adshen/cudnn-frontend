@@ -63,9 +63,53 @@ pip install -v --no-cache-dir --no-build-isolation .[cutedsl] \
 # of the cutedsl dependency set (cuda-python, apache-tvm-ffi, torch-c-dlpack-ext),
 # so uninstalling the DSL afterwards is cheaper than hand-listing those deps and
 # letting them drift from pyproject.toml.
-pip uninstall -y nvidia-cutlass-dsl
-pip install --no-cache-dir "${CUTLASS_DSL_PACKAGE:?CUTLASS_DSL_PACKAGE must be set}" \
+#
+# The Rubin image ALREADY ships nvidia-cutlass-dsl-internal, and that is the wheel
+# carrying the sm107 kernels. Both wheels unpack into the same
+# nvidia_cutlass_dsl/dsl_packages/cutlass/ directory, so `pip install .[cutedsl]`
+# overwrites the internal files with the public ones, and the plain
+# `pip uninstall nvidia-cutlass-dsl` below does not put them back — pip then
+# reports the internal dist as "already satisfied" and installs nothing. The
+# result is a public 4.6.1 `cutlass` on the path whose Arch enum has no sm_107a,
+# so every DSL test dies with `KeyError: 'sm_107a'` while the job still looks like
+# it exercised Rubin. Remove the public dist *and its libs* packages, then
+# force-reinstall the internal wheel so it is unambiguously the one on disk.
+pip uninstall -y nvidia-cutlass-dsl \
+    nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-core \
+    nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 || true
+pip install --no-cache-dir --force-reinstall --no-deps \
+    "${CUTLASS_DSL_PACKAGE:?CUTLASS_DSL_PACKAGE must be set}" \
     --extra-index-url "${CUTLASS_DSL_INDEX_URL:?CUTLASS_DSL_INDEX_URL must be set}"
+
+# Prove the DSL on the path actually understands Rubin before spending an hour of
+# node time on it. Without this the failure mode is 3000 identical KeyErrors deep
+# in collection, which reads as "the change broke everything" rather than "the
+# wrong wheel won".
+python - <<'PY'
+import sys
+import importlib.metadata as md
+
+for d in sorted(md.distributions(), key=lambda x: (x.metadata["Name"] or "").lower()):
+    name = d.metadata["Name"] or ""
+    if "cutlass" in name.lower():
+        print(f"  dist: {name} == {d.version}")
+
+import cutlass
+print("  cutlass.__file__   :", cutlass.__file__)
+print("  cutlass.__version__:", getattr(cutlass, "__version__", "unknown"))
+
+from cutlass.base_dsl.arch import Arch
+
+members = list(Arch.__members__)
+print("  Arch sm_10x members:", [m for m in members if m.startswith("sm_10")])
+if "sm_107a" not in members:
+    sys.exit(
+        "FATAL: the resolved cutlass DSL has no sm_107a in its Arch enum, so every "
+        "Rubin test would fail with KeyError: 'sm_107a'. The public "
+        "nvidia-cutlass-dsl has shadowed nvidia-cutlass-dsl-internal."
+    )
+print("  sm_107a: OK")
+PY
 
 # Fail here rather than midway through collection. requirements.txt pins
 # numpy<2.0.0, which can downgrade the numpy the container's torch was built
