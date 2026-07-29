@@ -98,7 +98,7 @@ oss:rel:cutlass_dsl_internal:
     # .default_job_template draft rule before flipping allow_failure.
     # api/cudnn-gh pipelines are deliberately excluded: they run as a bot user
     # that has no cluster account (sybil would reject the job).
-    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event" || $CI_PIPELINE_SOURCE == "api" 
   script:
     - hostname && whoami && id
     - export RESULTS_DIR_HOST="${CI_PROJECT_DIR}/${RESULTS_DIR_NAME}"
