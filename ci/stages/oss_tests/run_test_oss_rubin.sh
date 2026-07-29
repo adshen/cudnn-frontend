@@ -122,11 +122,17 @@ python -c 'import cudnn; print("cudnn frontend:", cudnn.__version__); print("cud
 # --- test -------------------------------------------------------------------
 # Write the junit report straight to the mounted results dir so it survives even
 # if a later step in this script dies.
+# PYTEST_TARGETS narrows the run to a subset (space-separated paths / node ids).
+# The full fe_api suite does not fit in SRUN_TIMELIMIT on Rubin -- it reached 92%
+# at the 100 minute mark -- so a targeted subset is the only way to get a junit
+# report out of a single allocation.
+read -r -a pytest_targets <<< "${PYTEST_TARGETS:-test/python/fe_api}"
+echo "pytest targets: ${pytest_targets[*]}"
 set +e
 pytest -n "${PYTEST_WORKERS:-4}" \
        --junit-xml="${RESULTS_DIR}/result-junit.xml" \
        --no-header --tb=short \
-       test/python/fe_api
+       "${pytest_targets[@]}"
 pytest_status=$?
 set -e
 
