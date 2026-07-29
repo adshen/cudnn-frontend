@@ -32,6 +32,9 @@ oss:rel:cutlass_dsl_4.6:
 # nvidia-cutlass-dsl-internal tracks the unreleased 4.7.0 line (not on PyPI).
 oss:rel:cutlass_dsl_internal:
   extends: oss:rel
+  variables:
+    CUTLASS_DSL_ARCH: sm_107a
+    CUTE_DSL_ARCH: sm_107a
   script:
     - pip install -v .[cutedsl]
     - pip uninstall -y nvidia-cutlass-dsl
