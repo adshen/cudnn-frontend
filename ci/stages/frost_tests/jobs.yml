@@ -1,4 +1,4 @@
-frost_engine_test:
+frost_tests:
   stage: frost_tests
   extends:
     - .default_job_template
@@ -7,4 +7,25 @@ frost_engine_test:
   tags: ["Blackwell"]
   needs: ["build:dev"]
   script:
-    - ci/stages/frost_tests/run_frost_engine_tests.sh
+    - ci/stages/frost_tests/run_frost_tests.sh
+
+# ==============================================================================
+# SM120 frost tests on cudnn-dev-net-22-04 / cudnn-dev-oar-22-04, each a
+# single-GPU GeForce RTX 5080 box (compute capability 12.0). Registered as
+# project runner ids 1360909 and 1360910, docker executor, concurrent = 1.
+#
+# These two boxes are dedicated to frost coverage and carry only the `SM120`
+# tag. They are deliberately kept out of .device_matrix:template, so no other
+# stage (python_tests, pycudnn, sanitizer, L4, oss, python_samples) fans out to
+# them — frost is the only workload SM120 is expected to run.
+#
+# Everything except the tag is inherited from frost_tests above: the same dev
+# image, the same fetch_cudnn_dev setup, the same build:dev artifact and the
+# same run_frost_tests.sh. Keeping it a separate job rather than a parallel
+# matrix over ["Blackwell", "SM120"] means allow_failure below applies to SM120
+# only and does not weaken the existing Blackwell gate.
+# ==============================================================================
+frost_tests:sm120:
+  extends: frost_tests
+  tags: ["SM120"]
+  allow_failure: true          # bring-up phase; must not block MRs
