@@ -1,13 +1,51 @@
-frost_tests:
+# FROST engine tests, split one job per opset folder under test/python/<opset>/frost.
+#
+# Each opset only runs on the architectures its engines target, so a failure names
+# both the opset and the GPU it failed on instead of being buried in one omnibus job:
+#   sdpa             -> Blackwell, Ampere (the SM100 kernel tests self-skip off
+#                       Blackwell; test_mhas_v2.py is the real non-Blackwell
+#                       coverage -- it exercises FROST dispatch and the native
+#                       cuDNN fallback through cudnn.pygraph)
+#
+# Hopper is deliberately absent: test_mhas_v2.py under -n 4 does not fit in the
+# Hopper runner's memory, so the job failed on ~500 torch.OutOfMemoryError from
+# the moment it was added (it was already red on !2254, the MR that introduced
+# it) -- none of them a real defect, and FROST engines are SM100-only so they are
+# not even eligible there. Restore the ARCH entry once the job fits, e.g. with a
+# lower -n or PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+#   linear_attention -> Blackwell only (GDN / GDN2 / KDA kernels are SM100-only)
+#   gemm             -> Blackwell only
+.frost_tests:template:
   stage: frost_tests
   extends:
     - .default_job_template
     - .cudnn_dev_image:template
     - .fetch_cudnn_dev:template
-  tags: ["Blackwell"]
   needs: ["build:dev"]
   script:
-    - ci/stages/frost_tests/run_frost_tests.sh
+    - ci/stages/frost_tests/run_frost_tests.sh ${FROST_TEST_PATHS}
+
+frost_tests:sdpa:
+  extends: .frost_tests:template
+  parallel:
+    matrix:
+      - ARCH: ["Blackwell", "Ampere"]
+  tags:
+    - ${ARCH}
+  variables:
+    FROST_TEST_PATHS: "test/python/sdpa/frost test/python/test_mhas_v2.py"
+
+frost_tests:linear_attention:
+  extends: .frost_tests:template
+  tags: ["Blackwell"]
+  variables:
+    FROST_TEST_PATHS: "test/python/linear_attention/frost"
+
+frost_tests:gemm:
+  extends: .frost_tests:template
+  tags: ["Blackwell"]
+  variables:
+    FROST_TEST_PATHS: "test/python/gemm/frost"
 
 # ==============================================================================
 # SM120 frost tests on cudnn-dev-net-22-04 / cudnn-dev-oar-22-04, each a
@@ -19,13 +57,13 @@ frost_tests:
 # stage (python_tests, pycudnn, sanitizer, L4, oss, python_samples) fans out to
 # them — frost is the only workload SM120 is expected to run.
 #
-# Everything except the tag is inherited from frost_tests above: the same dev
-# image, the same fetch_cudnn_dev setup, the same build:dev artifact and the
-# same run_frost_tests.sh. Keeping it a separate job rather than a parallel
-# matrix over ["Blackwell", "SM120"] means allow_failure below applies to SM120
-# only and does not weaken the existing Blackwell gate.
+# Unlike the per-opset jobs above, this one leaves FROST_TEST_PATHS unset so
+# run_frost_tests.sh falls back to the whole FROST suite -- SM120 is a bring-up
+# target and we want the widest signal off it. Keeping it a separate job rather
+# than another arch in the sdpa matrix means allow_failure below applies to
+# SM120 only and does not weaken the existing Blackwell gate.
 # ==============================================================================
 frost_tests:sm120:
-  extends: frost_tests
+  extends: .frost_tests:template
   tags: ["SM120"]
   allow_failure: true          # bring-up phase; must not block MRs
