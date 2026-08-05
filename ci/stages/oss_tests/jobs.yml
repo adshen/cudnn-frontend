@@ -2,7 +2,7 @@
   stage: oss_tests
   allow_failure: true
   variables:
-    CUTLASS_DSL_VERSION: "4.5.0"
+    CUTLASS_DSL_VERSION: "4.5.1"
   script:
     - pip install -v .[cutedsl] "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
     - ci/stages/oss_tests/run_test_oss.sh
@@ -25,21 +25,20 @@ oss:rel:
 oss:rel:cutlass_dsl_4.6:
   extends: oss:rel
   variables:
-    CUTLASS_DSL_VERSION: "4.6.1"
+    CUTLASS_DSL_VERSION: "4.6.2"
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
 
-# nvidia-cutlass-dsl-internal tracks the unreleased 4.7.0 line (not on PyPI).
-oss:rel:cutlass_dsl_internal:
+# 4.7.0 is now a PyPI release, so this is a plain version override like the 4.6
+# job above rather than the old install-then-swap against the urm internal wheel.
+# The sm_107a CUTLASS_DSL_ARCH/CUTE_DSL_ARCH overrides went with it: the public
+# wheel's Arch enum stops at sm_103a, and these runners are Hopper/Ampere/
+# Blackwell anyway. sm107 coverage is oss:rubin below, which keeps the internal
+# wheel because that is the only one carrying the Rubin kernels.
+oss:rel:cutlass_dsl_4.7:
   extends: oss:rel
   variables:
-    CUTLASS_DSL_ARCH: sm_107a
-    CUTE_DSL_ARCH: sm_107a
-  script:
-    - pip install -v .[cutedsl]
-    - pip uninstall -y nvidia-cutlass-dsl
-    - pip install "nvidia-cutlass-dsl==4.7.0a0" --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
-    - ci/stages/oss_tests/run_test_oss.sh
+    CUTLASS_DSL_VERSION: "4.7.0"
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
 

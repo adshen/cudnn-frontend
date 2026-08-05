@@ -58,11 +58,16 @@ pip install --no-cache-dir -r requirements.txt
 pip install -v --no-cache-dir --no-build-isolation .[cutedsl] \
     || pip install -v --no-cache-dir .[cutedsl]
 
-# Swap the PyPI-pinned cutedsl for the internal wheel. Same replace-after-install
-# pattern as oss:rel:cutlass_dsl_internal — the extra is what pulls in the rest
-# of the cutedsl dependency set (cuda-python, apache-tvm-ffi, torch-c-dlpack-ext),
-# so uninstalling the DSL afterwards is cheaper than hand-listing those deps and
-# letting them drift from pyproject.toml.
+# Swap the PyPI-pinned cutedsl for the internal wheel. Install-then-replace,
+# because the extra is what pulls in the rest of the cutedsl dependency set
+# (cuda-python, apache-tvm-ffi, torch-c-dlpack-ext), so uninstalling the DSL
+# afterwards is cheaper than hand-listing those deps and letting them drift
+# from pyproject.toml.
+#
+# This job is the one place the internal wheel is still required. The oss:rel
+# nightlies moved to public PyPI pins (4.5.1 / 4.6.2 / 4.7.0) once 4.7.0 was
+# released, but the public 4.7.0 Arch enum stops at sm_103a — only
+# nvidia-cutlass-dsl-internal carries sm_107a and the Rubin kernels.
 #
 # The Rubin image ALREADY ships nvidia-cutlass-dsl-internal, and that is the wheel
 # carrying the sm107 kernels. Both wheels unpack into the same

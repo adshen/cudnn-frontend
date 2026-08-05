@@ -25,7 +25,11 @@ function install_deps() {
     # extra, pip resolves nvidia-cutlass-dsl-libs-cu12 and the DSL runs a
     # CUDA-12 libNVVM (statically linked into _cutlass_ir.cu12.so) against a
     # CUDA 13 toolkit.
-    pip install "nvidia-cutlass-dsl[cu13]==4.7.0a0" "apache-tvm-ffi>=0.1.11" --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+    #
+    # 4.7.0 is a PyPI release now, so this pins the public wheel instead of the
+    # 4.7.0a0 prerelease from the urm internal index -- both packages are on
+    # PyPI, so no --extra-index-url is needed.
+    pip install "nvidia-cutlass-dsl[cu13]==4.7.0" "apache-tvm-ffi>=0.1.11"
     # The FROST tvm-ffi front door (~4.3x lower host dispatch) degrades silently
     # if tvm_ffi is missing, so a lost dependency would hide as a green build.
     python -c "import tvm_ffi; print('tvm_ffi', tvm_ffi.__version__)"
