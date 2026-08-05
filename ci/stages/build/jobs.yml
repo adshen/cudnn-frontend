@@ -11,7 +11,7 @@
 build:dev:
   needs: []
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .cudnn_dev_image:template
     - .fetch_cudnn_dev:template
     - .build:template
@@ -19,7 +19,7 @@ build:dev:
 build:rel:
   needs: []
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .cudnn_rel_image:template
     - .fetch_cudnn_rel:template
     - .build:template
@@ -36,4 +36,4 @@ build:win:
     - cmake ../
     - cmake --build . -j16 --verbose
   extends:
-    - .default_job_template
+    - .rules:mr_auto

@@ -5,7 +5,7 @@
 
 .analysis_job_template:
     extends:
-        - .default_job_template
+        - .rules:mr_auto
         - .cudnn_ga_image:template
     tags:
         - Blackwell
@@ -63,7 +63,8 @@ analysis:check-CUDNN_FRONTEND_SKIP_JSON_LIB:
 
 analysis:clang-format:
     stage: analysis
-    allow_failure: true
+    rules:
+        - !reference [.rules:mr_auto_allow_failure, rules]
     script:
         - ci/stages/analysis/run_style_check_diff.sh
     extends:
@@ -72,7 +73,8 @@ analysis:clang-format:
 analysis:guardwords_scan:
     needs: []
     stage: analysis
-    allow_failure: true
+    rules:
+        - !reference [.rules:mr_auto_allow_failure, rules]
     variables:
         GUARDWORDS_REPO: "gitlab-master.nvidia.com/dlswqa/cudnn/flashinfer-guardwords-scan.git"
         GUARDWORDS_DIR: "/tmp/guardwords-scan"
@@ -92,9 +94,8 @@ analysis:github-file-sync:
     tags:
         - Blackwell
     rules:
-        - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "develop"'
+        - !reference [.rules:nightly_develop, rules]
     script:
         - python3 ci/stages/analysis/check_github_file_sync.py
     extends:
-        - .default_job_template
         - .python_3_12_image:template

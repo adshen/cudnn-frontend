@@ -15,7 +15,7 @@ build:san:
     paths:
       - build/
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .cudnn_dev_image:template
     - .fetch_cudnn_dev:template
 
@@ -27,7 +27,7 @@ build:san:
 cpp_test:san:
   stage: sanitizer_tests
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .device_matrix:template
     - .cudnn_dev_image:template
     - .fetch_cudnn_dev:template

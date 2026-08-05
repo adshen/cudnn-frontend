@@ -7,23 +7,19 @@
     CI_CUDNN_FRONTEND_PIPELINE_SOURCE: $CI_PIPELINE_SOURCE
     CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
   rules:
-    - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: manual
-      allow_failure: true
+    # Same as .rules:mr_auto, but a bot pipeline has no merge request to read the
+    # source branch from, so that one case is spelled out ahead of the shared set
+    # to carry the variables override. First match wins.
     - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
-      when: manual
-      allow_failure: true
       variables:
         CI_CUDNN_FRONTEND_MERGE_REQUEST_SOURCE_BRANCH_NAME: $CI_COMMIT_REF_NAME
+    - !reference [.rules:mr_auto, rules]
   stage: backend_triggers
-  needs: []
   interruptible: true
 
 backend:rel:
   extends: .backend-trigger
+  needs: ["manual:backend"]
   trigger:
     project: cudnn/cudnn
     branch: release/9.25.0
@@ -31,6 +27,7 @@ backend:rel:
 
 backend:dev:
   extends: .backend-trigger
+  needs: ["manual:backend"]
   trigger:
     project: cudnn/cudnn
     branch: dev

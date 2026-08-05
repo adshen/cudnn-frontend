@@ -28,6 +28,7 @@ include:
   - local: ci/common/images.yml
   - local: ci/common/matrices.yml
   - local: ci/common/cudnn.yml
+  - local: ci/stages/manual/jobs.yml
   - local: ci/stages/analysis/jobs.yml
   - local: ci/stages/build/jobs.yml
   - local: ci/stages/sanitizer_tests/jobs.yml
@@ -50,20 +51,18 @@ include:
       - if: $CI_PIPELINE_SOURCE == "schedule"
 
 stages:
+  - manual
   - analysis
   - build
-  - sanitizer_tests
+  - python_samples
   - cpp_samples
   - oss_tests
-  - cpp_tests
   - frost_tests
-  - python_samples
   - python_tests
-  - multi-gpu-run
-  - mha_v1_tests
-  - mha_v2_tests
+  - sanitizer_tests
   - pycudnnTest
+  - multi-gpu-run
+  - backend_triggers
   - L4_graph_runner
   - deploy
   - notify
-  - backend_triggers

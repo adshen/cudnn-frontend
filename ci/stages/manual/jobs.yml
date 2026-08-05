@@ -1,0 +1,45 @@
+# Gate jobs. Each one is a switch, not a test: it runs nothing, and the jobs it
+# guards list it in needs:. On a change pipeline the gate is manual, so its group
+# only runs once somebody starts it -- @cudnn-ci-bot does that through the jobs
+# play API when a GitHub comment asks for the target (`@cudnn-ci-bot run oss`),
+# and a maintainer can click it on the pipeline page. On a schedule the gate runs
+# automatically, so nightlies keep running everything.
+#
+# Gating this way rather than marking each job `when: manual` means one click
+# starts a whole matrix, and the guarded jobs stay ordinary automatic jobs, so a
+# failure still fails the pipeline. allow_failure belongs on the switch, never on
+# the work.
+.manual_gate:template:
+  stage: manual
+  extends:
+    - .python_3_12_image:template
+  tags:
+    - Blackwell
+  needs: []
+  variables:
+    GIT_STRATEGY: none
+  rules:
+    - !reference [.rules:mr_manual_allow_failure, rules]
+  script:
+    - echo "gate opened by ${GITLAB_USER_LOGIN:-unknown}; the jobs that need this one will now run"
+
+manual:python_samples:
+  extends: .manual_gate:template
+
+manual:python_tests:
+  extends: .manual_gate:template
+
+manual:frost:
+  extends: .manual_gate:template
+
+manual:oss:
+  extends: .manual_gate:template
+
+manual:pycudnn:
+  extends: .manual_gate:template
+
+manual:multi_gpu:
+  extends: .manual_gate:template
+
+manual:backend:
+  extends: .manual_gate:template

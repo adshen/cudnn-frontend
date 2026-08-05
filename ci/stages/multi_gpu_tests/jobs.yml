@@ -16,8 +16,8 @@
 
 .multi_gpu_cluster:template:
     stage: multi-gpu-run
-    needs: []
-    allow_failure: true          # infra-proving phase; must not block MRs
+    needs: ["manual:multi_gpu"]
+    allow_failure: true          # infra-proving phase; a nightly must not go red on it
     timeout: 1h
     retry:
         max: 1
@@ -37,13 +37,12 @@
         ENROOT_IMAGE: "docker://nvcr.io#nvidia/pytorch:26.06-py3"
         ENROOT_CACHE_ROOT: "/lustre/fsw/coreai_libraries_cudnn/cudnn-frontend-ci/enroot"
         RESULTS_DIR_HOST: "${CI_PROJECT_DIR}/multigpu-results"
+    # WARNING: on a bot pipeline this job fails until the bot user is onboarded
+    # to hecate — sybil runs the script on the login node as the user who
+    # triggered the pipeline, and the bot has no unix/SLURM/kerberos account
+    # there. It only runs when manual:multi_gpu is started.
     rules:
-        # NOTE: no Draft-skip while the infra is proven out, so the job can be
-        # iterated from a Draft MR without running the full pipeline. Re-add the
-        # .default_job_template draft rule before flipping allow_failure.
-        # api/cudnn-gh pipelines are deliberately excluded: they run as a bot
-        # user that has no cluster account (sybil would reject the job).
-        - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
+        - !reference [.rules:mr_auto, rules]
     script:
         - hostname && whoami && id
         - rm -rf "${RESULTS_DIR_HOST}" && mkdir -p "${RESULTS_DIR_HOST}"

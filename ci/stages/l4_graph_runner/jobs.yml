@@ -11,7 +11,7 @@ L4:dev:
     - .L4_graph_runner_large:template
   needs: ["build:dev"]
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - !reference [.rules:schedule_only, rules]
 
 L4:rel:
   extends:
@@ -21,4 +21,4 @@ L4:rel:
     - .L4_graph_runner_large:template
   needs: ["build:rel"]
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - !reference [.rules:schedule_only, rules]

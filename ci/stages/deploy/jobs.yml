@@ -8,7 +8,7 @@ deploy:build_bdist_wheels:
     script:
         - ci/stages/deploy/build_pip_wheels.sh
     rules:
-        - if: $CI_PIPELINE_SOURCE == "schedule"
+        - !reference [.rules:schedule_only, rules]
     artifacts:
         paths:
             - many_linux_wheels/*.whl
@@ -32,7 +32,7 @@ deploy:build_bdist_wheels:
         - $DATE_FOLDER = Get-Date -Format "yyyy-MM-dd"
         - if ($CI_COMMIT_BRANCH -eq "main") { echo "main branch ${DATE_FOLDER}"; curl.exe -u ${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN} -T ./wheels/py${PYTHON_VERSION}/${wheel} https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/CUDNN/cudnn_frontend/main/${DATE_FOLDER}/${wheel} } elseif (${CI_COMMIT_BRANCH} -eq "develop") {echo "develop branch ${DATE_FOLDER}"; curl.exe -u ${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN} -T ./wheels/py${PYTHON_VERSION}/${wheel} https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/CUDNN/cudnn_frontend/develop/latest/${wheel} } else { echo "${CI_COMMIT_BRANCH}"; echo "Not posting ${wheel} to artifactory"}
     rules:
-        - if: $CI_PIPELINE_SOURCE == "schedule"
+        - !reference [.rules:schedule_only, rules]
     artifacts:
         paths:
             - wheels/py${PYTHON_VERSION}/*.whl
@@ -90,7 +90,7 @@ deploy:test_bdist_wheels_ga_cudnn_3.12:
     extends:
         - .cudnn_ga_image:template
     rules:
-        - if: $CI_PIPELINE_SOURCE == "schedule"
+        - !reference [.rules:schedule_only, rules]
     script:
         - apt-get install -y wget
         - wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb

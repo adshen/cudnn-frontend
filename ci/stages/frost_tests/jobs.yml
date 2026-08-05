@@ -18,10 +18,10 @@
 .frost_tests:template:
   stage: frost_tests
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .cudnn_dev_image:template
     - .fetch_cudnn_dev:template
-  needs: ["build:dev"]
+  needs: ["build:dev", "manual:frost"]
   script:
     - ci/stages/frost_tests/run_frost_tests.sh ${FROST_TEST_PATHS}
 
@@ -60,10 +60,11 @@ frost_tests:gemm:
 # Unlike the per-opset jobs above, this one leaves FROST_TEST_PATHS unset so
 # run_frost_tests.sh falls back to the whole FROST suite -- SM120 is a bring-up
 # target and we want the widest signal off it. Keeping it a separate job rather
-# than another arch in the sdpa matrix means allow_failure below applies to
+# than another arch in the sdpa matrix means the softer rule set below applies to
 # SM120 only and does not weaken the existing Blackwell gate.
 # ==============================================================================
 frost_tests:sm120:
   extends: .frost_tests:template
   tags: ["SM120"]
-  allow_failure: true          # bring-up phase; must not block MRs
+  rules:
+    - !reference [.rules:mr_auto_allow_failure, rules]

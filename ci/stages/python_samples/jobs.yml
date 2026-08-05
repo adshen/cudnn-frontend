@@ -11,11 +11,11 @@ py_samples:rel:
   tags:
     - ${ARCH}
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .python_samples:template
     - .cudnn_rel_image:template
     - .fetch_cudnn_rel:template
-  needs: []
+  needs: ["manual:python_samples"]
 
 py_samples:ga:
   script:
@@ -27,7 +27,7 @@ py_samples:ga:
   tags:
     - ${ARCH}
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .python_samples:template
     - .cudnn_ga_image:template
-  needs: []
+  needs: ["manual:python_samples"]

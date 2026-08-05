@@ -9,7 +9,7 @@
 
 oss:rel:
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .device_matrix:template
     - .cudnn_rel_image:template
     - .fetch_cudnn_rel:template
@@ -19,7 +19,7 @@ oss:rel:
       - ARCH: ["Hopper", "Ampere"]
       - ARCH: ["Blackwell"]
         OSS_TEST_SHARD: ["shard0", "shard1"]
-  needs: []
+  needs: ["manual:oss"]
 
 # Nightly-only duplicates of oss:rel against newer cutlass-dsl versions.
 oss:rel:cutlass_dsl_4.6:
@@ -27,7 +27,7 @@ oss:rel:cutlass_dsl_4.6:
   variables:
     CUTLASS_DSL_VERSION: "4.6.2"
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - !reference [.rules:schedule_only, rules]
 
 # 4.7.0 is now a PyPI release, so this is a plain version override like the 4.6
 # job above rather than the old install-then-swap against the urm internal wheel.
@@ -40,7 +40,7 @@ oss:rel:cutlass_dsl_4.7:
   variables:
     CUTLASS_DSL_VERSION: "4.7.0"
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - !reference [.rules:schedule_only, rules]
 
 # ==============================================================================
 # Rubin (sm107) OSS tests on the hecate SLURM pre-cluster.
@@ -66,8 +66,8 @@ oss:rel:cutlass_dsl_4.7:
 
 .oss_tests_rubin:template:
   stage: oss_tests
-  needs: []
-  allow_failure: true          # bring-up phase; must not block MRs
+  needs: ["manual:oss"]
+  allow_failure: true          # bring-up phase; a nightly must not go red on it
   timeout: 2h
   retry:
     max: 1
@@ -97,12 +97,7 @@ oss:rel:cutlass_dsl_4.7:
     # Space-separated pytest paths. Empty -> the full fe_api suite.
     PYTEST_TARGETS: ""
   rules:
-    # No Draft-skip while the infra is proven out, so the job can be iterated
-    # from a Draft MR without running the full pipeline. Re-add the
-    # .default_job_template draft rule before flipping allow_failure.
-    # api/cudnn-gh pipelines are deliberately excluded: they run as a bot user
-    # that has no cluster account (sybil would reject the job).
-    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event" || $CI_PIPELINE_SOURCE == "api" 
+    - !reference [.rules:mr_auto, rules]
   script:
     - hostname && whoami && id
     - export RESULTS_DIR_HOST="${CI_PROJECT_DIR}/${RESULTS_DIR_NAME}"

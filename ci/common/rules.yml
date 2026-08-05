@@ -1,4 +1,31 @@
-.default_job_template:
+# Shared rule sets. Jobs should reach for one of these rather than spelling out
+# their own `rules:`, so that pipeline-source policy lives in one file.
+#
+# "MR" below means both kinds of change pipeline: a GitLab merge request, and the
+# api + cudnn-gh/* pipeline @cudnn-ci-bot creates for a GitHub pull request. The
+# first four are mutually exclusive -- pick exactly one.
+#
+#   .rules:mr_auto                  runs; a failure fails the pipeline
+#   .rules:mr_auto_allow_failure    runs; a failure does not
+#   .rules:mr_manual                manual; a failure fails the pipeline
+#   .rules:mr_manual_allow_failure  manual; a failure does not
+#   .rules:schedule_only            nightly only
+#   .rules:nightly_develop          nightly on develop only
+#
+# The allow_failure variants apply to change pipelines only -- on a nightly the
+# job still counts. A job that should be soft everywhere wants job-level
+# allow_failure instead.
+#
+# Manual jobs are what @cudnn-ci-bot starts through the jobs play API when a
+# GitHub comment asks for them (`@cudnn-ci-bot run <target>`); anything unasked
+# for stays startable from the pipeline page. Prefer .rules:mr_manual, so a job
+# someone explicitly asked for still turns the pipeline red when it fails.
+# .rules:mr_manual_allow_failure is for jobs that are not expected to pass yet.
+#
+# A job that needs one of these plus something extra can put its own rule first
+# and reference the shared set after it -- first match wins. See backend:dev.
+
+.rules:base:
   rules:
     # CI_MERGE_REQUEST_DRAFT is not available in older GitLab versions (requires 17.10+), commented until GitLab is upgraded
     # - if: $CI_MERGE_REQUEST_DRAFT == "true"
@@ -6,5 +33,46 @@
     # Workaround: Check MR title for draft prefixes (Draft:, WIP:, [WIP])
     - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
       when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+.rules:mr_auto:
+  rules:
+    - !reference [.rules:base, rules]
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
+
+.rules:mr_auto_allow_failure:
+  rules:
+    - !reference [.rules:base, rules]
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
+      allow_failure: true
+
+.rules:mr_manual:
+  rules:
+    - !reference [.rules:base, rules]
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
+      when: manual
+      allow_failure: false
+
+.rules:mr_manual_allow_failure:
+  rules:
+    - !reference [.rules:base, rules]
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
+      when: manual
+      allow_failure: true
+
+.rules:schedule_only:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+.rules:nightly_develop:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_REF_NAME == "develop"'

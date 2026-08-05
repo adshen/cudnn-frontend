@@ -5,18 +5,18 @@
 
 pycudnn:dev:
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .device_matrix:template
     - .cudnn_dev_image:template
     - .fetch_cudnn_dev:template
     - .pycudnntest:template
-  needs: ["build:dev"]
+  needs: ["build:dev", "manual:pycudnn"]
 
 pycudnn:rel:
   extends:
-    - .default_job_template
+    - .rules:mr_auto
     - .device_matrix:template
     - .cudnn_rel_image:template
     - .fetch_cudnn_rel:template
     - .pycudnntest:template
-  needs: ["build:rel"]
+  needs: ["build:rel", "manual:pycudnn"]
