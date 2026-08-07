@@ -78,12 +78,9 @@ oss:rel:cutlass_dsl_4.7:
     GIT_STRATEGY: clone
     GIT_DEPTH: 20
     SLURM_ACCOUNT: "coreai_libraries_cudnn"
-    # backfill-xdr: the hecate Rubin (sm107/GR100) partition with backfill
-    # scheduling. batch-xdr is the same hardware but carries a long pending
-    # queue (190+ jobs observed); backfill-xdr typically grants a node in
-    # seconds. Override by setting SLURM_PARTITION as a CI/CD variable if
-    # the partition name changes.
-    SLURM_PARTITION: "backfill-xdr"
+    # Empty -> no -p flag, i.e. the cluster's default partition. hecate has no
+    # `batch` partition; set this only if a specific one turns out to be needed.
+    SLURM_PARTITION: ""
     SLURM_NODES: 1
     GPUS_PER_NODE: 4
     SRUN_TIMELIMIT: 100        # minutes, well under the 2h job timeout
@@ -131,9 +128,10 @@ oss:rel:cutlass_dsl_4.7:
         echo "enroot cache: ${cache_root}"
     # --- submit to SLURM: a single task owning the whole Rubin node ---
     - |
-        # Submit to SLURM on the backfill-xdr partition (Rubin sm107 nodes).
-        # hecate nodes report Gres=(null) so --exclusive is required to get all
-        # 4 GPUs on the node; without it srun allocates a single CPU task.
+        # -p is omitted unless SLURM_PARTITION is set: hecate has no `batch`
+        # partition and rejects the job outright ("invalid partition specified"),
+        # so let the cluster pick its default. Set SLURM_PARTITION (job variable
+        # or CI/CD variable) to pin one once the right name is known.
         srun_args=()
         if [ -n "${SLURM_PARTITION:-}" ]; then
           srun_args+=(-p "${SLURM_PARTITION}")
@@ -142,7 +140,6 @@ oss:rel:cutlass_dsl_4.7:
           -A "${SLURM_ACCOUNT}"
           -N "${SLURM_NODES}"
           --ntasks-per-node=1
-          --exclusive
           -t "${SRUN_TIMELIMIT}"
           --job-name "${SLURM_JOBNAME}"
           --container-image="${ENROOT_IMAGE}"
