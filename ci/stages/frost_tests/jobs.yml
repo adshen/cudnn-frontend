@@ -57,14 +57,15 @@ frost_tests:gemm:
 # stage (python_tests, pycudnn, sanitizer, L4, oss, python_samples) fans out to
 # them — frost is the only workload SM120 is expected to run.
 #
-# Unlike the per-opset jobs above, this one leaves FROST_TEST_PATHS unset so
-# run_frost_tests.sh falls back to the whole FROST suite -- SM120 is a bring-up
-# target and we want the widest signal off it. Keeping it a separate job rather
-# than another arch in the sdpa matrix means the softer rule set below applies to
-# SM120 only and does not weaken the existing Blackwell gate.
+# SM120 exercises the FROST SDPA kernel tests plus the pygraph routing and native
+# fallback coverage in test_mhas_v2.py. Keeping this a separate job rather than
+# another arch in the sdpa matrix also lets the softer rule set below apply only
+# to SM120 without weakening the existing Blackwell gate.
 # ==============================================================================
 frost_tests:sm120:
   extends: .frost_tests:template
   tags: ["SM120"]
   rules:
     - !reference [.rules:mr_auto_allow_failure, rules]
+  variables:
+    FROST_TEST_PATHS: "test/python/sdpa/frost test/python/test_mhas_v2.py"
