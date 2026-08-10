@@ -7,6 +7,11 @@ spec:
   image: "gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_$[[inputs.cudnn_version]]_$[[inputs.cuda_version]]"
   stage: build
   needs: []
+  variables:
+    # The qa_matrix cpp_samples jobs below execute bin/samples and
+    # bin/legacy_samples from this build's artifacts, so opt back into
+    # building them (MR builds leave them off — see ci/stages/build/build.sh).
+    FE_CI_BUILD_SAMPLES_AND_TESTS: "ON"
   extends:
     - .build:template
 

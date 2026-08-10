@@ -6,7 +6,12 @@
     - Blackwell
   artifacts:
     paths:
-      - build/
+      # Downstream jobs only need the python package (PYTHONPATH=build) and,
+      # for the scheduled qa_matrix cpp_samples jobs, the samples binaries.
+      # MR builds don't produce build/bin (samples/tests are off — see
+      # build.sh), so that path is simply absent there.
+      - build/cudnn/
+      - build/bin/
 
 build:dev:
   needs: []

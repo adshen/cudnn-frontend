@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import re
 import os
@@ -76,6 +77,28 @@ def filter_matches_by_artifact_property(matches, base_url, cuda_version, cudnn_v
     return result
 
 
+def get_artifact_sha256(base_url, version, cuda_version):
+    """SHA-256 of the tarball per Artifactory's storage API, or None if unavailable."""
+    api_base, repo_key, path_in_repo = _parse_artifactory_base_url(base_url)
+    rel = _tarball_path(version, cuda_version)
+    artifact_path = f"{path_in_repo}/{rel}" if path_in_repo else rel
+    url = f"{api_base}/api/storage/{repo_key}/{artifact_path}"
+    try:
+        r = requests.get(url, **request_kwargs(url), timeout=30)
+        r.raise_for_status()
+        return (r.json().get("checksums") or {}).get("sha256")
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+
+
+def sha256_of_file(path):
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def download_url(url, path):
     """Download url to path via a .tmp file (no partial file left on failure)."""
     tmp = Path(f"{path}.tmp")
@@ -120,6 +143,14 @@ def fetch_cudnn(base_url, cuda_version, download_dir, unzip_dir, output_dir, cud
         url = f"{base_url}/{_tarball_path(match['version'], cuda_version)}"
 
         if tarball_path.exists():
+            # A version tag can be republished with new bits, so the cached
+            # tarball is only trusted when its SHA-256 matches what Artifactory
+            # currently serves. On a match the multi-GB download is skipped;
+            # if the checksum can't be fetched, fall back to re-downloading.
+            remote_sha256 = get_artifact_sha256(base_url, match["version"], cuda_version)
+            if remote_sha256 and sha256_of_file(tarball_path) == remote_sha256:
+                print(f"Cached tarball for {version_num} at {tarball_path} matches Artifactory SHA-256; skipping download")
+                break
             print(f"Stale tarball for {version_num} at {tarball_path}; re-downloading (TOT version)")
 
         try:
@@ -132,6 +163,16 @@ def fetch_cudnn(base_url, cuda_version, download_dir, unzip_dir, output_dir, cud
 
     if tarball_path is None or not tarball_path.exists():
         raise Exception("ERROR: Failed to get any cuDNN build")
+
+    # Prune older cached tarballs so the CI cache stays a single file. TOT is
+    # re-downloaded every run regardless, so keeping history buys nothing:
+    # downloads/ just grows one multi-GB tarball per cuDNN TOT build and the
+    # cache save/restore ends up taking minutes per job. The tarball we keep
+    # remains the fallback if Artifactory is unreachable next run.
+    for old_tarball in downloads_dir.glob("cudnn-*.tar.gz"):
+        if old_tarball != tarball_path:
+            print(f"Pruning cached tarball {old_tarball}")
+            old_tarball.unlink()
 
     # extract, move, and copy
     print(f"Extracting {tarball_path}")
