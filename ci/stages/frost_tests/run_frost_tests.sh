@@ -10,7 +10,7 @@ if [ ${#FROST_TEST_PATHS[@]} -eq 0 ]; then
     FROST_TEST_PATHS=(
         test/python/gemm/frost
         test/python/sdpa/frost
-        test/python/linear_attention/frost
+        test/python/linear_attention
         test/python/test_mhas_v2.py
     )
 fi

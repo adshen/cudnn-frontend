@@ -39,7 +39,7 @@ frost_tests:linear_attention:
   extends: .frost_tests:template
   tags: ["Blackwell"]
   variables:
-    FROST_TEST_PATHS: "test/python/linear_attention/frost"
+    FROST_TEST_PATHS: "test/python/linear_attention"
 
 frost_tests:gemm:
   extends: .frost_tests:template
