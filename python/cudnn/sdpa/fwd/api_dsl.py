@@ -953,6 +953,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         lpt_head_group = 1
         if self._fp8 and self._pertensor and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 16 == 0:
             lpt_head_group = 16
+        if self._fp8 and self._pertensor and self.flavor == (256, 256) and not self.thd and (self.batch_size * self.h_q) % 32 == 0:
+            lpt_head_group = 32
         lpt_q_tiles = 0
         if self._fp8 and self._pertensor and self.flavor == (192, 128) and not self.thd:
             lpt_q_tiles = (self.s_q_max + 511) // 512
