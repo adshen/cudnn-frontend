@@ -188,6 +188,29 @@ NUM_KPHASES_PV = CFG.TILE_N // CFG.TILE_K_HW_BMM2
 NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
 
 
+def _max_abs_reduction(vec):
+    """Balanced max(abs(vec)) without materializing an abs vector."""
+    maxima = [vec[i] for i in range(int(vec.shape[0]))]
+    minima = list(maxima)
+    while len(maxima) > 1:
+        next_maxima = []
+        next_minima = []
+        for i in range(0, len(maxima), 3):
+            max_group = maxima[i : i + 3]
+            min_group = minima[i : i + 3]
+            max_acc = max_group[0]
+            min_acc = min_group[0]
+            for value in max_group[1:]:
+                max_acc = cute.math.max(max_acc, value, ftz=True)
+            for value in min_group[1:]:
+                min_acc = cute.math.min(min_acc, value, ftz=True)
+            next_maxima.append(max_acc)
+            next_minima.append(min_acc)
+        maxima = next_maxima
+        minima = next_minima
+    return cute.math.max(maxima[0], -minima[0], ftz=True)
+
+
 @cute.kernel
 def _kernel(
     tma_q_desc: cutlass.GridConstant[tmap.TensorMap],
@@ -1592,9 +1615,7 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 o_scaled = o_chunk * inv_sum
-                for _i in cutlass.range_constexpr(O_CHUNK):
-                    _e = o_scaled[_i]
-                    _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
+                _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled), ftz=True)
                 o_out = o_scaled.to(OUT_STORAGE_DTYPE)
 
                 col_offset_const = (chunk_idx_total * O_CHUNK) % D_BLOCK_SIZE
