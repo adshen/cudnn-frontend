@@ -4,9 +4,9 @@
 """End-to-end tests for the FROST SM100 DSL per-tensor FP8 SDPA-forward engine.
 
 Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) routed to
-the exact d128/d128 or d192/d128 engine, and validates O against an fp32-dequant
-reference. ``Amax_O`` is produced in-kernel (atomicMax over the pre-cast fp32 values)
-and checked.
+an exact d128/d128, d192/d128, or d256/d256 engine, and validates O against an
+fp32-dequant reference. ``Amax_O`` is produced in-kernel (atomicMax over the
+pre-cast fp32 values) and checked.
 
 cuDNN's ``sdpa_fp8`` op exposes causal / bottom-right / sliding-window masks, attention
 sink, and a padding mask (per-batch ``seq_len_kv`` → KV-side masking, tested here). THD /
@@ -304,6 +304,49 @@ def test_fp8_d192_d128_zero_length_kv():
         seq_lens_kv=[256, 0],
         d_qk=192,
         d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_fp8_d256_output_dtypes(in_key, out_key):
+    scale = 1.0 / math.sqrt(256)
+    out, o_ref, a_o, a_o_ref = _run(
+        1,
+        8,
+        8,
+        512,
+        512,
+        in_key,
+        _OUT[out_key],
+        scale=scale,
+        sdpa_kwargs=dict(use_causal_mask=True),
+        d_qk=256,
+        d_v=256,
+    )
+    _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal_br", "swa"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d256_masks(mask):
+    scale = 1.0 / math.sqrt(256)
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=256,
+        d_v=256,
     )
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 

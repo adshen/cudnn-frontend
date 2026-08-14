@@ -1012,6 +1012,7 @@ ENGINE_SPECS = (
         # trajectory that exceeds the frontend tolerance on sparse CI seeds.
         sink_dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
     ),
+    _sm100_fp8_spec(256),
     _sm120_spec(),
     _sm120_fp8_spec(),
     _sm80_spec(),

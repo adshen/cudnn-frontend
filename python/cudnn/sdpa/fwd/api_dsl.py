@@ -84,13 +84,14 @@ _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_FP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_fp8_sm100.py",
     (192, 128): "prefill_d192_d128_fp8_sm100.py",
+    (256, 256): "prefill_d256_fp8_sm100.py",
 }
 
 
 def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
     if device_cc == (10, 7):
         return frozenset({(128, 128)})
-    return frozenset({(128, 128), (192, 128)})
+    return frozenset({(128, 128), (192, 128), (256, 256)})
 
 
 # Both flavors tile KV in TILE_N=128 columns; the KV tail is only masked when
@@ -804,7 +805,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
         # FP8 paths use exact native shapes. SM100 supports d128/d128 and
-        # d192/d128; Rubin currently supports only per-tensor FP8 d128.
+        # d192/d128 for both paths, plus per-tensor FP8 d256/d256. Rubin
+        # currently supports only per-tensor FP8 d128.
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
         self._value_error_if(
             self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes,
