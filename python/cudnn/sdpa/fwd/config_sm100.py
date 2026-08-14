@@ -366,18 +366,19 @@ class CfgD256:
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
+    fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d256: register budget over 512"),
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d256: per-role regs must be multiples of 8"),
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
-        (cfg.CTA_MMA == 2, "d256 SM100 is cga2-only (CTA_MMA must be 2)"),
-        (cfg.STAGES_KV == 2, "d256 SM100 STAGES_KV: f16/bf16 -> 2 (192 KiB SMEM budget)"),
+        (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
+        (cfg.STAGES_KV == 2, "d256 SM100 uses two full/half-width KV stages"),
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d256: Q/K swizzle must be 64/128B"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d256: V/O swizzle out of range"),
         (cfg.TILES_Q == 1, "d256 pipeline mandates TILES_Q == 1"),
         (cfg.SOFTMAX_WARPGROUPS == 1, "d256 pipeline mandates SOFTMAX_WARPGROUPS == 1"),
-        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d256: DTYPE_O must equal DTYPE_QKV"),
+        (fp8 or cfg.DTYPE_O == cfg.DTYPE_QKV, "d256: half input requires DTYPE_O == DTYPE_QKV"),
     )
     for ok, msg in checks:
         if not ok:
@@ -387,18 +388,28 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
 def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
     _validate_params("d256", params)
     b = bpe(params.dtype_qkv)
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    b_o = bpe(dtype_o)
     cfg = CfgD256(
         DTYPE_QKV=params.dtype_qkv,
-        DTYPE_O=params.dtype_qkv,
+        DTYPE_O=dtype_o,
         BPE=b,
-        BPE_O=b,
+        BPE_O=b_o,
+        # FP8 uses one M128 CTA per work unit. With a full K/V slice per CTA,
+        # two KV stages consume the same SMEM payload as CTA2's four half-slices.
+        CGA_M=1 if fp8 else 2,
+        CTA_MMA=1 if fp8 else 2,
         Q_SWZ_BYTES=q_swz_bytes(256, b),
         K_SWZ_BYTES=q_swz_bytes(256, b),
-        V_SWZ_BYTES=v_swz_bytes(256, 2, b),
-        O_SWZ_BYTES=o_swz_bytes(256, b),
+        V_SWZ_BYTES=v_swz_bytes(256, 1 if fp8 else 2, b),
+        O_SWZ_BYTES=o_swz_bytes(256, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
-        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
+        STAGES_KV=2,
+        # 4 softmax + 4 correction + MMA + TMALDG + TMASTG per CTA.
+        READ_TILE_ARRIVERS=11 if fp8 else 21,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
