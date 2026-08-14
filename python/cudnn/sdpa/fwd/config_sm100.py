@@ -405,7 +405,7 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
-        SCHEDULER_POLICY=params.sched_policy,
+        SCHEDULER_POLICY=SCHED_LPT if fp8 else params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
