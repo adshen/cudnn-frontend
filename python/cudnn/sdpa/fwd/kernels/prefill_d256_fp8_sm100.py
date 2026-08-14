@@ -984,6 +984,7 @@ def _softmax_warp_group(
     cta_in_pair,
 ):
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
+    tmem_base = tmem_ptr_i32.load()
 
     bmm1_done_phase_pair = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)
@@ -1047,7 +1048,6 @@ def _softmax_warp_group(
                 bars.mb_bmm1_done[parity_rt].wait(bmm1_phase)
                 bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_rt)
 
-                tmem_base = tmem_ptr_i32.load()
                 s_addr_base = tmem_base + s_off_rt
                 p_addr_base = tmem_base + p_off_rt
                 stats_addr = tmem_base + s_off_rt
@@ -1118,7 +1118,6 @@ def _softmax_warp_group(
                 bmm1_phase = (bmm1_done_phase_pair >> parity_rt) & cutlass.Int32(1)
                 bars.mb_bmm1_done[parity_rt].wait(bmm1_phase)
                 bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_rt)
-                tmem_base = tmem_ptr_i32.load()
                 s_addr_base = tmem_base + s_off_rt
                 p_addr_base = tmem_base + p_off_rt
                 stats_addr = tmem_base + s_off_rt
@@ -1204,7 +1203,6 @@ def _softmax_warp_group(
                 bmm1_phase = (bmm1_done_phase_pair >> parity_rt) & cutlass.Int32(1)
                 bars.mb_bmm1_done[parity_rt].wait(bmm1_phase)
                 bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_rt)
-                tmem_base = tmem_ptr_i32.load()
                 s_addr_base = tmem_base + s_off_rt
                 p_addr_base = tmem_base + p_off_rt
                 stats_addr = tmem_base + s_off_rt
@@ -1271,7 +1269,6 @@ def _softmax_warp_group(
                 bmm1_phase = (bmm1_done_phase_pair >> parity_rt) & cutlass.Int32(1)
                 bars.mb_bmm1_done[parity_rt].wait(bmm1_phase)
                 bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_rt)
-                tmem_base = tmem_ptr_i32.load()
                 s_addr_base = tmem_base + s_off_rt
                 p_addr_base = tmem_base + p_off_rt
                 stats_addr = tmem_base + s_off_rt
@@ -1347,7 +1344,7 @@ def _softmax_warp_group(
                 stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
 
         total_sum_scalar = total_sum[0] + total_sum[1]
-        stats_addr_epi = tmem_ptr_i32.load() + cutlass.Int32(LAYOUT.STATS_EPI_OFF)
+        stats_addr_epi = tmem_base + cutlass.Int32(LAYOUT.STATS_EPI_OFF)
         stats_vec_epi = cutlass.Vector.from_elements((total_max_safe, total_sum_scalar), cutlass.Float32)
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr_epi, cutlass.Float32), stats_vec_epi)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
@@ -1397,6 +1394,7 @@ def _correction_warp_group(
     amax_o_tensor,
 ):
     nvvm.barrier_cta_sync(barrier_id=2, thread_count=32 * (CFG.CORRECTION_WARPS + 1))
+    tmem_base_corr = tmem_ptr_i32.load()
 
     tid_raw = cute.arch.thread_idx()[0]
     tid_in_wg = tid_raw - cutlass.Int32(CFG.CORR_WARP_BASE * 32)
@@ -1445,7 +1443,7 @@ def _correction_warp_group(
         for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
             parity_prev_rt = (kv_loop - cutlass.Int32(1)) & cutlass.Int32(1)
             parity_cur_rt = kv_loop & cutlass.Int32(1)
-            tmem_base_iter = tmem_ptr_i32.load()
+            tmem_base_iter = tmem_base_corr
 
             bars.mb_stat_full.wait(stat_mbar_state)
 
@@ -1490,7 +1488,7 @@ def _correction_warp_group(
 
             stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
-        tmem_base_epi = tmem_ptr_i32.load()
+        tmem_base_epi = tmem_base_corr
 
         total_max_scaled = cutlass.Float32(0.0)
         total_sum = cutlass.Float32(0.0)
