@@ -126,7 +126,12 @@ N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
-_sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
+_sdpa_h = make_sdpa_helpers(
+    CFG,
+    lpt_q_tiles_in_cga_units=True,
+    grouped_lpt=PARAMS.lpt_head_group > 1,
+    lpt_head_group=PARAMS.lpt_head_group,
+)
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 # qtrim variant: collapses the KV loop for CGA tiles entirely past the
