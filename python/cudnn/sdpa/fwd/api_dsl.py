@@ -75,20 +75,20 @@ _SM100_DTYPE_QKV_CODE = {
 }
 _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # FP8 kernels use E4M3/E5M2 inputs and BF16/FP16/FP8 outputs. Block-scale
-# MXFP8 remains d128-only; per-tensor FP8 has exact d128/d128 and d192/d128
-# kernels.
+# MXFP8 remains d128-only; per-tensor FP8 uses exact native shapes.
 _SM100_MXFP8_KERNEL_FILE = "prefill_d128_mxfp8_sm100.py"
 _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_FP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_fp8_sm100.py",
     (192, 128): "prefill_d192_d128_fp8_sm100.py",
+    (256, 256): "prefill_d256_fp8_sm100.py",
 }
 
 
 def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
     if not pertensor or device_cc == (10, 7):
         return frozenset({(128, 128)})
-    return frozenset({(128, 128), (192, 128)})
+    return frozenset({(128, 128), (192, 128), (256, 256)})
 
 
 # Both flavors tile KV in TILE_N=128 columns; the KV tail is only masked when
@@ -794,8 +794,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
         # FP8 paths use exact native shapes. Per-tensor FP8 also has the
-        # d192/d128 flavor; MXFP8 remains d128-only until its scale-factor
-        # descriptors and pipeline are extended.
+        # exact d192/d128 and d256/d256 flavors; MXFP8 remains d128-only until
+        # its scale-factor descriptors and pipeline are extended.
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
         self._value_error_if(
             self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes,
