@@ -75,7 +75,7 @@ _SM100_DTYPE_QKV_CODE = {
 }
 _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # FP8 kernels use E4M3/E5M2 inputs and BF16/FP16/FP8 outputs. Block-scale
-# Both FP8 paths have exact d128/d128 and d192/d128 kernels.
+# Per-tensor and block-scale FP8 select independently from their native maps.
 _SM100_MXFP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_mxfp8_sm100.py",
     (192, 128): "prefill_d192_d128_mxfp8_sm100.py",
@@ -84,13 +84,15 @@ _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_FP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_fp8_sm100.py",
     (192, 128): "prefill_d192_d128_fp8_sm100.py",
+    (256, 256): "prefill_d256_fp8_sm100.py",
 }
 
 
 def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
     if device_cc == (10, 7):
         return frozenset({(128, 128)})
-    return frozenset({(128, 128), (192, 128)})
+    kernel_files = _SM100_FP8_KERNEL_FILES if pertensor else _SM100_MXFP8_KERNEL_FILES
+    return frozenset(kernel_files)
 
 
 # Both flavors tile KV in TILE_N=128 columns; the KV tail is only masked when
@@ -857,7 +859,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
         )
 
-        # FP8 flavor shapes: SM100 serves d128/d128 and d192/d128; Rubin
+        # FP8 flavor shapes: SM100 per-tensor FP8 serves d128/d128,
+        # d192/d128, and d256/d256; MXFP8 serves the shapes in its independent
+        # native map. Rubin
         # currently serves only per-tensor FP8 d128. Per-tensor FP8 serves
         # the dense ENVELOPE of every flavor it has (TMA zero-padding, like
         # the f16 flavors — exact in FP8, and the descales are scalars, so

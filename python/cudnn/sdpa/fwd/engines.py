@@ -579,10 +579,10 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     "sm107" = Rubin line 107-119): the two lowerings genuinely diverge and a
     shared row could only describe their union with knob x arch notches.
     Within a row the head dim is a LOWERING concern — the adapter picks the
-    kernel flavor (d128 or d192xd128) covering the graph. Each row declares
+    kernel flavor (d128, d192xd128, or d256) covering the graph. Each row declares
     exactly what its own kernels carry:
 
-    - d_shapes: the sm100 row picks between the d128 and d192xd128 flavors;
+    - d_shapes: the sm100 row picks among d128, d192xd128, and d256 flavors;
       Rubin has only the d128 sibling, so a Rubin d192 graph is ineligible
       at probe time instead of a late build error.
     - The ENVELOPE (d_pad_multiple=16, the TMA 16-byte global-stride rule at
@@ -621,7 +621,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             sm_lo=107 if rubin_row else _BLACKWELL[0],
             sm_hi=_BLACKWELL[1] if rubin_row else 106,
             phase="prefill",
-            d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128)}),
+            d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256)}),
             d_pad_multiple=16,
             thd_d_shapes=frozenset({(128, 128)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),

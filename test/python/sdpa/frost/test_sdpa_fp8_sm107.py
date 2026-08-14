@@ -56,6 +56,7 @@ def test_sm100_module_unchanged():
 def test_sm107_per_tensor_fp8_advertises_only_d128():
     assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128)})
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    assert (256, 256) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
 
 def test_per_tensor_fp8_rows_split_per_arch_line():
