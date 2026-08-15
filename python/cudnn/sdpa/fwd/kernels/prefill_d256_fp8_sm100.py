@@ -307,7 +307,6 @@ def _kernel(
     qh_per_kh: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
-    amax_s_tensor: cute.Tensor,
     amax_o_tensor: cute.Tensor,
     # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths (mirrors
     # cuDNN's SEQLEN_Q pointer / FA's seqused_q). None unless
@@ -488,7 +487,6 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
             o_scale_fused=o_scale_fused,
-            amax_s_tensor=amax_s_tensor,
             amax_o_tensor=amax_o_tensor,
         )
 
@@ -1283,9 +1281,7 @@ def _softmax_warp_group(
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
-                        nvvm.make_tmem_ptr(
-                            p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32
-                        ),
+                        nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32),
                         chunk_P_1b.to(STORAGE_DTYPE),
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
@@ -1387,9 +1383,7 @@ def _softmax_warp_group(
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
-                        nvvm.make_tmem_ptr(
-                            p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32
-                        ),
+                        nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32),
                         chunk_P_1b.to(STORAGE_DTYPE),
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
@@ -1474,9 +1468,7 @@ def _softmax_warp_group(
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
-                        nvvm.make_tmem_ptr(
-                            p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32
-                        ),
+                        nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32),
                         chunk_P_1b.to(STORAGE_DTYPE),
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
@@ -1576,9 +1568,7 @@ def _softmax_warp_group(
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
-                        nvvm.make_tmem_ptr(
-                            p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32
-                        ),
+                        nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK + P_COLS_PER_SUBCHUNK), cutlass.Float32),
                         chunk_P_1b.to(STORAGE_DTYPE),
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
@@ -1637,7 +1627,6 @@ def _correction_warp_group(
     cta_in_pair,
     cta_id_x,
     o_scale_fused,
-    amax_s_tensor,
     amax_o_tensor,
 ):
     nvvm.barrier_cta_sync(barrier_id=2, thread_count=32 * (CFG.CORRECTION_WARPS + 1))
@@ -1801,8 +1790,6 @@ def _correction_warp_group(
             inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
             beta = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
 
-        _amax_s_ptr = Pointer(amax_s_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-        _beta_bits = beta.bitcast(cutlass.Int32)
         _row_valid = q_row_global < seqlen_q
         if cutlass.const_expr(CFG.THD_VARLEN):
             _cu_for_valid = cutlass.make_array_view(seq_kv_lens_tensor)
@@ -1830,9 +1817,6 @@ def _correction_warp_group(
                 lse_arr = cutlass.make_array_view(lse_tensor)
                 lse_row = lse_arr[batch_idx, head_idx, :]
                 lse_row[q_row_global] = lse_val
-
-        if _row_valid:
-            nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_s_ptr, _beta_bits)
 
         parity_last_rt = cutlass.Int32(0)
         if bounds.right > bounds.left:
@@ -1918,7 +1902,6 @@ def _host(
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
     n_thd_units: cutlass.Int32,
-    amax_s_tensor: cute.Tensor,
     amax_o_tensor: cute.Tensor,
     # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths; None
     # (and absent from the compiled ABI) unless CFG.SEQ_Q_LENS_PRESENT.
@@ -2003,7 +1986,6 @@ def _host(
         cutlass.Int32(QH // KH),
         scale_softmax_log2,
         o_scale_fused,
-        amax_s_tensor,
         amax_o_tensor,
         seq_q_lens_tensor,
     ).launch(
@@ -2133,12 +2115,6 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
-    fake_amax_s = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (1,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (1,),
@@ -2159,7 +2135,6 @@ def compile(  # noqa: A001
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
-        fake_amax_s,
         fake_amax_o,
         fake_seq_q_lens,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
