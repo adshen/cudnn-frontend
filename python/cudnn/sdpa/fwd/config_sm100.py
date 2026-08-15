@@ -314,6 +314,9 @@ class CfgD256:
     CORRECTION_WARPS: int = 4
 
     SOFTMAX_REGS: int = 240
+    # The DSL traces the unreachable WG1 dispatch for one-WG specializations,
+    # so its placeholder must still be a legal setmaxnreg operand.
+    SOFTMAX_WG1_REGS: int = 40
     CORRECTION_REGS: int = 96
     MMA_REGS: int = 40
     TMALDG_REGS: int = 40
@@ -341,6 +344,7 @@ class CfgD256:
     OTHER_WARPS: int = 4
 
     SOFTMAX_WG0_BASE: int = 0
+    SOFTMAX_WG1_BASE: int = 4
     CORR_WARP_BASE: int = 4
     MMA_WARP_ID: int = 8
     TMALDG_WARP_ID: int = 9
@@ -367,9 +371,13 @@ class CfgD256:
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
     fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
+    split_dense_p = fp8 and cfg.MASK_FLAGS == MASK_NONE
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
-        (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d256: register budget over 512"),
+        (
+            cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_REGS + cfg.SOFTMAX_WG1_REGS <= 512,
+            "d256: register budget over 512",
+        ),
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d256: per-role regs must be multiples of 8"),
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
         (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
@@ -377,7 +385,12 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d256: Q/K swizzle must be 64/128B"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d256: V/O swizzle out of range"),
         (cfg.TILES_Q == 1, "d256 pipeline mandates TILES_Q == 1"),
-        (cfg.SOFTMAX_WARPGROUPS == 1, "d256 pipeline mandates SOFTMAX_WARPGROUPS == 1"),
+        (cfg.SOFTMAX_WARPGROUPS == (2 if split_dense_p else 1), "d256: only dense FP8 may split P generation"),
+        (cfg.TOTAL_WARPS == (16 if split_dense_p else 12), "d256: role layout and warp count disagree"),
+        (
+            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if fp8 else 16),
+            "d256: TILE_K_HW must be 32 for FP8 and 16 for BF16/FP16",
+        ),
         (fp8 or cfg.DTYPE_O == cfg.DTYPE_QKV, "d256: half input requires DTYPE_O == DTYPE_QKV"),
     )
     for ok, msg in checks:
@@ -389,6 +402,8 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
     _validate_params("d256", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    mask_flags = _mask_flags_from(params)
+    split_dense_p = fp8 and mask_flags == MASK_NONE
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
     cfg = CfgD256(
@@ -408,14 +423,27 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
         STAGES_KV=2,
-        # 4 softmax + 4 correction + MMA + TMALDG + TMASTG per CTA.
-        READ_TILE_ARRIVERS=11 if fp8 else 21,
-        MASK_FLAGS=_mask_flags_from(params),
+        SOFTMAX_WARPGROUPS=2 if split_dense_p else 1,
+        SOFTMAX_WG1_REGS=136 if split_dense_p else 40,
+        TOTAL_WARPS=16 if split_dense_p else 12,
+        THREADS_PER_CTA=(16 if split_dense_p else 12) * 32,
+        SOFTMAX_WG1_BASE=4 if split_dense_p else 64,
+        CORR_WARP_BASE=8 if split_dense_p else 4,
+        MMA_WARP_ID=12 if split_dense_p else 8,
+        TMALDG_WARP_ID=13 if split_dense_p else 9,
+        TMASTG_WARP_ID=14 if split_dense_p else 10,
+        SCHED_WARP_ID=15 if split_dense_p else 11,
+        READ_TILE_ARRIVERS=15 if split_dense_p else 11 if fp8 else 21,
+        MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
-        SCHEDULER_POLICY=SCHED_LPT if fp8 else params.sched_policy,
+        SCHEDULER_POLICY=(
+            SCHED_NATURAL if mask_flags == MASK_NONE else SCHED_LPT
+        )
+        if fp8
+        else params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
