@@ -525,7 +525,7 @@ def _sm100_spec() -> EngineSpec:
 def _sm100_mxfp8_spec() -> EngineSpec:
     """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen (d128/d128 only — the d192/d128 kernel is dense-only) rides the
+    THD/varlen (d128/d128 only — the d192/d128 and d256 kernels are dense-only) rides the
     shared packed lowering (write_thd_meta envelope design, issue #552; packed
     Q/K/V/O contract only). The SF tensors travel PACKED
     per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
@@ -541,7 +541,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             phase="prefill",
             # Exact native shapes only (d_pad_multiple=0): the SF plumbing is
             # not audited for envelope zero-padding.
-            d_shapes=frozenset({(128, 128), (192, 128)}),
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             d_pad_multiple=0,
             # Only the d128 kernel carries the write_thd_meta THD leg and
             # wires SplitHelpers; the d192x128 file is dense-only.

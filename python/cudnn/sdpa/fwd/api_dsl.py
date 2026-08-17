@@ -66,7 +66,7 @@ _SM100_KERNEL_FILES = {
     (128, 128): "prefill_d128_f16_sm100.py",
 }
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
-# FP8 kernel family; the output dtype is encoded the same way.
+# FP8 kernel families; the output dtype is encoded the same way.
 _SM100_DTYPE_QKV_CODE = {
     torch.float8_e4m3fn: DTYPE_E4M3,
     torch.float8_e5m2: DTYPE_E5M2,
@@ -79,6 +79,7 @@ _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _SM100_MXFP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_mxfp8_sm100.py",
     (192, 128): "prefill_d192_d128_mxfp8_sm100.py",
+    (256, 256): "prefill_d256_mxfp8_sm100.py",
 }
 _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_FP8_KERNEL_FILES = {
@@ -1054,6 +1055,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lpt_head_group = 8
         if self._fp8 and self._pertensor and self.flavor == (256, 256) and not self.thd and (self.batch_size * self.h_q) % 32 == 0:
             lpt_head_group = 32
+        if mxfp8 and self.flavor == (256, 256) and not self.thd and (self.batch_size * self.h_q) % 8 == 0:
+            lpt_head_group = 8
         lpt_q_tiles = 0
         if self._fp8 and self.flavor == (192, 128) and not self.thd:
             lpt_q_tiles = (self.s_q_max + 511) // 512

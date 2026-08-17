@@ -4,9 +4,10 @@
 """End-to-end tests for the FROST SM100 DSL block-scale MXFP8 SDPA-forward engine.
 
 Drives ``graph.sdpa_mxfp8`` (FP8 E4M3/E5M2 Q/K/V + per-32-block E8M0 scale factors)
-routed to the native D128/D128 or D192/D128 MXFP8 engine, and validates the output
-against an fp32-dequant reference. Inputs are quantized with the torch-only
-MXFP8 quantizer in ``test/python/sdpa/mxfp8_quant.py`` (TE-equivalent semantics
+routed to the exact D128/D128, D192/D128, or D256/D256 MXFP8 engine, and
+validates the output against an fp32-dequant reference. Inputs are quantized
+with the torch-only MXFP8 quantizer in ``test/python/sdpa/mxfp8_quant.py``
+(TE-equivalent semantics
 — the same layout cuDNN's own mxfp8 path uses), so the scale-factor tensors
 reach the engine in cuDNN's F8_128x4 reordering. TransformerEngine is NOT
 required.
@@ -226,6 +227,27 @@ _MASKS = {
     "causal_br": dict(use_causal_mask_bottom_right=True),
     "swa": dict(use_causal_mask=True, diagonal_band_left_bound=65),  # window = 64
 }
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_smoke(in_key, mask):
+    O, O_ref, amax = _run(
+        1,
+        8,
+        8,
+        256,
+        in_key,
+        torch.float16,
+        scale=1.0 / math.sqrt(256),
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=256,
+        d_v=256,
+    )
+    _check(O, O_ref, torch.float16, in_key, d_qk=256)
+    assert amax.item() > 0.0
 
 
 @pytest.mark.L0
