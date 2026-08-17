@@ -1003,6 +1003,7 @@ ENGINE_SPECS = (
     _sm100_spec(512),
     _sm100_mxfp8_spec(128),
     _sm100_mxfp8_spec(192, d_v=128),
+    _sm100_mxfp8_spec(256),
     _sm100_fp8_spec(128),
     _sm100_fp8_spec(
         192,

@@ -187,6 +187,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm100_d192_d128_fp8": EngineSlot(9, opt_in=True),
             "sdpa_fwd_prefill_sm100_d192_d128_mxfp8": EngineSlot(10, opt_in=True),
             "sdpa_fwd_prefill_sm100_d256_fp8": EngineSlot(11, opt_in=True),
+            "sdpa_fwd_prefill_sm100_d256_mxfp8": EngineSlot(12, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
