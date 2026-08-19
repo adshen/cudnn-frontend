@@ -319,6 +319,13 @@ def _exp2_dense_chunk_b(vec, softmax_half):
     return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
 
 
+def _exp2_masked_alpha(x):
+    if CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0:
+        value, _ = ex2_emulation_2(x, x, poly_degree=2)
+        return value
+    return cute.math.exp2(x, fastmath=True)
+
+
 @cute.kernel
 def _kernel(
     tma_q_desc: cutlass.GridConstant[tmap.TensorMap],
@@ -1450,7 +1457,7 @@ def _softmax_warp_group(
                 # min(., 0) guards the dead->alive drop of the safe max (total_sum
                 # is still 0 there).  total_max_safe starts at -inf: iter-0 alpha = 0.
                 new_total_max_safe = row_max_for_exp2(total_max)
-                alpha = cute.math.exp2(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)), fastmath=True)
+                alpha = _exp2_masked_alpha(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)))
                 total_max_safe = new_total_max_safe
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
@@ -1541,7 +1548,7 @@ def _softmax_warp_group(
                 # Every row in this interior tile is live, so the updated
                 # total_max is finite even if all preceding edge tiles were dead.
                 new_total_max_safe = total_max
-                alpha = cute.math.exp2(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)), fastmath=True)
+                alpha = _exp2_masked_alpha(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)))
                 total_max_safe = new_total_max_safe
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
@@ -1643,7 +1650,7 @@ def _softmax_warp_group(
                 # min(., 0) guards the dead->alive drop of the safe max (total_sum
                 # is still 0 there).  total_max_safe starts at -inf: iter-0 alpha = 0.
                 new_total_max_safe = row_max_for_exp2(total_max)
-                alpha = cute.math.exp2(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)), fastmath=True)
+                alpha = _exp2_masked_alpha(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)))
                 total_max_safe = new_total_max_safe
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
