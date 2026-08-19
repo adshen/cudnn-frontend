@@ -293,7 +293,11 @@ def _exp2_dense_chunk_a(vec, softmax_half):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
         use_e4_poly = CFG.DTYPE_QKV == 0 and i % 10 < 4 and not (softmax_half == 1 and i == 30)
-        use_e5_poly = CFG.DTYPE_QKV == 1 and (i % 10 < 4 or (softmax_half == 1 and (i == 26 or i == 28)))
+        use_e5_poly = CFG.DTYPE_QKV == 1 and (
+            (i % 10 < 4 and not (softmax_half == 5 and i == 30))
+            or (softmax_half == 1 and (i == 26 or i == 28))
+            or (softmax_half == 5 and i == 28)
+        )
         if use_e4_poly:
             x, y = ex2_emulation_2(vec[i], vec[i + 1])
         elif use_e5_poly:
@@ -1542,7 +1546,7 @@ def _softmax_warp_group(
                 bars.mb_stat_full.arrive()
                 reg_S = reg_S * scale_log2 - total_max_safe
 
-                chunk_P_0a = _exp2_dense_chunk_a(reg_S[0:P_SUBCHUNK].vec, 0)
+                chunk_P_0a = _exp2_dense_chunk_a(reg_S[0:P_SUBCHUNK].vec, 5)
                 hoisted_sum = row_reduction_pair(chunk_P_0a)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
                 chunk_P_0b = _exp2_dense_chunk_b(reg_S[P_SUBCHUNK:CHUNK].vec, 3)
