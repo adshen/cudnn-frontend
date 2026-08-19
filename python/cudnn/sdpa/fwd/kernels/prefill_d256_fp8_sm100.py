@@ -308,7 +308,7 @@ def _exp2_dense_chunk_a(vec, softmax_half):
 def _exp2_dense_chunk_b(vec, softmax_half):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        e4_threshold = 18 if softmax_half == 2 else 16
+        e4_threshold = 20 if softmax_half == 2 else 16
         e5_threshold = 20 if softmax_half == 0 else (22 if softmax_half == 2 else 24)
         if (CFG.DTYPE_QKV == 0 and i >= e4_threshold) or (CFG.DTYPE_QKV == 1 and i >= e5_threshold):
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
