@@ -97,7 +97,7 @@ oss:rel:cutlass_dsl_4.8:
     SLURM_ACCOUNT: "coreai_libraries_cudnn"
     # Empty -> no -p flag, i.e. the cluster's default partition. hecate has no
     # `batch` partition; set this only if a specific one turns out to be needed.
-    SLURM_PARTITION: ""
+    SLURM_PARTITION: "batch-xdr"
     SLURM_NODES: 1
     GPUS_PER_NODE: 4
     SRUN_TIMELIMIT: 100        # minutes, well under the 2h job timeout
