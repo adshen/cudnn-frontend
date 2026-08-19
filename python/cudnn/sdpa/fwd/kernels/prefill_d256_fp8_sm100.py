@@ -2031,21 +2031,21 @@ def _host(
         box_dims=qk_box_q,
         stride_order=stride_order,
         swizzle=_tma_swz(CFG.Q_SWZ_BYTES),
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+        l2_promotion=tmap.TensorMapL2Promotion.l2_256b,
     )
     tma_k_desc = tmap.create_tensor_map_tiled_from_view(
         k_tensor,
         box_dims=qk_box_k,
         stride_order=stride_order,
         swizzle=_tma_swz(CFG.K_SWZ_BYTES),
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+        l2_promotion=tmap.TensorMapL2Promotion.l2_256b,
     )
     tma_v_desc = tmap.create_tensor_map_tiled_from_view(
         v_tensor,
         box_dims=vo_box_v,
         stride_order=stride_order,
         swizzle=_tma_swz(CFG.V_SWZ_BYTES),
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+        l2_promotion=tmap.TensorMapL2Promotion.l2_256b,
     )
     tma_o_desc = tmap.create_tensor_map_tiled_from_view(
         o_tensor,
