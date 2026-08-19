@@ -417,7 +417,11 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         STAGES_KV=2,
         SOFTMAX_WARPGROUPS=2 if split_dense_p else 1,
         SOFTMAX_WG1_REGS=136 if split_dense_p else 40,
-        CORRECTION_REGS=104 if fp8 and mask_flags != MASK_NONE else 96,
+        CORRECTION_REGS=(
+            112
+            if params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
+            else 104 if fp8 and mask_flags != MASK_NONE else 96
+        ),
         TOTAL_WARPS=16 if split_dense_p else 12,
         THREADS_PER_CTA=(16 if split_dense_p else 12) * 32,
         SOFTMAX_WG1_BASE=4 if split_dense_p else 64,
