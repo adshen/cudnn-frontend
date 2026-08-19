@@ -293,7 +293,7 @@ def _exp2_dense_chunk_a(vec, softmax_half):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
         use_e4_poly = CFG.DTYPE_QKV == 0 and i % 10 < 4 and not (softmax_half == 1 and i == 30)
-        use_e5_poly = CFG.DTYPE_QKV == 1 and (i % 10 < 4 or i == 28 or (softmax_half == 1 and i == 26))
+        use_e5_poly = CFG.DTYPE_QKV == 1 and (i % 10 < 4 or (softmax_half == 1 and (i == 26 or i == 28)))
         if use_e4_poly:
             x, y = ex2_emulation_2(vec[i], vec[i + 1])
         elif use_e5_poly:
