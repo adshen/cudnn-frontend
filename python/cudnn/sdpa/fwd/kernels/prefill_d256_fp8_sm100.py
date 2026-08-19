@@ -308,7 +308,7 @@ def _exp2_dense_chunk_a(vec, softmax_half):
 def _exp2_dense_chunk_b(vec, softmax_half):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        e5_threshold = 20 if softmax_half == 0 else 24
+        e5_threshold = 20 if softmax_half == 0 else (22 if softmax_half == 2 else 24)
         if (CFG.DTYPE_QKV == 0 and i >= 16) or (CFG.DTYPE_QKV == 1 and i >= e5_threshold):
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         else:
@@ -1563,7 +1563,7 @@ def _softmax_warp_group(
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK), cutlass.Float32),
                         chunk_P_1a.to(STORAGE_DTYPE),
                     )
-                    chunk_P_1b = _exp2_dense_chunk_b(reg_S[CHUNK + P_SUBCHUNK : 2 * CHUNK].vec, 1)
+                    chunk_P_1b = _exp2_dense_chunk_b(reg_S[CHUNK + P_SUBCHUNK : 2 * CHUNK].vec, 2)
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
