@@ -380,7 +380,7 @@ def _kernel(
         leading_byte_offset=LEADING_BYTE_OFFSET_QK,
         stride_byte_offset=STRIDE_BYTE_OFFSET_QK,
         layout=SMEM_LAYOUT_QKO,
-        tma_loads_per_tile=TMA_QK_ITERS,
+        tma_loads_per_tile=1,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
     )
@@ -391,7 +391,7 @@ def _kernel(
         leading_byte_offset=LEADING_BYTE_OFFSET_PV,
         stride_byte_offset=STRIDE_BYTE_OFFSET_PV,
         layout=SMEM_LAYOUT_V,
-        tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
+        tma_loads_per_tile=1,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
     )
@@ -737,7 +737,6 @@ def _tmaldg_warp_group(
     sched_state = PipelineState.start()
 
     K_ROW_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_N // CFG.CTA_MMA)
-    V_COL_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_O // CFG.CTA_MMA)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -756,7 +755,7 @@ def _tmaldg_warp_group(
                 bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=nvvm.elect_sync())
             tma_load_tile(
                 sK[kv_state.idx],
-                tma_k(cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
+                tma_k(cutlass.Int32(0), kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                 bars.mb_k_full[kv_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
@@ -769,7 +768,7 @@ def _tmaldg_warp_group(
                 bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
             tma_load_tile(
                 sV[kv_state.idx],
-                tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                tma_v(cutlass.Int32(0), kv_row_base + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                 bars.mb_v_full[kv_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
@@ -786,7 +785,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sK[kv_state.idx],
-                    tma_k(cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
+                    tma_k(cutlass.Int32(0), kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -799,7 +798,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sV[kv_state.idx],
-                    tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                    tma_v(cutlass.Int32(0), kv_row_base + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -835,7 +834,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sK[kv_state.idx],
-                    tma_k(cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
+                    tma_k(cutlass.Int32(0), kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -848,7 +847,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sV[kv_state.idx],
-                    tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                    tma_v(cutlass.Int32(0), kv_row_base + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -2017,9 +2016,31 @@ def _host(
     B, QH, KH, SQ, SKV, _ = problem_size
 
     _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE_O
+    k_rank5_layout = cute.make_layout(
+        (k_tensor.shape[0], k_tensor.shape[2], TMA_QK_ITERS, k_tensor.shape[1], TMA_QK_GRANU_ELEMS),
+        stride=(
+            k_tensor.shape[1] * k_tensor.shape[2] * CFG.TILE_K,
+            CFG.TILE_K,
+            TMA_QK_GRANU_ELEMS,
+            k_tensor.shape[2] * CFG.TILE_K,
+            1,
+        ),
+    )
+    k_rank5_tensor = cute.make_tensor(k_tensor.iterator, k_rank5_layout)
+    v_rank5_layout = cute.make_layout(
+        (v_tensor.shape[0], v_tensor.shape[2], TMA_VO_ITERS, v_tensor.shape[1], TMA_VO_GRANU_ELEMS),
+        stride=(
+            v_tensor.shape[1] * v_tensor.shape[2] * CFG.TILE_O,
+            CFG.TILE_O,
+            TMA_VO_GRANU_ELEMS,
+            v_tensor.shape[2] * CFG.TILE_O,
+            1,
+        ),
+    )
+    v_rank5_tensor = cute.make_tensor(v_tensor.iterator, v_rank5_layout)
     qk_box_q = (1, CFG.TILE_M, 1, TMA_QK_GRANU_ELEMS)
-    qk_box_k = (1, CFG.TILE_N // CFG.CTA_MMA, 1, TMA_QK_GRANU_ELEMS)
-    vo_box_v = (1, CFG.TILE_N, 1, TMA_VO_GRANU_ELEMS)
+    qk_box_k = (1, 1, TMA_QK_ITERS, CFG.TILE_N // CFG.CTA_MMA, TMA_QK_GRANU_ELEMS)
+    vo_box_v = (1, 1, TMA_VO_ITERS, CFG.TILE_N, TMA_VO_GRANU_ELEMS)
     vo_box_o = (1, CFG.TILE_M, 1, _O_GRANU_ELEMS)
     stride_order = (3, 2, 1, 0)
 
@@ -2034,16 +2055,16 @@ def _host(
         l2_promotion=tmap.TensorMapL2Promotion.l2_256b,
     )
     tma_k_desc = tmap.create_tensor_map_tiled_from_view(
-        k_tensor,
+        k_rank5_tensor,
         box_dims=qk_box_k,
-        stride_order=stride_order,
+        stride_order=(4, 3, 2, 1, 0),
         swizzle=_tma_swz(CFG.K_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_256b,
     )
     tma_v_desc = tmap.create_tensor_map_tiled_from_view(
-        v_tensor,
+        v_rank5_tensor,
         box_dims=vo_box_v,
-        stride_order=stride_order,
+        stride_order=(4, 3, 2, 1, 0),
         swizzle=_tma_swz(CFG.V_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_256b,
     )
