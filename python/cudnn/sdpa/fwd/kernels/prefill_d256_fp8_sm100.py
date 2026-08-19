@@ -1516,15 +1516,22 @@ def _softmax_warp_group(
                 s_addr_base = tmem_base + s_off_rt
                 p_addr_base = tmem_base + p_off_rt
                 stats_addr = tmem_base + s_off_rt
-                unmasked_chunk = 32
-                raw_chunks = [
-                    nvvm.tcgen05_ld(
-                        "32x32b",
-                        nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * unmasked_chunk), cutlass.Float32),
-                        num=unmasked_chunk,
-                    )
-                    for c in range(CFG.TILE_N // unmasked_chunk)
-                ]
+                if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                    raw_chunks = [
+                        nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base, cutlass.Float32), num=32),
+                        nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(32), cutlass.Float32), num=32),
+                        nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(64), cutlass.Float32), num=64),
+                    ]
+                else:
+                    unmasked_chunk = 32
+                    raw_chunks = [
+                        nvvm.tcgen05_ld(
+                            "32x32b",
+                            nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * unmasked_chunk), cutlass.Float32),
+                            num=unmasked_chunk,
+                        )
+                        for c in range(CFG.TILE_N // unmasked_chunk)
+                    ]
                 reg_S_vec = vec_concat(raw_chunks)
                 current_max_unscaled = row_max_reduction(reg_S_vec)
                 reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
