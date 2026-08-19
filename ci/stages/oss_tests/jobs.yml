@@ -4,7 +4,12 @@
   variables:
     CUTLASS_DSL_VERSION: "4.5.1"
   script:
+    # CUTLASS_DSL_INDEX_URL lets a job run against an unreleased wheel off the
+    # urm internal index (same variable name as frost_tests). Leave it empty
+    # for a public version: urm also carries local-version builds of the
+    # released wheels (4.7.0+<date>.<sha>) that pip prefers over PyPI's.
     - pip install -v .[cutedsl] "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
+        ${CUTLASS_DSL_INDEX_URL:+--extra-index-url "${CUTLASS_DSL_INDEX_URL}"}
     - ci/stages/oss_tests/run_test_oss.sh
 
 oss:rel:
@@ -39,6 +44,18 @@ oss:rel:cutlass_dsl_4.7:
   extends: oss:rel
   variables:
     CUTLASS_DSL_VERSION: "4.7.0"
+  rules:
+    - !reference [.rules:schedule_only, rules]
+
+# 4.8 is unreleased, so this pins the prerelease off the urm internal index,
+# same as .frost:cutlass-dsl-4.8:template in ci/stages/frost_tests/jobs.yml.
+# The 4.8 branch publishes dailies as 4.8.0a0+<date>.<sha> and == ignores the
+# local suffix, so the job takes the newest build of the day.
+oss:rel:cutlass_dsl_4.8:
+  extends: oss:rel
+  variables:
+    CUTLASS_DSL_VERSION: "4.8.0a0"
+    CUTLASS_DSL_INDEX_URL: "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple"
   rules:
     - !reference [.rules:schedule_only, rules]
 
