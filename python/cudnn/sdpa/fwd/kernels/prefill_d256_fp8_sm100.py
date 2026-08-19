@@ -78,6 +78,7 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_CAUSAL,
     MASK_SWA,
 )
+from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 if CFG.DTYPE_QKV == 0:
     STORAGE_DTYPE = cutlass.Float8E4M3FN
@@ -286,6 +287,31 @@ def _max_abs_reduction(vec):
         maxima = next_maxima
         minima = next_minima
     return cute.math.max(maxima[0], -minima[0], ftz=True)
+
+
+def _exp2_dense_chunk_a(vec, softmax_half):
+    values = []
+    for i in range(0, int(vec.shape[0]), 2):
+        use_poly = CFG.DTYPE_QKV == 0 and i % 10 < 4 and not (softmax_half == 1 and i == 30)
+        if use_poly:
+            x, y = ex2_emulation_2(vec[i], vec[i + 1])
+        else:
+            x = cute.math.exp2(vec[i], fastmath=True)
+            y = cute.math.exp2(vec[i + 1], fastmath=True)
+        values.extend((x, y))
+    return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
+
+
+def _exp2_dense_chunk_b(vec):
+    values = []
+    for i in range(0, int(vec.shape[0]), 2):
+        if CFG.DTYPE_QKV == 0 and i >= 16:
+            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
+        else:
+            x = cute.math.exp2(vec[i], fastmath=True)
+            y = cute.math.exp2(vec[i + 1], fastmath=True)
+        values.extend((x, y))
+    return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
 
 
 @cute.kernel
@@ -1319,7 +1345,7 @@ def _softmax_warp_group(
                     # Keep the multiply adjacent to the subtract so PTXAS can
                     # emit FFMA2 instead of a separate FMUL2/FADD2 pair.
                     reg_S_half = scale_log2 * reg_S_half - total_max_safe
-                chunk_P_a = cute.math.exp2(reg_S_half[0:P_SUBCHUNK].vec, fastmath=True)
+                chunk_P_a = _exp2_dense_chunk_a(reg_S_half[0:P_SUBCHUNK].vec, softmax_half)
                 new_p_sum_pair = row_reduction_pair(chunk_P_a)
                 nvvm.tcgen05_st(
                     "32x32b",
@@ -1329,7 +1355,7 @@ def _softmax_warp_group(
                     ),
                     chunk_P_a.to(STORAGE_DTYPE),
                 )
-                chunk_P_b = cute.math.exp2(reg_S_half[P_SUBCHUNK:CHUNK].vec, fastmath=True)
+                chunk_P_b = _exp2_dense_chunk_b(reg_S_half[P_SUBCHUNK:CHUNK].vec)
                 new_p_sum_pair = new_p_sum_pair + row_reduction_pair(chunk_P_b)
                 nvvm.tcgen05_st(
                     "32x32b",
