@@ -22,7 +22,7 @@ backend:rel:
   needs: ["manual:backend"]
   trigger:
     project: cudnn/cudnn
-    branch: release/9.25.0
+    branch: release/9.26.0
     strategy: depend
 
 backend:dev:
