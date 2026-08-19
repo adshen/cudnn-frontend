@@ -1299,14 +1299,11 @@ def _softmax_warp_group(
                         for c in range(N_CHUNKS)
                     ]
                     reg_S_full = RegTile(vec_concat(raw_chunks), size=CFG.TILE_N)
-                    if cutlass.const_expr(CFG.DTYPE_QKV == 1):
-                        current_max_unscaled = cute.math.max(
-                            row_max_reduction(reg_S_full[0:CHUNK].vec),
-                            row_max_reduction(reg_S_full[CHUNK : 2 * CHUNK].vec),
-                            ftz=True,
-                        )
-                    else:
-                        current_max_unscaled = row_max_reduction(reg_S_full.vec)
+                    current_max_unscaled = cute.math.max(
+                        row_max_reduction(reg_S_full[0:CHUNK].vec),
+                        row_max_reduction(reg_S_full[CHUNK : 2 * CHUNK].vec),
+                        ftz=True,
+                    )
                     current_max = current_max_unscaled * scale_log2
                     update_cond = (current_max - total_max) > RESCALE_THRESHOLD
                     total_max = cutlass.Float32(
