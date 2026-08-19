@@ -1,21 +1,35 @@
-# FROST engine tests, split one job per opset folder under test/python/<opset>/frost.
+# FROST engine tests, one job per (channel, opset, arch), named
+# frost:<channel>:<opset>:sm<arch>. Every job is spelled out rather than
+# generated from a matrix, so a name is greppable, appears verbatim in a failure
+# notification, and a single cell can be made soft, retimed or dropped without
+# touching its neighbours.
 #
-# Each opset only runs on the architectures its engines target, so a failure names
-# both the opset and the GPU it failed on instead of being buried in one omnibus job:
-#   sdpa             -> Blackwell, Ampere (the SM100 kernel tests self-skip off
+# The three axes are hidden templates below; a job is the intersection, and the
+# order of the extends list is what resolves conflicts (last wins), so the
+# channel template's rules override the arch template's.
+#
+#   channel: rel -> the public wheel run_frost_tests.sh defaults to; the MR
+#                   gate, and what users actually install
+#            cutlass-dsl-4.8 -> the unreleased 4.8 build, nightly only
+#   opset:   sdpa, linear, gemm -- the pytest paths
+#   arch:    sm80 -> Ampere, sm100 -> Blackwell, sm120 -> the GeForce boxes
+#
+# Coverage is deliberately uneven, because the engines are:
+#   sdpa             -> sm80, sm100, sm120. The SM100 kernel tests self-skip off
 #                       Blackwell; test_mhas_v2.py is the real non-Blackwell
 #                       coverage -- it exercises FROST dispatch and the native
-#                       cuDNN fallback through cudnn.pygraph)
+#                       cuDNN fallback through cudnn.pygraph.
+#   linear           -> sm100 only, from test/python/linear_attention
+#                       (GDN / GDN2 / KDA kernels are SM100-only)
+#   gemm             -> sm100 only
 #
 # Hopper is deliberately absent: test_mhas_v2.py under -n 4 does not fit in the
 # Hopper runner's memory, so the job failed on ~500 torch.OutOfMemoryError from
 # the moment it was added (it was already red on !2254, the MR that introduced
 # it) -- none of them a real defect, and FROST engines are SM100-only so they are
-# not even eligible there. Restore the ARCH entry once the job fits, e.g. with a
-# lower -n or PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
-#   linear_attention -> Blackwell only (GDN / GDN2 / KDA kernels are SM100-only)
-#   gemm             -> Blackwell only
-.frost_tests:template:
+# not even eligible there. Add an sm90 template and jobs once it fits, e.g. with
+# a lower -n or PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+.frost:template:
   stage: frost_tests
   extends:
     - .rules:mr_auto
@@ -25,47 +39,129 @@
   script:
     - ci/stages/frost_tests/run_frost_tests.sh ${FROST_TEST_PATHS}
 
-frost_tests:sdpa:
-  extends: .frost_tests:template
-  parallel:
-    matrix:
-      - ARCH: ["Blackwell", "Ampere"]
-  tags:
-    - ${ARCH}
+# --- opset: which suite runs ------------------------------------------------
+.frost:sdpa:template:
   variables:
     FROST_TEST_PATHS: "test/python/sdpa/frost test/python/test_mhas_v2.py"
 
-frost_tests:linear_attention:
-  extends: .frost_tests:template
-  tags: ["Blackwell"]
+.frost:linear:template:
   variables:
     FROST_TEST_PATHS: "test/python/linear_attention"
 
-frost_tests:gemm:
-  extends: .frost_tests:template
-  tags: ["Blackwell"]
+.frost:gemm:template:
   variables:
     FROST_TEST_PATHS: "test/python/gemm/frost"
 
-# ==============================================================================
-# SM120 frost tests on cudnn-dev-net-22-04 / cudnn-dev-oar-22-04, each a
-# single-GPU GeForce RTX 5080 box (compute capability 12.0). Registered as
-# project runner ids 1360909 and 1360910, docker executor, concurrent = 1.
-#
-# These two boxes are dedicated to frost coverage and carry only the `SM120`
-# tag. They are deliberately kept out of .device_matrix:template, so no other
-# stage (python_tests, pycudnn, sanitizer, L4, oss, python_samples) fans out to
-# them — frost is the only workload SM120 is expected to run.
-#
-# SM120 exercises the FROST SDPA kernel tests plus the pygraph routing and native
-# fallback coverage in test_mhas_v2.py. Keeping this a separate job rather than
-# another arch in the sdpa matrix also lets the softer rule set below apply only
-# to SM120 without weakening the existing Blackwell gate.
-# ==============================================================================
-frost_tests:sm120:
-  extends: .frost_tests:template
+# --- arch: which runner it lands on -----------------------------------------
+# The tags are the runner-side names (Ampere / Blackwell / SM120); the job names
+# use the compute capability, which is what the engines and the skip markers in
+# the tests are actually written against.
+.frost:sm80:template:
+  tags: ["Ampere"]
+
+.frost:sm100:template:
+  tags: ["Blackwell"]
+
+# SM120 is cudnn-dev-net-22-04 / cudnn-dev-oar-22-04, each a single-GPU GeForce
+# RTX 5080 box (compute capability 12.0), project runner ids 1360909 / 1360910,
+# docker executor, concurrent = 1. They carry only the `SM120` tag and are kept
+# out of .device_matrix:template, so frost is the only workload that reaches
+# them. No softer rule set: sm120 gates an MR like sm100 and sm80 do.
+.frost:sm120:template:
   tags: ["SM120"]
+
+# --- channel: which cutlass-dsl wheel ---------------------------------------
+# rel needs no template: run_frost_tests.sh already defaults to the public pin
+# and to no extra index, which is the point -- urm also carries local-version
+# builds of the released wheels (4.7.0+<date>.<sha>) that pip prefers over
+# PyPI's 4.7.0, so pointing the MR lane at it would quietly stop testing what
+# users install.
+#
+# The cutlass-dsl-* channels are nightly-only duplicates against unreleased
+# builds, the same idea as oss:rel:cutlass_dsl_4.x in
+# ci/stages/oss_tests/jobs.yml: they say whether the next DSL is safe to adopt
+# before an MR moves the pin. Each branch
+# publishes dailies as <version>+<date>.<sha> on the urm internal index, and ==
+# ignores that local suffix, so a job takes the newest build of the day.
+#
+# Hard, like the rel jobs: a nightly that goes red on 4.8 is the signal the lane
+# exists to produce. That does mean an upstream daily can redden the nightly for
+# reasons no MR here caused -- if that turns into noise, allow_failure on this
+# template is the knob, not deleting the lane.
+.frost:cutlass-dsl:template:
   rules:
-    - !reference [.rules:mr_auto_allow_failure, rules]
+    - !reference [.rules:schedule_only, rules]
   variables:
-    FROST_TEST_PATHS: "test/python/sdpa/frost test/python/test_mhas_v2.py"
+    CUTLASS_DSL_INDEX_URL: "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple"
+
+.frost:cutlass-dsl-4.8:template:
+  extends: .frost:cutlass-dsl:template
+  variables:
+    CUTLASS_DSL_VERSION: "4.8.0a0"
+
+# --- jobs: rel, the public wheel --------------------------------------------
+frost:rel:sdpa:sm80:
+  extends:
+    - .frost:template
+    - .frost:sdpa:template
+    - .frost:sm80:template
+
+frost:rel:sdpa:sm100:
+  extends:
+    - .frost:template
+    - .frost:sdpa:template
+    - .frost:sm100:template
+
+frost:rel:sdpa:sm120:
+  extends:
+    - .frost:template
+    - .frost:sdpa:template
+    - .frost:sm120:template
+
+frost:rel:linear:sm100:
+  extends:
+    - .frost:template
+    - .frost:linear:template
+    - .frost:sm100:template
+
+frost:rel:gemm:sm100:
+  extends:
+    - .frost:template
+    - .frost:gemm:template
+    - .frost:sm100:template
+
+# --- jobs: cutlass-dsl-4.8, the unreleased 4.8 build ------------------------
+frost:cutlass-dsl-4.8:sdpa:sm80:
+  extends:
+    - .frost:template
+    - .frost:sdpa:template
+    - .frost:sm80:template
+    - .frost:cutlass-dsl-4.8:template
+
+frost:cutlass-dsl-4.8:sdpa:sm100:
+  extends:
+    - .frost:template
+    - .frost:sdpa:template
+    - .frost:sm100:template
+    - .frost:cutlass-dsl-4.8:template
+
+frost:cutlass-dsl-4.8:sdpa:sm120:
+  extends:
+    - .frost:template
+    - .frost:sdpa:template
+    - .frost:sm120:template
+    - .frost:cutlass-dsl-4.8:template
+
+frost:cutlass-dsl-4.8:linear:sm100:
+  extends:
+    - .frost:template
+    - .frost:linear:template
+    - .frost:sm100:template
+    - .frost:cutlass-dsl-4.8:template
+
+frost:cutlass-dsl-4.8:gemm:sm100:
+  extends:
+    - .frost:template
+    - .frost:gemm:template
+    - .frost:sm100:template
+    - .frost:cutlass-dsl-4.8:template

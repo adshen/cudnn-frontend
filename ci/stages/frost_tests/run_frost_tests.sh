@@ -26,10 +26,20 @@ function install_deps() {
     # CUDA-12 libNVVM (statically linked into _cutlass_ir.cu12.so) against a
     # CUDA 13 toolkit.
     #
-    # 4.7.0 is a PyPI release now, so this pins the public wheel instead of the
-    # 4.7.0a0 prerelease from the urm internal index -- both packages are on
-    # PyPI, so no --extra-index-url is needed.
-    pip install "nvidia-cutlass-dsl[cu13]==4.7.0" "apache-tvm-ffi>=0.1.11"
+    # 4.7.0 is a PyPI release now, so the default pins the public wheel instead
+    # of the 4.7.0a0 prerelease from the urm internal index -- both packages are
+    # on PyPI, so no --extra-index-url is needed for it.
+    #
+    # CUTLASS_DSL_VERSION / CUTLASS_DSL_INDEX_URL let a job run the suite against
+    # an unreleased wheel -- the nightly :cutlass_dsl jobs in jobs.yml pin the
+    # 4.7 and 4.8 branch tips off the urm internal index. CUTLASS_DSL_VERSION is
+    # the same variable name the oss_tests jobs use. Leave the index empty for a
+    # public version: urm also carries local-version builds of the released
+    # wheels (4.7.0+<date>.<sha>), and pip prefers those over PyPI's 4.7.0.
+    CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION:-4.7.0}"
+    pip install "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
+        ${CUTLASS_DSL_INDEX_URL:+--extra-index-url "${CUTLASS_DSL_INDEX_URL}"} \
+        "apache-tvm-ffi>=0.1.11"
     # The FROST tvm-ffi front door (~4.3x lower host dispatch) degrades silently
     # if tvm_ffi is missing, so a lost dependency would hide as a green build.
     python -c "import tvm_ffi; print('tvm_ffi', tvm_ffi.__version__)"
