@@ -1557,15 +1557,35 @@ def _softmax_warp_group(
                 reg_S = reg_S * scale_log2 - total_max_safe
 
                 chunk_P_0a = _exp2_dense_chunk_a(reg_S[0:P_SUBCHUNK].vec, 0)
-                hoisted_sum = row_reduction_pair(chunk_P_0a)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
+                if cutlass.const_expr(
+                    CFG.DTYPE_QKV == 1
+                    and CFG.MASK_FLAGS == MASK_CAUSAL
+                    and CFG.BOTTOM_RIGHT == 0
+                ):
+                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
+                    hoisted_sum = row_reduction_pair(chunk_P_0a)
+                else:
+                    hoisted_sum = row_reduction_pair(chunk_P_0a)
+                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
                 chunk_P_0b = _exp2_dense_chunk_b(reg_S[P_SUBCHUNK:CHUNK].vec, 3)
-                hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
-                nvvm.tcgen05_st(
-                    "32x32b",
-                    nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_SUBCHUNK), cutlass.Float32),
-                    chunk_P_0b.to(STORAGE_DTYPE),
-                )
+                if cutlass.const_expr(
+                    CFG.DTYPE_QKV == 1
+                    and CFG.MASK_FLAGS == MASK_CAUSAL
+                    and CFG.BOTTOM_RIGHT == 0
+                ):
+                    nvvm.tcgen05_st(
+                        "32x32b",
+                        nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_SUBCHUNK), cutlass.Float32),
+                        chunk_P_0b.to(STORAGE_DTYPE),
+                    )
+                    hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
+                else:
+                    hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
+                    nvvm.tcgen05_st(
+                        "32x32b",
+                        nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_SUBCHUNK), cutlass.Float32),
+                        chunk_P_0b.to(STORAGE_DTYPE),
+                    )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
