@@ -1541,10 +1541,10 @@ def _softmax_warp_group(
                 bars.mb_stat_full.arrive()
                 reg_S = reg_S * scale_log2 - total_max_safe
 
-                chunk_P_0a = cute.math.exp2(reg_S[0:P_SUBCHUNK].vec, fastmath=True)
+                chunk_P_0a = _exp2_dense_chunk_a(reg_S[0:P_SUBCHUNK].vec, 0)
                 hoisted_sum = row_reduction_pair(chunk_P_0a)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
-                chunk_P_0b = cute.math.exp2(reg_S[P_SUBCHUNK:CHUNK].vec, fastmath=True)
+                chunk_P_0b = _exp2_dense_chunk_b(reg_S[P_SUBCHUNK:CHUNK].vec, 0)
                 hoisted_sum = hoisted_sum + row_reduction_pair(chunk_P_0b)
                 nvvm.tcgen05_st(
                     "32x32b",
@@ -1556,14 +1556,14 @@ def _softmax_warp_group(
 
                 deferred_sum_1 = None
                 if cutlass.const_expr(N_CHUNKS == 2):
-                    chunk_P_1a = cute.math.exp2(reg_S[CHUNK : CHUNK + P_SUBCHUNK].vec, fastmath=True)
+                    chunk_P_1a = _exp2_dense_chunk_a(reg_S[CHUNK : CHUNK + P_SUBCHUNK].vec, 1)
                     deferred_sum_1 = row_reduction_pair(chunk_P_1a)
                     nvvm.tcgen05_st(
                         "32x32b",
                         nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK), cutlass.Float32),
                         chunk_P_1a.to(STORAGE_DTYPE),
                     )
-                    chunk_P_1b = cute.math.exp2(reg_S[CHUNK + P_SUBCHUNK : 2 * CHUNK].vec, fastmath=True)
+                    chunk_P_1b = _exp2_dense_chunk_b(reg_S[CHUNK + P_SUBCHUNK : 2 * CHUNK].vec, 1)
                     deferred_sum_1 = deferred_sum_1 + row_reduction_pair(chunk_P_1b)
                     nvvm.tcgen05_st(
                         "32x32b",
