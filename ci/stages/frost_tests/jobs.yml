@@ -92,12 +92,12 @@
   rules:
     - !reference [.rules:schedule_only, rules]
   variables:
-    CUTLASS_DSL_INDEX_URL: "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple"
+    FROST_CUTLASS_DSL_INDEX_URL: "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple"
 
 .frost:cutlass-dsl-4.8:template:
   extends: .frost:cutlass-dsl:template
   variables:
-    CUTLASS_DSL_VERSION: "4.8.0a0"
+    FROST_CUTLASS_DSL_VERSION: "4.8.0a0"
 
 # --- jobs: rel, the public wheel --------------------------------------------
 frost:rel:sdpa:sm80:

@@ -30,16 +30,24 @@ function install_deps() {
     # of the 4.7.0a0 prerelease from the urm internal index -- both packages are
     # on PyPI, so no --extra-index-url is needed for it.
     #
-    # CUTLASS_DSL_VERSION / CUTLASS_DSL_INDEX_URL let a job run the suite against
-    # an unreleased wheel -- the nightly :cutlass_dsl jobs in jobs.yml pin the
-    # 4.7 and 4.8 branch tips off the urm internal index. CUTLASS_DSL_VERSION is
-    # the same variable name the oss_tests jobs use. Leave the index empty for a
-    # public version: urm also carries local-version builds of the released
-    # wheels (4.7.0+<date>.<sha>), and pip prefers those over PyPI's 4.7.0.
-    CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION:-4.7.0}"
-    pip install "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
-        ${CUTLASS_DSL_INDEX_URL:+--extra-index-url "${CUTLASS_DSL_INDEX_URL}"} \
+    # FROST_CUTLASS_DSL_VERSION / FROST_CUTLASS_DSL_INDEX_URL let a job run the
+    # suite against an unreleased wheel -- the nightly frost:cutlass-dsl-4.8
+    # jobs in jobs.yml pin the 4.8 branch tip off the urm internal index. Leave
+    # the index empty for a public version: urm also carries local-version
+    # builds of the released wheels (4.7.0+<date>.<sha>), and pip prefers those
+    # over PyPI's 4.7.0.
+    #
+    # The FROST_ prefix is not decoration. The NGC PyTorch image these jobs run
+    # in exports its own CUTLASS_DSL_VERSION (4.4.2 in cudnn_13.3.0, stale even
+    # against the 4.5.2 the image ships), so reading that bare name here
+    # installed 4.4.2 instead of the pin and failed the suite on `No module
+    # named cutlass.experimental`.
+    FROST_CUTLASS_DSL_VERSION="${FROST_CUTLASS_DSL_VERSION:-4.7.0}"
+    pip install "nvidia-cutlass-dsl[cu13]==${FROST_CUTLASS_DSL_VERSION}" \
+        ${FROST_CUTLASS_DSL_INDEX_URL:+--extra-index-url "${FROST_CUTLASS_DSL_INDEX_URL}"} \
         "apache-tvm-ffi>=0.1.11"
+    # A wheel other than the pinned one is a broken job, not 51 mystery failures.
+    python -c "import importlib.metadata as md; v = md.version('nvidia-cutlass-dsl'); assert v.startswith('${FROST_CUTLASS_DSL_VERSION}'), f'cutlass-dsl {v} installed, expected ${FROST_CUTLASS_DSL_VERSION}'"
     # The FROST tvm-ffi front door (~4.3x lower host dispatch) degrades silently
     # if tvm_ffi is missing, so a lost dependency would hide as a green build.
     python -c "import tvm_ffi; print('tvm_ffi', tvm_ffi.__version__)"
