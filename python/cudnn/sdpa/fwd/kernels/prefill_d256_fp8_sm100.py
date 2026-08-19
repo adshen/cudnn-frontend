@@ -2163,11 +2163,7 @@ def compile(  # noqa: A001
         _fake_scale(),
         fake_amax_o,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options=(
-            "--enable-tvm-ffi --ptxas-options -uumn"
-            if CFG.MASK_FLAGS == MASK_NONE
-            else "--enable-tvm-ffi"
-        ),
+        options="--enable-tvm-ffi",
     )
 
 
