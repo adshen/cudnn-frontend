@@ -1823,10 +1823,12 @@ def _correction_warp_group(
             bars.mb_stat_empty.arrive()
 
             bmm2_done_phase_prev = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
-            bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
-            bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_prev_rt)
+            if cutlass.const_expr(CFG.DTYPE_QKV != 1):
+                bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
 
             if ~all_alpha_one:
+                if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                    bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
                 for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                     o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
                     o_chunk = nvvm.tcgen05_ld(
@@ -1836,10 +1838,14 @@ def _correction_warp_group(
                     )
                     o_scaled = vec_scale_pair(o_chunk, alpha, O_CHUNK)
                     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+            if cutlass.const_expr(CFG.DTYPE_QKV != 1):
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
 
             bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
+            bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_prev_rt)
             stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
         tmem_base_epi = tmem_base_corr
