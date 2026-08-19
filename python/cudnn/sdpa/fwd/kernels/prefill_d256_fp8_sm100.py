@@ -1556,7 +1556,7 @@ def _softmax_warp_group(
 
                 deferred_sum_1 = None
                 if cutlass.const_expr(N_CHUNKS == 2):
-                    chunk_P_1a = _exp2_dense_chunk_a(reg_S[CHUNK : CHUNK + P_SUBCHUNK].vec, 1)
+                    chunk_P_1a = _exp2_dense_chunk_a(reg_S[CHUNK : CHUNK + P_SUBCHUNK].vec, 0)
                     deferred_sum_1 = row_reduction_pair(chunk_P_1a)
                     nvvm.tcgen05_st(
                         "32x32b",
