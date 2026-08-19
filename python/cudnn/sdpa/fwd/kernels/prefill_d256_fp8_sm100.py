@@ -292,9 +292,12 @@ def _max_abs_reduction(vec):
 def _exp2_dense_chunk_a(vec, softmax_half):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        use_poly = CFG.DTYPE_QKV == 0 and i % 10 < 4 and not (softmax_half == 1 and i == 30)
-        if use_poly:
+        use_e4_poly = CFG.DTYPE_QKV == 0 and i % 10 < 4 and not (softmax_half == 1 and i == 30)
+        use_e5_poly = CFG.DTYPE_QKV == 1 and (i % 10 < 4 or i == 28 or (softmax_half == 1 and i == 26))
+        if use_e4_poly:
             x, y = ex2_emulation_2(vec[i], vec[i + 1])
+        elif use_e5_poly:
+            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
@@ -302,10 +305,11 @@ def _exp2_dense_chunk_a(vec, softmax_half):
     return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
 
 
-def _exp2_dense_chunk_b(vec):
+def _exp2_dense_chunk_b(vec, softmax_half):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if CFG.DTYPE_QKV == 0 and i >= 16:
+        e5_threshold = 18 if softmax_half == 0 else 24
+        if (CFG.DTYPE_QKV == 0 and i >= 16) or (CFG.DTYPE_QKV == 1 and i >= e5_threshold):
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -1355,7 +1359,7 @@ def _softmax_warp_group(
                     ),
                     chunk_P_a.to(STORAGE_DTYPE),
                 )
-                chunk_P_b = _exp2_dense_chunk_b(reg_S_half[P_SUBCHUNK:CHUNK].vec)
+                chunk_P_b = _exp2_dense_chunk_b(reg_S_half[P_SUBCHUNK:CHUNK].vec, softmax_half)
                 new_p_sum_pair = new_p_sum_pair + row_reduction_pair(chunk_P_b)
                 nvvm.tcgen05_st(
                     "32x32b",
