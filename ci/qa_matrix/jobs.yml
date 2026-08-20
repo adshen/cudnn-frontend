@@ -6,7 +6,10 @@ spec:
 "build:$[[inputs.cudnn_version]]_$[[inputs.cuda_version]]":
   image: "gitlab-master.nvidia.com:5005/cudnn/cudnn_frontend:cudnn_$[[inputs.cudnn_version]]_$[[inputs.cuda_version]]"
   stage: build
-  needs: []
+  # manual:qa_matrix is manual on a change pipeline and automatic on a schedule,
+  # so this build and the jobs below stay nightly-only in practice until
+  # somebody asks for them on an MR.
+  needs: ["manual:qa_matrix"]
   variables:
     # The qa_matrix cpp_samples jobs below execute bin/samples and
     # bin/legacy_samples from this build's artifacts, so opt back into
@@ -20,7 +23,7 @@ spec:
   needs: ["build:$[[inputs.cudnn_version]]_$[[inputs.cuda_version]]"]
   parallel:
     matrix:
-      - ARCH: ["Hopper", "Ampere"]
+      - ARCH: ["Hopper", "Ampere", "Blackwell"]
   tags:
     - ${ARCH}
   extends:
@@ -31,7 +34,7 @@ spec:
   needs: ["build:$[[inputs.cudnn_version]]_$[[inputs.cuda_version]]"]
   parallel:
     matrix:
-      - ARCH: ["Hopper", "Ampere"]
+      - ARCH: ["Hopper", "Ampere", "Blackwell"]
   tags:
     - ${ARCH}
   extends:

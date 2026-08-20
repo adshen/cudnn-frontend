@@ -45,10 +45,12 @@ include:
   - local: ci/stages/notify/jobs.yml
   - local: ci/qa_matrix/jobs.yml
     inputs:
-      cuda_version: "13.1.0"
-      cudnn_version: "9.19.0.56"
+      cuda_version: "13.3.0"
+      cudnn_version: "9.24.0.43"
     rules:
       - if: $CI_PIPELINE_SOURCE == "schedule"
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      - if: '$CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_REF_NAME =~ /^cudnn-gh\/.*$/'
 
 stages:
   - manual

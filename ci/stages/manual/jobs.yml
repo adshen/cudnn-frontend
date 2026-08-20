@@ -32,6 +32,13 @@ manual:python_tests:
 manual:frost:
   extends: .manual_gate:template
 
+# Guards ci/qa_matrix/jobs.yml -- the cpp_samples and python_tests jobs against
+# a pinned released cuDNN/CUDA pair. They are the nightly's coverage; the gate is
+# what lets a change pipeline ask for the same run without every MR paying
+# for it.
+manual:qa_matrix:
+  extends: .manual_gate:template
+
 manual:oss:
   extends: .manual_gate:template
 
