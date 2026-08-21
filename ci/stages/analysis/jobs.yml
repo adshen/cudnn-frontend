@@ -88,6 +88,15 @@ analysis:guardwords_scan:
     extends:
         - .analysis_job_template
 
+analysis:jax-import-guard:
+    needs: []
+    stage: analysis
+    script:
+        - ci/stages/analysis/check_jax_import_guard.sh
+    extends:
+        - .analysis_job_template
+        - .jax_26_07_image:template
+
 analysis:github-file-sync:
     needs: []
     stage: analysis

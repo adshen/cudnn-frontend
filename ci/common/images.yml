@@ -15,3 +15,6 @@
 
 .python_3_12_image:template:
   image: python:3.12
+
+.jax_26_07_image:template:
+  image: nvcr.io/nvidia/jax:26.07-py3
