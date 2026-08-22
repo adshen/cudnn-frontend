@@ -363,7 +363,11 @@ class CfgD256:
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
     fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
-    split_dense_p = fp8 and cfg.MASK_FLAGS == MASK_NONE
+    split_p = cfg.SOFTMAX_WARPGROUPS == 2
+    split_p_supported = fp8 and (
+        cfg.MASK_FLAGS == MASK_NONE
+        or (cfg.MASK_FLAGS == MASK_CAUSAL and cfg.BOTTOM_RIGHT == 0)
+    )
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (
@@ -377,8 +381,9 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d256: Q/K swizzle must be 64/128B"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d256: V/O swizzle out of range"),
         (cfg.TILES_Q == 1, "d256 pipeline mandates TILES_Q == 1"),
-        (cfg.SOFTMAX_WARPGROUPS == (2 if split_dense_p else 1), "d256: only dense FP8 may split P generation"),
-        (cfg.TOTAL_WARPS == (16 if split_dense_p else 12), "d256: role layout and warp count disagree"),
+        (not split_p or split_p_supported, "d256: unsupported split-P specialization"),
+        (cfg.SOFTMAX_WARPGROUPS == 2 if cfg.MASK_FLAGS == MASK_NONE and fp8 else True, "d256: dense FP8 must split P generation"),
+        (cfg.TOTAL_WARPS == (16 if split_p else 12), "d256: role layout and warp count disagree"),
         (
             cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if fp8 else 16),
             "d256: TILE_K_HW must be 32 for FP8 and 16 for BF16/FP16",
@@ -395,7 +400,14 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     mask_flags = _mask_flags_from(params)
-    split_dense_p = fp8 and mask_flags == MASK_NONE
+    split_p = fp8 and (
+        mask_flags == MASK_NONE
+        or (
+            not mxfp8
+            and mask_flags == MASK_CAUSAL
+            and not params.bottom_right
+        )
+    )
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
     cfg = CfgD256(
@@ -415,10 +427,10 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
         STAGES_KV=2,
-        SOFTMAX_WARPGROUPS=2 if split_dense_p else 1,
+        SOFTMAX_WARPGROUPS=2 if split_p else 1,
         SOFTMAX_REGS=(
             256
-            if mxfp8 and split_dense_p and params.dtype_qkv == DTYPE_E5M2
+            if mxfp8 and split_p and params.dtype_qkv == DTYPE_E5M2
             else (
                 248
                 if mxfp8
@@ -427,36 +439,61 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
                     params.dtype_qkv == DTYPE_E5M2
                     or (params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right)
                 )
+                else 224
+                if not mxfp8
+                and split_p
+                and params.dtype_qkv == DTYPE_E4M3
+                and mask_flags == MASK_CAUSAL
+                and not params.bottom_right
                 else 240
             )
         ),
-        SOFTMAX_WG1_REGS=144 if mxfp8 and split_dense_p and params.dtype_qkv == DTYPE_E5M2 else 136 if split_dense_p else 40,
+        SOFTMAX_WG1_REGS=(
+            160
+            if split_p
+            and not mxfp8
+            and params.dtype_qkv == DTYPE_E4M3
+            and mask_flags == MASK_CAUSAL
+            and not params.bottom_right
+            else 144
+            if mxfp8 and split_p and params.dtype_qkv == DTYPE_E5M2
+            else 136 if split_p else 40
+        ),
         CORRECTION_REGS=(
             72
-            if mxfp8 and split_dense_p and params.dtype_qkv == DTYPE_E5M2
+            if mxfp8 and split_p and params.dtype_qkv == DTYPE_E5M2
             else (
                 64
                 if mxfp8 and mask_flags != MASK_NONE
                 else (
                     112
-                    if not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
+                    if not mxfp8
+                    and params.dtype_qkv == DTYPE_E5M2
+                    and mask_flags == MASK_CAUSAL
+                    and not params.bottom_right
+                    and not split_p
                     else (
-                        64
+                        96
+                        if not mxfp8
+                        and params.dtype_qkv == DTYPE_E5M2
+                        and mask_flags == MASK_CAUSAL
+                        and not params.bottom_right
+                        else 64
                         if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
                         else 104 if not mxfp8 and fp8 and mask_flags != MASK_NONE else 96
                     )
                 )
             )
         ),
-        TOTAL_WARPS=16 if split_dense_p else 12,
-        THREADS_PER_CTA=(16 if split_dense_p else 12) * 32,
-        SOFTMAX_WG1_BASE=4 if split_dense_p else 64,
-        CORR_WARP_BASE=8 if split_dense_p else 4,
-        MMA_WARP_ID=12 if split_dense_p else 8,
-        TMALDG_WARP_ID=13 if split_dense_p else 9,
-        TMASTG_WARP_ID=14 if split_dense_p else 10,
-        SCHED_WARP_ID=15 if split_dense_p else 11,
-        READ_TILE_ARRIVERS=15 if split_dense_p else 11 if fp8 else 21,
+        TOTAL_WARPS=16 if split_p else 12,
+        THREADS_PER_CTA=(16 if split_p else 12) * 32,
+        SOFTMAX_WG1_BASE=4 if split_p else 64,
+        CORR_WARP_BASE=8 if split_p else 4,
+        MMA_WARP_ID=12 if split_p else 8,
+        TMALDG_WARP_ID=13 if split_p else 9,
+        TMASTG_WARP_ID=14 if split_p else 10,
+        SCHED_WARP_ID=15 if split_p else 11,
+        READ_TILE_ARRIVERS=15 if split_p else 11 if fp8 else 21,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
