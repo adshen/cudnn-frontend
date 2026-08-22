@@ -289,11 +289,16 @@ def _max_abs_reduction(vec):
     return cute.math.max(maxima[0], -minima[0], ftz=True)
 
 
+_E5_STYLE_SOFTMAX = CFG.DTYPE_QKV == 1 or (
+    CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0
+)
+
+
 def _exp2_dense_chunk_a(vec, softmax_half):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        use_e4_poly = CFG.DTYPE_QKV == 0 and i % 10 < 4 and not (softmax_half == 1 and i == 30)
-        use_e5_poly = CFG.DTYPE_QKV == 1 and (i % 10 < 4 or (softmax_half == 1 and (i == 26 or i == 28)))
+        use_e4_poly = not _E5_STYLE_SOFTMAX and i % 10 < 4 and not (softmax_half == 1 and i == 30)
+        use_e5_poly = _E5_STYLE_SOFTMAX and (i % 10 < 4 or (softmax_half == 1 and (i == 26 or i == 28)))
         if use_e4_poly:
             x, y = ex2_emulation_2(vec[i], vec[i + 1])
         elif use_e5_poly:
@@ -310,7 +315,7 @@ def _exp2_dense_chunk_b(vec, softmax_half):
     for i in range(0, int(vec.shape[0]), 2):
         e4_threshold = 20 if softmax_half == 2 else 16
         e5_threshold = 22 if softmax_half == 3 else (20 if softmax_half == 0 else (22 if softmax_half == 2 else 24))
-        if (CFG.DTYPE_QKV == 0 and i >= e4_threshold) or (CFG.DTYPE_QKV == 1 and i >= e5_threshold):
+        if (not _E5_STYLE_SOFTMAX and i >= e4_threshold) or (_E5_STYLE_SOFTMAX and i >= e5_threshold):
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -320,10 +325,13 @@ def _exp2_dense_chunk_b(vec, softmax_half):
 
 
 def _exp2_masked_alpha(x):
-    if CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0:
+    if _E5_STYLE_SOFTMAX and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0:
         value, _ = ex2_emulation_2(x, x, poly_degree=2)
         return value
     return cute.math.exp2(x, fastmath=True)
+
+
+_RARE_RESCALE_CORRECTION = _E5_STYLE_SOFTMAX
 
 
 @cute.kernel
@@ -1519,7 +1527,7 @@ def _softmax_warp_group(
                 s_addr_base = tmem_base + s_off_rt
                 p_addr_base = tmem_base + p_off_rt
                 stats_addr = tmem_base + s_off_rt
-                if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                if cutlass.const_expr(_E5_STYLE_SOFTMAX):
                     raw_chunks = [
                         nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base, cutlass.Float32), num=32),
                         nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(32), cutlass.Float32), num=32),
@@ -1558,7 +1566,7 @@ def _softmax_warp_group(
 
                 chunk_P_0a = _exp2_dense_chunk_a(reg_S[0:P_SUBCHUNK].vec, 0)
                 if cutlass.const_expr(
-                    CFG.DTYPE_QKV == 1
+                    _E5_STYLE_SOFTMAX
                     and CFG.MASK_FLAGS == MASK_CAUSAL
                     and CFG.BOTTOM_RIGHT == 0
                 ):
@@ -1569,7 +1577,7 @@ def _softmax_warp_group(
                     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0a.to(STORAGE_DTYPE))
                 chunk_P_0b = _exp2_dense_chunk_b(reg_S[P_SUBCHUNK:CHUNK].vec, 3)
                 if cutlass.const_expr(
-                    CFG.DTYPE_QKV == 1
+                    _E5_STYLE_SOFTMAX
                     and CFG.MASK_FLAGS == MASK_CAUSAL
                     and CFG.BOTTOM_RIGHT == 0
                 ):
@@ -1850,11 +1858,11 @@ def _correction_warp_group(
             bars.mb_stat_empty.arrive()
 
             bmm2_done_phase_prev = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
-            if cutlass.const_expr(CFG.DTYPE_QKV != 1):
+            if cutlass.const_expr(not _RARE_RESCALE_CORRECTION):
                 bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
 
             if ~all_alpha_one:
-                if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                if cutlass.const_expr(_RARE_RESCALE_CORRECTION):
                     bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
                 for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                     o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
@@ -1865,9 +1873,9 @@ def _correction_warp_group(
                     )
                     o_scaled = vec_scale_pair(o_chunk, alpha, O_CHUNK)
                     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
-                if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                if cutlass.const_expr(_RARE_RESCALE_CORRECTION):
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-            if cutlass.const_expr(CFG.DTYPE_QKV != 1):
+            if cutlass.const_expr(not _RARE_RESCALE_CORRECTION):
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
 
             bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
