@@ -165,3 +165,162 @@ frost:cutlass-dsl-4.8:gemm:sm100:
     - .frost:gemm:template
     - .frost:sm100:template
     - .frost:cutlass-dsl-4.8:template
+
+# ==============================================================================
+# Cluster arches: sm103 (GB300, lyris) and sm107 (Rubin, hecate).
+#
+# Neither exists as a tagged GPU box -- both live behind SLURM. These jobs land
+# on the project's sybil runners, which execute the script ON THE CLUSTER LOGIN
+# NODE as the user who triggered the pipeline, then submit the real work to a
+# compute node with srun + enroot/pyxis. Same mechanism as oss:rubin in
+# ci/stages/oss_tests/jobs.yml and multi_gpu_smoke:lyris in
+# ci/stages/multi_gpu_tests/jobs.yml; the node-side half is
+# run_frost_tests_cluster.sh rather than run_frost_tests.sh, because cuDNN comes
+# from the container and the package is pip-installed instead of taken from
+# build:dev artifacts (hence no build:dev in needs).
+#
+# Prerequisites, both of which fail the job rather than silently degrade it:
+#   * The triggering user must be onboarded to the cluster: unix account, SLURM
+#     account, and kerberos. A bot-triggered pipeline has none of these, which
+#     is the main reason these stay soft.
+#   * hecate additionally needs registry credentials for the Rubin image
+#     (GITLAB_ALL_KEY, or a RUBIN_REGISTRY_TOKEN override), resolved by
+#     setup_registry_credentials.sh in this directory.
+#
+# Soft while the lanes are in bring-up: an allocation can fail for cluster
+# reasons no MR here caused. Drop allow_failure once they hold.
+# ==============================================================================
+.frost:cluster:template:
+  stage: frost_tests
+  needs: ["manual:frost"]
+  allow_failure: true
+  timeout: 2h
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: 20
+    SLURM_ACCOUNT: "coreai_libraries_cudnn"
+    SLURM_NODES: 1
+    GPUS_PER_NODE: 4
+    SRUN_TIMELIMIT: 100        # minutes, well under the 2h job timeout
+    # Pre-cluster cli_filter requires --account and this --job-name format:
+    # <account>-<subproject>.<details>
+    SLURM_JOBNAME: "${SLURM_ACCOUNT}-cudnn_frontend.frost.${CI_JOB_ID}"
+    ENROOT_CACHE_ROOT: "/lustre/fsw/coreai_libraries_cudnn/cudnn-frontend-ci/enroot"
+    RESULTS_DIR_NAME: "frost-cluster-results"
+    FROST_TEST_PATHS: "test/python/sdpa/frost test/python/test_mhas_v2.py"
+  rules:
+    - !reference [.rules:mr_auto, rules]
+  script:
+    - hostname && whoami && id
+    - export RESULTS_DIR_HOST="${CI_PROJECT_DIR}/${RESULTS_DIR_NAME}"
+    - rm -rf "${RESULTS_DIR_HOST}" && mkdir -p "${RESULTS_DIR_HOST}"
+    # --- enroot config isolated to this job (the login node is shared) ---
+    - export ENROOT_CONFIG_PATH="${CI_PROJECT_DIR}/.enroot-${CI_JOB_ID}"
+    - mkdir -p "${ENROOT_CONFIG_PATH}"
+    - |
+        # Private gitlab-master images need credentials; nvcr.io ones only do if
+        # anonymous pulls are rejected from the cluster. Resolve and verify them
+        # here rather than on the compute node, where a bad token surfaces only
+        # as a bare 401 from pyxis.
+        if [ "${ENROOT_NEEDS_GITLAB_CREDENTIALS:-0}" = "1" ]; then
+          # Writes ${ENROOT_CONFIG_PATH}/.credentials itself, and fails here with
+          # a specific message rather than as a 401 from pyxis on the node.
+          ci/stages/frost_tests/setup_registry_credentials.sh
+        elif [ -n "${NGC_API_KEY:-}" ]; then
+          printf 'machine nvcr.io login $oauthtoken password %s\n' "${NGC_API_KEY}" > "${ENROOT_CONFIG_PATH}/.credentials"
+        fi
+    - |
+        # Shared enroot cache on lustre; fall back to the build dir if the
+        # project path is not writable for this user.
+        if mkdir -p "${ENROOT_CACHE_ROOT}/cache" "${ENROOT_CACHE_ROOT}/temp" 2>/dev/null; then
+          cache_root="${ENROOT_CACHE_ROOT}"
+        else
+          cache_root="${CI_PROJECT_DIR}/.enroot-cache"
+          mkdir -p "${cache_root}/cache" "${cache_root}/temp"
+        fi
+        printf 'ENROOT_CACHE_PATH %s/cache\nENROOT_TEMP_PATH %s/temp\n' "${cache_root}" "${cache_root}" > "${ENROOT_CONFIG_PATH}/enroot.conf"
+        echo "enroot cache: ${cache_root}"
+    # --- submit to SLURM: a single task owning the whole node ---
+    - |
+        # -p is omitted unless SLURM_PARTITION is set: a cluster without the
+        # named partition rejects the job outright ("invalid partition
+        # specified"), so an unset value means "let the cluster pick".
+        srun_args=()
+        if [ -n "${SLURM_PARTITION:-}" ]; then
+          srun_args+=(-p "${SLURM_PARTITION}")
+        fi
+        srun_args+=(
+          -A "${SLURM_ACCOUNT}"
+          -N "${SLURM_NODES}"
+          --ntasks-per-node=1
+          -t "${SRUN_TIMELIMIT}"
+          --job-name "${SLURM_JOBNAME}"
+          --container-image="${ENROOT_IMAGE}"
+          --container-mounts="${CI_PROJECT_DIR}:/workspace"
+          --container-workdir=/workspace
+          --container-env=RESULTS_DIR_NAME,EXPECTED_COMPUTE_CAP,FROST_TEST_PATHS,FROST_CUTLASS_DSL_VERSION,FROST_CUTLASS_DSL_INDEX_URL,PYTEST_WORKERS
+        )
+        echo "srun ${srun_args[*]}"
+        set +e
+        srun "${srun_args[@]}" /bin/bash ci/stages/frost_tests/run_frost_tests_cluster.sh
+        run_status=$?
+        set -e
+        # srun can report success while the payload dies before pytest runs
+        # (bad image, no GPUs, pip failure), which would look like a green job.
+        if [ ! -f "${RESULTS_DIR_HOST}/complete.ok" ] && [ "${run_status}" -eq 0 ]; then
+          echo "ERROR: completion marker missing; the node script died silently."
+          run_status=1
+        fi
+        echo "frost cluster srun exit status: ${run_status}"
+        exit "${run_status}"
+  after_script:
+    - rm -rf "${CI_PROJECT_DIR}/.enroot-${CI_JOB_ID}" || true
+  artifacts:
+    when: always
+    paths:
+      - frost-cluster-results/
+    reports:
+      junit: frost-cluster-results/result-junit.xml
+
+# GB300 (sm103) on lyris. aarch64 Grace-Blackwell, so the project's x86-only
+# registry images cannot run here; nvcr.io/nvidia/pytorch is multi-arch, the
+# same base multi_gpu_smoke:lyris uses. sm_103a is in the public DSL's Arch
+# enum, so this lane runs the released wheel like the other frost:rel jobs.
+frost:rel:sdpa:sm103:
+  extends: .frost:cluster:template
+  tags:
+    - lyris
+  variables:
+    SLURM_PARTITION: "gb300"
+    ENROOT_IMAGE: "docker://nvcr.io#nvidia/pytorch:26.06-py3"
+    EXPECTED_COMPUTE_CAP: "103"
+    FROST_CUTLASS_DSL_VERSION: "4.7.0"
+
+# Rubin (sm107) on hecate. The public 4.7.0 Arch enum stops at sm_103a, so this
+# lane needs the unreleased 4.8 build off the urm internal index -- the same pin
+# the frost:cutlass-dsl-4.8 jobs use. Unlike those, it is not schedule-only:
+# there is no rel counterpart to compare against on this hardware.
+#
+# Narrower FROST_TEST_PATHS than the other jobs: Rubin serves only the
+# per-tensor FP8 d128 path (see _allowed_msg in cudnn/sdpa/fwd/api_dsl.py), and
+# the sm100/sm120 modules in test/python/sdpa/frost do not gate on cc 10.7 --
+# pointing this job at the whole directory produced 572 failures, every one of
+# them "SdpaFwdDslSm100 requires cc=10.0 or 10.3". Widen it when those modules
+# learn to skip, or when Rubin serves more paths.
+frost:cutlass-dsl-4.8:sdpa:sm107:
+  extends: .frost:cluster:template
+  tags:
+    - hecate
+  variables:
+    FROST_TEST_PATHS: "test/python/sdpa/frost/test_sdpa_fp8_sm107.py test/python/test_mhas_v2.py"
+    SLURM_PARTITION: "batch-xdr"
+    ENROOT_IMAGE: "docker://gitlab-master.nvidia.com:5005#dl/dgx/pytorch:rubin-py3-devel"
+    ENROOT_NEEDS_GITLAB_CREDENTIALS: "1"
+    EXPECTED_COMPUTE_CAP: "107"
+    FROST_CUTLASS_DSL_VERSION: "4.8.0a0"
+    FROST_CUTLASS_DSL_INDEX_URL: "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple"
