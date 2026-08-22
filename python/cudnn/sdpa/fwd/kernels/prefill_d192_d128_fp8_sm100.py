@@ -600,23 +600,31 @@ def _kernel(
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
 
-    # Keep quantization scales on device. The adapter supplies the attention
-    # scale in log2 units and a unit output scale; fold Q/K and V/O factors in
-    # here without host readback.
-    _dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
-    _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
-    _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
-    _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
-    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
-    o_scale_fused = o_scale_fused * _dsc_v * _scl_o
+    # E5M2 schedules better when all four scale operations precede role
+    # dispatch. E4M3 benefits from keeping each pair local to its consumer.
+    if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+        _e5_dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+        _e5_dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+        _e5_dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
+        _e5_scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+        scale_softmax_log2 = scale_softmax_log2 * _e5_dsc_q * _e5_dsc_k
+        o_scale_fused = o_scale_fused * _e5_dsc_v * _e5_scl_o
 
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        if cutlass.const_expr(CFG.DTYPE_QKV == 0):
+            # Only softmax consumes the Q/K descales. Keep these device loads
+            # out of the E4M3 MMA, TMA, correction, and scheduler paths.
+            _dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+            _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+            scale_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+        else:
+            scale_log2 = scale_softmax_log2
         _softmax_warp_group(
             sub_tile_id=0,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
-            scale_log2=scale_softmax_log2,
+            scale_log2=scale_log2,
             tmem_ptr_i32=tmem_ptr_i32,
             sQ=sQ,
             sinks_tensor=sinks_tensor,
@@ -634,11 +642,17 @@ def _kernel(
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        if cutlass.const_expr(CFG.DTYPE_QKV == 0):
+            _dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+            _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+            scale_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+        else:
+            scale_log2 = scale_softmax_log2
         _softmax_warp_group(
             sub_tile_id=1,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
-            scale_log2=scale_softmax_log2,
+            scale_log2=scale_log2,
             tmem_ptr_i32=tmem_ptr_i32,
             sQ=sQ,
             sinks_tensor=sinks_tensor,
@@ -656,6 +670,13 @@ def _kernel(
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
         nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(CFG.DTYPE_QKV == 0):
+            # V/O scaling is correction-only for the E4M3 specialization.
+            _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
+            _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+            o_scale_corr = o_scale_fused * _dsc_v * _scl_o
+        else:
+            o_scale_corr = o_scale_fused
         _correction_warp_group(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
@@ -674,7 +695,7 @@ def _kernel(
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
-            o_scale_fused=o_scale_fused,
+            o_scale_fused=o_scale_corr,
             amax_o_tensor=amax_o_tensor,
         )
 
