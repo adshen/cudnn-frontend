@@ -419,8 +419,11 @@ def _exp2_chunk0a_mixed(vec, apply_mask, dense=False, softmax_half=0):
         if _E5_STYLE_SOFTMAX and apply_mask:
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
+        elif _E5_STYLE_SOFTMAX and not dense and i == 0:
+            x = cute.math.exp2(vec[i], fastmath=True)
+            y = cute.math.exp2(vec[i + 1], fastmath=True)
         elif _E5_STYLE_SOFTMAX and not dense:
-            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
+            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=1)
         elif _E5_STYLE_SOFTMAX and dense and (i % 10 < 4 or i == 28 or (softmax_half == 1 and i == 26)):
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         elif not _E5_STYLE_SOFTMAX and i % 10 < 4 and not (dense and softmax_half == 1 and i == 30):
@@ -436,12 +439,14 @@ def _exp2_chunk1b_mixed(vec, dense=False, softmax_half=0):
     values = []
     for i in range(0, int(vec.shape[0]), 2):
         threshold = 16
+        if _E5_STYLE_SOFTMAX and not dense:
+            threshold = 2
         if not _E5_STYLE_SOFTMAX and not dense:
             threshold = 20 if softmax_half == 2 else 16
         elif _E5_STYLE_SOFTMAX and dense:
             threshold = 18 if softmax_half == 0 else 24
         if i >= threshold:
-            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
+            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=1)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
