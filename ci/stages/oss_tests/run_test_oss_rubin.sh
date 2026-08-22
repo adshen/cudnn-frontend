@@ -58,31 +58,26 @@ pip install --no-cache-dir -r requirements.txt
 pip install -v --no-cache-dir --no-build-isolation .[cutedsl] \
     || pip install -v --no-cache-dir .[cutedsl]
 
-# Swap the PyPI-pinned cutedsl for the internal wheel. Install-then-replace,
-# because the extra is what pulls in the rest of the cutedsl dependency set
-# (cuda-python, apache-tvm-ffi, torch-c-dlpack-ext), so uninstalling the DSL
-# afterwards is cheaper than hand-listing those deps and letting them drift
-# from pyproject.toml.
+# Swap the pyproject-resolved cutedsl for the version this job pins
+# (CUTLASS_DSL_PACKAGE, currently the public 4.8 prerelease — the first public
+# line whose Arch enum carries sm_107a; 4.7.0 stops at sm_103a).
+# Install-then-replace, because the extra is what pulls in the rest of the
+# cutedsl dependency set (cuda-python, apache-tvm-ffi, torch-c-dlpack-ext), so
+# uninstalling the DSL afterwards is cheaper than hand-listing those deps and
+# letting them drift from pyproject.toml.
 #
-# This job is the one place the internal wheel is still required. The oss:rel
-# nightlies moved to public PyPI pins (4.5.1 / 4.6.2 / 4.7.0) once 4.7.0 was
-# released, but the public 4.7.0 Arch enum stops at sm_103a — only
-# nvidia-cutlass-dsl-internal carries sm_107a and the Rubin kernels.
-#
-# The Rubin image ALREADY ships nvidia-cutlass-dsl-internal, and that is the wheel
-# carrying the sm107 kernels. Both wheels unpack into the same
-# nvidia_cutlass_dsl/dsl_packages/cutlass/ directory, so `pip install .[cutedsl]`
-# overwrites the internal files with the public ones, and the plain
-# `pip uninstall nvidia-cutlass-dsl` below does not put them back — pip then
-# reports the internal dist as "already satisfied" and installs nothing. The
-# result is a public 4.6.1 `cutlass` on the path whose Arch enum has no sm_107a,
-# so every DSL test dies with `KeyError: 'sm_107a'` while the job still looks like
-# it exercised Rubin. Remove the public dist *and its libs* packages, then
-# force-reinstall the internal wheel so it is unambiguously the one on disk.
-pip uninstall -y nvidia-cutlass-dsl \
+# The Rubin image ships nvidia-cutlass-dsl-internal preinstalled. All of these
+# wheels unpack into the same nvidia_cutlass_dsl/dsl_packages/cutlass/
+# directory, so whichever dist is installed last silently owns the files while
+# the others still look "already satisfied" to pip. To make the pinned wheel
+# unambiguously the one on disk: remove the pyproject-resolved public dist
+# *and its libs* packages *and* the image's internal dist, then install the
+# pinned package fresh (with deps — the public wheels split the compiled
+# pieces into nvidia-cutlass-dsl-libs-* which --no-deps would skip).
+pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-internal \
     nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-core \
     nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 || true
-pip install --no-cache-dir --force-reinstall --no-deps \
+pip install --no-cache-dir \
     "${CUTLASS_DSL_PACKAGE:?CUTLASS_DSL_PACKAGE must be set}" \
     --extra-index-url "${CUTLASS_DSL_INDEX_URL:?CUTLASS_DSL_INDEX_URL must be set}"
 

@@ -38,8 +38,8 @@ oss:rel:cutlass_dsl_4.6:
 # job above rather than the old install-then-swap against the urm internal wheel.
 # The sm_107a CUTLASS_DSL_ARCH/CUTE_DSL_ARCH overrides went with it: the public
 # wheel's Arch enum stops at sm_103a, and these runners are Hopper/Ampere/
-# Blackwell anyway. sm107 coverage is oss:rubin below, which keeps the internal
-# wheel because that is the only one carrying the Rubin kernels.
+# Blackwell anyway. sm107 coverage is oss:rubin below, which pins the public
+# 4.8 prerelease — the first public line whose Arch enum carries sm_107a.
 oss:rel:cutlass_dsl_4.7:
   extends: oss:rel
   variables:
@@ -77,8 +77,8 @@ oss:rel:cutlass_dsl_4.8:
 #     RUBIN_REGISTRY_TOKEN override) — see the credentials step below.
 #
 # The image ships CUDA/cuDNN/torch for Rubin, so there is no fetch_cudnn step;
-# the fe_api tests exercise the cutedsl kernels, and the internal cutlass-dsl
-# wheel from urm is what carries the sm107 kernel variants.
+# the fe_api tests exercise the cutedsl kernels against the cutlass-dsl 4.8
+# prerelease from urm — the first public line whose Arch enum carries sm_107a.
 # ==============================================================================
 
 .oss_tests_rubin:template:
@@ -106,8 +106,13 @@ oss:rel:cutlass_dsl_4.8:
     SLURM_JOBNAME: "${SLURM_ACCOUNT}-cudnn_frontend.oss_rubin.${CI_JOB_ID}"
     ENROOT_IMAGE: "docker://gitlab-master.nvidia.com:5005#dl/dgx/pytorch:rubin-py3-devel"
     ENROOT_CACHE_ROOT: "/lustre/fsw/coreai_libraries_cudnn/cudnn-frontend-ci/enroot"
-    # The Rubin/sm107 kernels live in the internal (unreleased) cutedsl wheel.
-    CUTLASS_DSL_PACKAGE: "nvidia-cutlass-dsl-internal"
+    # Rubin needs a wheel whose Arch enum carries sm_107a. The public 4.8
+    # prerelease is the first one that does (4.7.0 stops at sm_103a), so this
+    # job now tracks it instead of nvidia-cutlass-dsl-internal. The 4.8 branch
+    # publishes dailies to the urm index as 4.8.0a0+<date>.<sha> and `==`
+    # ignores the local suffix, so the job takes the newest build of the day —
+    # same convention as oss:rel:cutlass_dsl_4.8 above.
+    CUTLASS_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.8.0a0"
     CUTLASS_DSL_INDEX_URL: "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple"
     EXPECTED_COMPUTE_CAP: "107"
     RESULTS_DIR_NAME: "rubin-oss-results"
