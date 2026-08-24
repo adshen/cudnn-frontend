@@ -222,9 +222,10 @@ class KernelTmemLayout:
     STATS_ODD_OFF: int = 128
     STATS_EPI_OFF: int = 0
 
-    # Scale-factor scratch.  Prologue Q/K use dead O columns.  Steady-state
-    # Q/K and BMM2 P/V use the current score parity after softmax has loaded it.
-    SF_HEAD_OFFSET: int = 8
+    # Scale-factor scratch.  Prologue Q/K use dead O columns.  In fused split-P,
+    # steady-state Q/K use WG1's consumed high score half while P/V retain the
+    # selected low-half addresses released by WG0.
+    SF_HEAD_OFFSET: int = 64 if CFG.FUSED_CORR_SPLIT_P else 8
     SF_AFTER_P_OFFSET: int = 32
     SF_Q_PRO_OFF: int = 256
     SF_K_PRO_OFF: int = 256 + SF_TMEM_COLS_Q
@@ -610,9 +611,10 @@ def _kernel(
         alignment=16,
         space=cutlass.AddressSpace.smem,
     )
-    # One barrier per score parity.  Every softmax warp arrives after its
-    # tcgen05 load; MMA may then overwrite that score region with scale factors.
+    # P/V scale factors occupy the low score half released by WG0.  Fused
+    # split-P Q/K scale factors use a separate high-half transition from WG1.
     mb_sf_reuse = cutlass.Array(cutlass.Int64, 2, alignment=16, space=cutlass.AddressSpace.smem)
+    mb_qk_sf_reuse = cutlass.Array(cutlass.Int64, 2, alignment=16, space=cutlass.AddressSpace.smem)
     READ_TILE_ARRIVERS_TOTAL = CFG.READ_TILE_ARRIVERS
 
     if warp_idx == 0:
@@ -642,7 +644,11 @@ def _kernel(
             for p in cutlass.range_constexpr(2):
                 nvvm.mbarrier_init(
                     mb_sf_reuse.subview(p),
-                    CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS,
+                    CFG.SOFTMAX_WG_WARPS,
+                )
+                nvvm.mbarrier_init(
+                    mb_qk_sf_reuse.subview(p),
+                    CFG.SOFTMAX_WG_WARPS,
                 )
             bars.mb_empty_mainloop.init()
             bars.mb_tmem_dealloc.init()
@@ -719,6 +725,7 @@ def _kernel(
                 amax_o_tensor=amax_o_tensor,
                 softmax_exchange=softmax_exchange,
                 mb_sf_reuse=mb_sf_reuse,
+                mb_qk_sf_reuse=mb_qk_sf_reuse,
             )
         else:
             _softmax_warp_group(
@@ -769,6 +776,7 @@ def _kernel(
             amax_o_tensor=amax_o_tensor,
             softmax_exchange=softmax_exchange,
             mb_sf_reuse=mb_sf_reuse,
+            mb_qk_sf_reuse=mb_qk_sf_reuse,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -797,6 +805,7 @@ def _kernel(
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
                     mb_sf_reuse=mb_sf_reuse,
+                    mb_qk_sf_reuse=mb_qk_sf_reuse,
                 )
             else:
                 _mma_warp_quiet(tmem_ptr_i32, bars)
@@ -823,6 +832,7 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
                 mb_sf_reuse=mb_sf_reuse,
+                mb_qk_sf_reuse=mb_qk_sf_reuse,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -1289,6 +1299,7 @@ def _mma_warp_group(
     mcast_mask,
     cta_in_pair,
     mb_sf_reuse,
+    mb_qk_sf_reuse,
 ):
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
@@ -1430,6 +1441,7 @@ def _mma_warp_group(
     kv_state_V = PipelineState.start(phase=0)
     bmm2_ready_phase_pair = cutlass.Int32(0)
     sf_reuse_phase_pair = cutlass.Int32(0)
+    qk_sf_reuse_phase_pair = cutlass.Int32(0)
     empty_mainloop_phase = cutlass.Int32(0)
 
     is_valid_tile = cutlass.Int32(1)
@@ -1506,12 +1518,17 @@ def _mma_warp_group(
                 )
                 bmm2_ready_phase_cur = (bmm2_ready_phase_pair >> parity_cur_rt) & cutlass.Int32(1)
                 sf_reuse_phase_cur = (sf_reuse_phase_pair >> parity_cur_rt) & cutlass.Int32(1)
+                qk_sf_reuse_phase_cur = (qk_sf_reuse_phase_pair >> parity_cur_rt) & cutlass.Int32(1)
 
                 bars.mb_k_full[kv_state_K.idx].wait(kv_state_K.phase)
                 desc_K = sK[kv_state_K.idx].desc()
                 desc_K_SF = sK_SF[kv_state_K.idx].desc()
-                wait(mb_sf_reuse.subview(parity_cur_rt), sf_reuse_phase_cur)
-                sf_reuse_phase_pair = sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
+                if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                    wait(mb_qk_sf_reuse.subview(parity_cur_rt), qk_sf_reuse_phase_cur)
+                    qk_sf_reuse_phase_pair = qk_sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
+                else:
+                    wait(mb_sf_reuse.subview(parity_cur_rt), sf_reuse_phase_cur)
+                    sf_reuse_phase_pair = sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
                 tmem_SF_Q = tmem_raw.subview(tmem_S_acc_cur_addr + cutlass.Int32(LAYOUT.SF_HEAD_OFFSET))
                 tmem_SF_K = tmem_raw.subview(tmem_S_acc_cur_addr + cutlass.Int32(LAYOUT.SF_HEAD_OFFSET + SF_TMEM_COLS_Q))
                 if nvvm.elect_sync():
@@ -1529,6 +1546,9 @@ def _mma_warp_group(
                 _consumer_arrive_k_empty(bars, kv_state_K, mcast_mask)
                 kv_state_K = advance(kv_state_K, CFG.STAGES_KV)
 
+                if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                    wait(mb_sf_reuse.subview(parity_cur_rt), sf_reuse_phase_cur)
+                    sf_reuse_phase_pair = sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
                 tmem_SF_P = tmem_raw.subview(tmem_S_acc_cur_addr + cutlass.Int32(LAYOUT.SF_AFTER_P_OFFSET))
                 tmem_SF_V = tmem_raw.subview(tmem_S_acc_cur_addr + cutlass.Int32(LAYOUT.SF_AFTER_P_OFFSET + SF_TMEM_COLS_P))
                 if cutlass.const_expr(CFG.MASK_FLAGS != 0):
@@ -1614,6 +1634,7 @@ def _mma_warp_group(
             )
             bmm2_ready_phase_last = (bmm2_ready_phase_pair >> parity_last_rt) & cutlass.Int32(1)
             sf_reuse_phase_last = (sf_reuse_phase_pair >> parity_last_rt) & cutlass.Int32(1)
+            qk_sf_reuse_phase_last = (qk_sf_reuse_phase_pair >> parity_last_rt) & cutlass.Int32(1)
 
             tmem_S_acc_last_addr = cutlass.Int32(
                 arith.select(
@@ -1624,6 +1645,9 @@ def _mma_warp_group(
             )
             tmem_SF_P = tmem_raw.subview(tmem_S_acc_last_addr + cutlass.Int32(LAYOUT.SF_AFTER_P_OFFSET))
             tmem_SF_V = tmem_raw.subview(tmem_S_acc_last_addr + cutlass.Int32(LAYOUT.SF_AFTER_P_OFFSET + SF_TMEM_COLS_P))
+            if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                wait(mb_qk_sf_reuse.subview(parity_last_rt), qk_sf_reuse_phase_last)
+                qk_sf_reuse_phase_pair = qk_sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_last_rt)
             if cutlass.const_expr(CFG.MASK_FLAGS != 0):
                 wait(mb_sf_reuse.subview(parity_last_rt), sf_reuse_phase_last)
                 sf_reuse_phase_pair = sf_reuse_phase_pair ^ (cutlass.Int32(1) << parity_last_rt)
@@ -1870,8 +1894,9 @@ def _softmax_warp_group(
                     reg_S_half = reg_S_half * scale_log2
                     cute.arch.inline_ptx('.pragma "reset knob SchedResBusyXU64=1";')
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                if nvvm.elect_sync():
-                    nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
+                if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 1 or softmax_half == 0):
+                    if nvvm.elect_sync():
+                        nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
                 nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
                 if cutlass.const_expr(softmax_half == 1):
                     exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
@@ -1959,8 +1984,9 @@ def _softmax_warp_group(
                     nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK) for c in range(N_CHUNKS)
                 ]
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                if nvvm.elect_sync():
-                    nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
+                if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 1 or softmax_half == 0):
+                    if nvvm.elect_sync():
+                        nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
                 if cutlass.const_expr(bottom_right_diagonal):
                     mask_bottom_right = 0
                     causal_diag = None
@@ -2077,8 +2103,9 @@ def _softmax_warp_group(
                     for c in range(CFG.TILE_N // unmasked_chunk)
                 ]
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                if nvvm.elect_sync():
-                    nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
+                if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 1 or softmax_half == 0):
+                    if nvvm.elect_sync():
+                        nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
                 reg_S_vec = vec_concat(raw_chunks)
                 max_lo = row_max_reduction(reg_S_vec[0:64])
                 max_hi = row_max_reduction(reg_S_vec[64:128])
@@ -2183,8 +2210,9 @@ def _softmax_warp_group(
                         nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK) for c in range(N_CHUNKS)
                     ]
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    if nvvm.elect_sync():
-                        nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
+                    if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 1 or softmax_half == 0):
+                        if nvvm.elect_sync():
+                            nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
                     if cutlass.const_expr(bottom_right_diagonal):
                         mask_bottom_right = 0
                         causal_diag = None
@@ -2334,6 +2362,7 @@ def _correction_warp_group(
     amax_o_tensor,
     softmax_exchange,
     mb_sf_reuse,
+    mb_qk_sf_reuse,
 ):
     if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
         nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
@@ -2394,7 +2423,7 @@ def _correction_warp_group(
         p_cols_per_chunk,
         p_cols_per_subchunk,
         bars_arg,
-        mb_sf_reuse_arg,
+        mb_qk_sf_reuse_arg,
         tmem_base_arg,
         exchange_arg,
         tid_in_wg_arg,
@@ -2432,8 +2461,7 @@ def _correction_warp_group(
         )
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         if nvvm.elect_sync():
-            nvvm.mbarrier_arrive(mb_sf_reuse_arg.subview(parity_cur_rt))
-
+            nvvm.mbarrier_arrive(mb_qk_sf_reuse_arg.subview(parity_cur_rt))
         if cutlass.const_expr(masked):
             kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
             raw_hi = apply_mask_chunk(
@@ -2542,7 +2570,7 @@ def _correction_warp_group(
                     P_COLS_PER_CHUNK,
                     P_COLS_PER_SUBCHUNK,
                     bars,
-                    mb_sf_reuse,
+                    mb_qk_sf_reuse,
                     tmem_base_corr,
                     softmax_exchange,
                     tid_in_wg,
@@ -2569,7 +2597,7 @@ def _correction_warp_group(
                         P_COLS_PER_CHUNK,
                         P_COLS_PER_SUBCHUNK,
                         bars,
-                        mb_sf_reuse,
+                        mb_qk_sf_reuse,
                         tmem_base_corr,
                         softmax_exchange,
                         tid_in_wg,
