@@ -74,8 +74,8 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    # Kernel flavors are row DATA: Rubin has no d192 sibling.
-    assert sm100.d_shapes == frozenset({(128, 128), (192, 128)})
+    # Kernel flavors are row DATA: Rubin has no d192 or d256 sibling.
+    assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (256, 256)})
     assert sm107.d_shapes == frozenset({(128, 128)})
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
@@ -321,7 +321,9 @@ def test_fp8_envelope_mismatch_rules():
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
     # The d192xd128 flavor serves its envelope too (kernel takes d_qk/d_v).
     assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=96)) is None
-    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=160))
+    # D256xD256 extends that envelope in both dimensions.
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=160, d_v=160)) is None
+    assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
     assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None

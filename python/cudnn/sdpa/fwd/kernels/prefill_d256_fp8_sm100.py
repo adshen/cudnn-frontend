@@ -2336,10 +2336,12 @@ def _host(
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
+    o_desc_words: cute.Tensor,
     problem_size: Tuple[int, int, int, int, int, int],
     bottom_right_diagonal: cutlass.Constexpr[bool],
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
+    n_thd_units: cutlass.Int32,
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
@@ -2521,6 +2523,12 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
+    fake_o_desc = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64,
+        (1,),
+        stride_order=(0,),
+        assumed_align=16,
+    )
 
     def _fake_scale():
         return cute.runtime.make_fake_compact_tensor(
@@ -2539,6 +2547,7 @@ def compile(  # noqa: A001
         fake_lse,
         fake_sinks,
         fake_seq_kv_lens,
+        fake_o_desc,
         (b, qh, kh, sq, skv, 0),
         bool(
             CFG.MASK_FLAGS == MASK_CAUSAL
@@ -2548,6 +2557,7 @@ def compile(  # noqa: A001
         ),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
+        cutlass.Int32(0),
         _fake_scale(),
         _fake_scale(),
         _fake_scale(),
