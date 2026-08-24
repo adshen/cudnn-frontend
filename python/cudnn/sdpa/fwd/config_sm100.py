@@ -90,8 +90,8 @@ class TemplateParams:
     # Compile-time LPT head/batch grouping. Keep 1 unless the selected kernel
     # and concrete graph shape opt into a divisor of B*Hq.
     lpt_head_group: int = 1
-    # Dense D192 FP8 may specialize the reverse-row LPT decoder to its exact
-    # number of query tiles. Zero keeps the existing runtime derivation.
+    # Dense FP8 kernels may specialize scheduler selection/decoding to the
+    # graph's compile-time number of query tiles. Zero keeps runtime derivation.
     lpt_q_tiles: int = 0
     thd_varlen: bool = False
     # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
@@ -408,6 +408,13 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
             and not params.bottom_right
         )
     )
+    pt_lpt_l2 = (
+        not mxfp8
+        and mask_flags == MASK_CAUSAL
+        and not params.bottom_right
+        and params.lpt_q_tiles >= 16
+    )
+    mx_causal_role_swap = mxfp8 and mask_flags == MASK_CAUSAL and not params.bottom_right
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
     cfg = CfgD256(
@@ -439,7 +446,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
                     params.dtype_qkv == DTYPE_E5M2
                     or (params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right)
                 )
-                else 224
+                else 216
                 if not mxfp8
                 and split_p
                 and params.dtype_qkv == DTYPE_E4M3
@@ -449,7 +456,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
             )
         ),
         SOFTMAX_WG1_REGS=(
-            160
+            168
             if split_p
             and not mxfp8
             and params.dtype_qkv == DTYPE_E4M3
@@ -488,18 +495,27 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         TOTAL_WARPS=16 if split_p else 12,
         THREADS_PER_CTA=(16 if split_p else 12) * 32,
         SOFTMAX_WG1_BASE=4 if split_p else 64,
-        CORR_WARP_BASE=8 if split_p else 4,
-        MMA_WARP_ID=12 if split_p else 8,
-        TMALDG_WARP_ID=13 if split_p else 9,
-        TMASTG_WARP_ID=14 if split_p else 10,
-        SCHED_WARP_ID=15 if split_p else 11,
+        CORR_WARP_BASE=8 if split_p or mx_causal_role_swap else 4,
+        MMA_WARP_ID=4 if mx_causal_role_swap else 12 if split_p else 8,
+        TMALDG_WARP_ID=5 if mx_causal_role_swap else 13 if split_p else 9,
+        TMASTG_WARP_ID=6 if mx_causal_role_swap else 14 if split_p else 10,
+        SCHED_WARP_ID=7 if mx_causal_role_swap else 15 if split_p else 11,
         READ_TILE_ARRIVERS=15 if split_p else 11 if fp8 else 21,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
-        SCHEDULER_POLICY=(SCHED_NATURAL if mask_flags == MASK_NONE else SCHED_LPT) if fp8 else params.sched_policy,
+        SCHEDULER_POLICY=(
+            SCHED_NATURAL
+            if mask_flags == MASK_NONE
+            else params.sched_policy
+            if pt_lpt_l2
+            else SCHED_LPT
+        )
+        if fp8
+        else params.sched_policy,
+        L2_SIZE_MIB=32 if pt_lpt_l2 else 60,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),

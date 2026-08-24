@@ -950,6 +950,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         lpt_q_tiles = 0
         if self._fp8 and self.flavor == (192, 128) and not self.thd:
             lpt_q_tiles = (self.s_q_max + 511) // 512
+        elif self._fp8 and self._pertensor and self.flavor == (256, 256) and not self.thd:
+            lpt_q_tiles = (self.s_q_max + 255) // 256
         template_window_right = self.window_right
         if (
             self._fp8
