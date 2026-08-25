@@ -61,15 +61,6 @@ analysis:check-CUDNN_FRONTEND_SKIP_JSON_LIB:
     extends:
         - .analysis_job_template
 
-analysis:clang-format:
-    stage: analysis
-    rules:
-        - !reference [.rules:mr_auto_allow_failure, rules]
-    script:
-        - ci/stages/analysis/run_style_check_diff.sh
-    extends:
-        - .analysis_job_template
-
 analysis:guardwords_scan:
     needs: []
     stage: analysis
