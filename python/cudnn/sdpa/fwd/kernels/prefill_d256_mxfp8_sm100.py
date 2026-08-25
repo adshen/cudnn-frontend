@@ -425,7 +425,11 @@ def _exp2_chunk0a_mixed(vec, apply_mask, dense=False, softmax_half=0):
             y = cute.math.exp2(vec[i + 1], fastmath=True)
         elif _E5_STYLE_SOFTMAX and not dense:
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=1)
-        elif _E5_STYLE_SOFTMAX and dense and (i % 10 < 4 or i == 28 or (softmax_half == 1 and i == 26)):
+        elif _E5_STYLE_SOFTMAX and dense and (
+            i % 10 < 4
+            or (softmax_half == 0 and i == 26)
+            or (softmax_half == 1 and (i == 24 or i == 26 or i == 28))
+        ):
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         elif not _E5_STYLE_SOFTMAX and i % 10 < 4 and not (dense and softmax_half == 1 and i == 30):
             x, y = ex2_emulation_2(vec[i], vec[i + 1])
@@ -445,8 +449,10 @@ def _exp2_chunk1b_mixed(vec, dense=False, softmax_half=0):
         if not _E5_STYLE_SOFTMAX and not dense:
             threshold = 20 if softmax_half == 2 else 16
         elif _E5_STYLE_SOFTMAX and dense:
-            threshold = 18 if softmax_half == 0 else 24
-        if i >= threshold:
+            threshold = 18 if softmax_half == 0 else 22
+        if i >= threshold or (
+            _E5_STYLE_SOFTMAX and dense and softmax_half == 0 and (i == 12 or i == 14)
+        ):
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=1)
         else:
             x = cute.math.exp2(vec[i], fastmath=True)
@@ -1460,14 +1466,7 @@ def _mma_warp_group(
             q_full_phase = q_full_phase ^ cutlass.Int32(1)
 
             lo_parity_runtime = kv_left & cutlass.Int32(1)
-            parity_lo_is_even = lo_parity_runtime == cutlass.Int32(0)
-            tmem_S_acc_lo_addr = cutlass.Int32(
-                arith.select(
-                    parity_lo_is_even.ir_value(),
-                    cutlass.Int32(LAYOUT.S_ACC_EVEN_OFF).ir_value(),
-                    cutlass.Int32(LAYOUT.S_ACC_ODD_OFF).ir_value(),
-                )
-            )
+            tmem_S_acc_lo_addr = lo_parity_runtime << 7
 
             bars.mb_k_full[kv_state_K.idx].wait(kv_state_K.phase)
             desc_K = sK[kv_state_K.idx].desc()
@@ -1481,6 +1480,7 @@ def _mma_warp_group(
                 tmem_raw.subview(tmem_S_acc_lo_addr),
                 tmem_sf_a=tmem_SF_Q_pro,
                 tmem_sf_b=tmem_SF_K_pro,
+                elect_once=True,
             )
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[lo_parity_runtime].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1492,30 +1492,10 @@ def _mma_warp_group(
             for kv_loop in cutlass.range(kv_left, kv_right - cutlass.Int32(1), 1, unroll=1):
                 parity_cur_rt = kv_loop & cutlass.Int32(1)
                 parity_next_rt = (kv_loop + cutlass.Int32(1)) & cutlass.Int32(1)
-                cur_is_even = parity_cur_rt == cutlass.Int32(0)
-                next_is_even = parity_next_rt == cutlass.Int32(0)
-
-                tmem_S_acc_next_addr = cutlass.Int32(
-                    arith.select(
-                        next_is_even.ir_value(),
-                        cutlass.Int32(LAYOUT.S_ACC_EVEN_OFF).ir_value(),
-                        cutlass.Int32(LAYOUT.S_ACC_ODD_OFF).ir_value(),
-                    )
-                )
-                tmem_S_acc_cur_addr = cutlass.Int32(
-                    arith.select(
-                        cur_is_even.ir_value(),
-                        cutlass.Int32(LAYOUT.S_ACC_EVEN_OFF).ir_value(),
-                        cutlass.Int32(LAYOUT.S_ACC_ODD_OFF).ir_value(),
-                    )
-                )
-                tmem_P_cur_addr = cutlass.Int32(
-                    arith.select(
-                        cur_is_even.ir_value(),
-                        cutlass.Int32(LAYOUT.P_EVEN_OFF).ir_value(),
-                        cutlass.Int32(LAYOUT.P_ODD_OFF).ir_value(),
-                    )
-                )
+                parity_col_off = parity_cur_rt << 7
+                tmem_S_acc_cur_addr = parity_col_off
+                tmem_S_acc_next_addr = cutlass.Int32(LAYOUT.S_ACC_ODD_OFF) - parity_col_off
+                tmem_P_cur_addr = cutlass.Int32(LAYOUT.P_EVEN_OFF) + parity_col_off
                 bmm2_ready_phase_cur = (bmm2_ready_phase_pair >> parity_cur_rt) & cutlass.Int32(1)
                 sf_reuse_phase_cur = (sf_reuse_phase_pair >> parity_cur_rt) & cutlass.Int32(1)
                 qk_sf_reuse_phase_cur = (qk_sf_reuse_phase_pair >> parity_cur_rt) & cutlass.Int32(1)
@@ -1540,6 +1520,7 @@ def _mma_warp_group(
                     tmem_raw.subview(tmem_S_acc_next_addr),
                     tmem_sf_a=tmem_SF_Q,
                     tmem_sf_b=tmem_SF_K,
+                    elect_once=True,
                 )
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm1_done[parity_next_rt].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -1565,6 +1546,7 @@ def _mma_warp_group(
 
                 scaleC = cutlass.Boolean(kv_loop != kv_left)
                 if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+                    bmm2_issue = nvvm.elect_sync()
                     for chunk_id in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
                         bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(chunk_id)].wait(bmm2_ready_phase_cur)
                         for n_block in cutlass.range_constexpr(BMM2_LOOP_N_BLOCKS):
@@ -1580,8 +1562,13 @@ def _mma_warp_group(
                                     accum_b2,
                                     tmem_sf_a=tmem_SF_P,
                                     tmem_sf_b=tmem_SF_V.subview(n_block * SF_V_COLS_PER_NBLOCK),
+                                    issue_mma=bmm2_issue,
                                 )
-                elif cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                elif cutlass.const_expr(
+                    CFG.DTYPE_QKV == 1
+                    or (CFG.FUSED_CORR_SPLIT_P and CFG.MASK_FLAGS == MASK_NONE)
+                ):
+                    bmm2_issue_dense = nvvm.elect_sync()
                     for k in cutlass.range_constexpr(NUM_KPHASES_PV):
                         if k % k_per_chunk == 0:
                             chunk_id = k // k_per_chunk
@@ -1597,6 +1584,7 @@ def _mma_warp_group(
                                 accum_b2,
                                 tmem_sf_a=tmem_SF_P,
                                 tmem_sf_b=tmem_SF_V.subview(n_block * SF_V_COLS_PER_NBLOCK),
+                                issue_mma=bmm2_issue_dense,
                             )
                 else:
                     for n_block in cutlass.range_constexpr(BMM2_LOOP_N_BLOCKS):
@@ -1624,25 +1612,13 @@ def _mma_warp_group(
 
             kv_last = kv_right - cutlass.Int32(1)
             parity_last_rt = kv_last & cutlass.Int32(1)
-            last_is_even = parity_last_rt == cutlass.Int32(0)
-            tmem_P_last_addr = cutlass.Int32(
-                arith.select(
-                    last_is_even.ir_value(),
-                    cutlass.Int32(LAYOUT.P_EVEN_OFF).ir_value(),
-                    cutlass.Int32(LAYOUT.P_ODD_OFF).ir_value(),
-                )
-            )
+            parity_last_col_off = parity_last_rt << 7
+            tmem_P_last_addr = cutlass.Int32(LAYOUT.P_EVEN_OFF) + parity_last_col_off
             bmm2_ready_phase_last = (bmm2_ready_phase_pair >> parity_last_rt) & cutlass.Int32(1)
             sf_reuse_phase_last = (sf_reuse_phase_pair >> parity_last_rt) & cutlass.Int32(1)
             qk_sf_reuse_phase_last = (qk_sf_reuse_phase_pair >> parity_last_rt) & cutlass.Int32(1)
 
-            tmem_S_acc_last_addr = cutlass.Int32(
-                arith.select(
-                    last_is_even.ir_value(),
-                    cutlass.Int32(LAYOUT.S_ACC_EVEN_OFF).ir_value(),
-                    cutlass.Int32(LAYOUT.S_ACC_ODD_OFF).ir_value(),
-                )
-            )
+            tmem_S_acc_last_addr = parity_last_col_off
             tmem_SF_P = tmem_raw.subview(tmem_S_acc_last_addr + cutlass.Int32(LAYOUT.SF_AFTER_P_OFFSET))
             tmem_SF_V = tmem_raw.subview(tmem_S_acc_last_addr + cutlass.Int32(LAYOUT.SF_AFTER_P_OFFSET + SF_TMEM_COLS_P))
             if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
@@ -1667,6 +1643,7 @@ def _mma_warp_group(
             n_kv_eff = kv_right - kv_left
             scaleC_epi = cutlass.Boolean(n_kv_eff != cutlass.Int32(1))
             if cutlass.const_expr(CFG.MASK_FLAGS != 0):
+                bmm2_issue = nvvm.elect_sync()
                 for chunk_id in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
                     bars.mb_bmm2_ready[parity_last_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(chunk_id)].wait(bmm2_ready_phase_last)
                     for n_block in cutlass.range_constexpr(BMM2_LOOP_N_BLOCKS):
@@ -1682,8 +1659,13 @@ def _mma_warp_group(
                                 accum_b2,
                                 tmem_sf_a=tmem_SF_P,
                                 tmem_sf_b=tmem_SF_V.subview(n_block * SF_V_COLS_PER_NBLOCK),
+                                issue_mma=bmm2_issue,
                             )
-            elif cutlass.const_expr(CFG.DTYPE_QKV == 1):
+            elif cutlass.const_expr(
+                CFG.DTYPE_QKV == 1
+                or (CFG.FUSED_CORR_SPLIT_P and CFG.MASK_FLAGS == MASK_NONE)
+            ):
+                bmm2_issue_dense_epi = nvvm.elect_sync()
                 for k in cutlass.range_constexpr(NUM_KPHASES_PV):
                     if k % k_per_chunk == 0:
                         chunk_id = k // k_per_chunk
@@ -1699,6 +1681,7 @@ def _mma_warp_group(
                             accum_b2,
                             tmem_sf_a=tmem_SF_P,
                             tmem_sf_b=tmem_SF_V.subview(n_block * SF_V_COLS_PER_NBLOCK),
+                            issue_mma=bmm2_issue_dense_epi,
                         )
             else:
                 for n_block in cutlass.range_constexpr(BMM2_LOOP_N_BLOCKS):
@@ -1807,7 +1790,8 @@ def _softmax_warp_group(
         q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
         q_abs = q_row_coord + tid_in_wg
 
-        bars.mb_o_empty.wait(epilogue_state)
+        if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+            bars.mb_o_empty.wait(epilogue_state)
         if cutlass.const_expr(softmax_half == 0 and not CFG.FUSED_CORR_SPLIT_P):
             bars.mb_stat_empty.wait(stat_empty_phase)
             stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
@@ -1897,7 +1881,8 @@ def _softmax_warp_group(
                 if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 1 or softmax_half == 0):
                     if nvvm.elect_sync():
                         nvvm.mbarrier_arrive(mb_sf_reuse.subview(parity_rt))
-                nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+                if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+                    nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
                 if cutlass.const_expr(softmax_half == 1):
                     exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
                     new_total_max_safe = softmax_exchange.subview(exchange_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).load()
@@ -1908,7 +1893,10 @@ def _softmax_warp_group(
                     total_max_safe = new_total_max_safe
 
                 if cutlass.const_expr(softmax_half == 0):
-                    if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                    if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
+                        exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
+                        softmax_exchange.subview(exchange_base + tid_in_wg).store(alpha)
+                    elif cutlass.const_expr(CFG.DTYPE_QKV == 1):
                         exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
                         softmax_exchange.subview(exchange_base + tid_in_wg).store(alpha)
                     else:
@@ -2513,14 +2501,26 @@ def _correction_warp_group(
         )
 
         reg_S_half = reg_S_half * scale_log2_arg - total_max_safe
-        chunk_P_a = cute.math.exp2(reg_S_half[0:p_subchunk].vec, fastmath=True)
+        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
+            chunk_P_a = _exp2_chunk0a_mixed(
+                reg_S_half[0:p_subchunk].vec,
+                False,
+                dense=True,
+                softmax_half=1,
+            )
+        else:
+            chunk_P_a = cute.math.exp2(reg_S_half[0:p_subchunk].vec, fastmath=True)
         new_p_sum_pair = row_reduction_pair(chunk_P_a)
         nvvm.tcgen05_st(
             "32x32b",
             nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(p_cols_per_chunk), cutlass.Float32),
             chunk_P_a.to(STORAGE_DTYPE),
         )
-        chunk_P_b = _exp2_chunk1b_mixed(reg_S_half[p_subchunk:64].vec, softmax_half=2)
+        chunk_P_b = _exp2_chunk1b_mixed(
+            reg_S_half[p_subchunk:64].vec,
+            dense=CFG.MASK_FLAGS == MASK_NONE,
+            softmax_half=1 if CFG.MASK_FLAGS == MASK_NONE else 2,
+        )
         new_p_sum_pair = new_p_sum_pair + row_reduction_pair(chunk_P_b)
         nvvm.tcgen05_st(
             "32x32b",
@@ -2666,8 +2666,8 @@ def _correction_warp_group(
                         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             else:
-                bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
                 if ~all_alpha_one:
+                    bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                         o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
                         o_chunk = nvvm.tcgen05_ld(
@@ -2677,7 +2677,7 @@ def _correction_warp_group(
                         )
                         o_scaled = vec_scale_pair(o_chunk, alpha, O_CHUNK)
                         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_prev_rt)
 
             bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)

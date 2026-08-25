@@ -423,7 +423,10 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
             and not params.bottom_right
         )
     )
-    fused_corr_split_p = mxfp8 and mask_flags == MASK_CAUSAL and not params.bottom_right
+    fused_corr_split_p = mxfp8 and (
+        (mask_flags == MASK_NONE and params.dtype_qkv == DTYPE_E4M3)
+        or (mask_flags == MASK_CAUSAL and not params.bottom_right)
+    )
     pt_lpt_l2 = (
         not mxfp8
         and mask_flags == MASK_CAUSAL
@@ -454,7 +457,9 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         CORRECTION_WARPS=0 if fused_corr_split_p else 4,
         FUSED_CORR_SPLIT_P=1 if fused_corr_split_p else 0,
         SOFTMAX_REGS=(
-            256
+            248
+            if fused_corr_split_p
+            else 256
             if mxfp8 and split_p and params.dtype_qkv == DTYPE_E5M2
             else (
                 248
@@ -507,7 +512,11 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
                         and not params.bottom_right
                         else 64
                         if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
-                        else 104 if not mxfp8 and fp8 and mask_flags != MASK_NONE else 96
+                        else 104
+                        if not mxfp8 and fp8 and mask_flags != MASK_NONE
+                        else 88
+                        if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_NONE
+                        else 96
                     )
                 )
             )
@@ -516,11 +525,11 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         THREADS_PER_CTA=(12 if fused_corr_split_p else 16 if split_p else 12) * 32,
         SOFTMAX_WG1_BASE=4 if fused_corr_split_p or split_p else 64,
         CORR_WARP_BASE=64 if fused_corr_split_p else 8 if split_p or mx_causal_role_swap else 4,
-        MMA_WARP_ID=4 if mx_causal_role_swap and not fused_corr_split_p else 12 if split_p else 8,
-        TMALDG_WARP_ID=5 if mx_causal_role_swap and not fused_corr_split_p else 13 if split_p else 9,
-        TMASTG_WARP_ID=6 if mx_causal_role_swap and not fused_corr_split_p else 14 if split_p else 10,
-        SCHED_WARP_ID=7 if mx_causal_role_swap and not fused_corr_split_p else 15 if split_p else 11,
-        READ_TILE_ARRIVERS=15 if split_p else 11 if fp8 else 21,
+        MMA_WARP_ID=8 if fused_corr_split_p else 4 if mx_causal_role_swap else 12 if split_p else 8,
+        TMALDG_WARP_ID=9 if fused_corr_split_p else 5 if mx_causal_role_swap else 13 if split_p else 9,
+        TMASTG_WARP_ID=10 if fused_corr_split_p else 6 if mx_causal_role_swap else 14 if split_p else 10,
+        SCHED_WARP_ID=11 if fused_corr_split_p else 7 if mx_causal_role_swap else 15 if split_p else 11,
+        READ_TILE_ARRIVERS=11 if fused_corr_split_p else 15 if split_p else 11 if fp8 else 21,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
