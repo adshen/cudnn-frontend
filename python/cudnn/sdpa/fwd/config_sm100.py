@@ -423,10 +423,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
             and not params.bottom_right
         )
     )
-    fused_corr_split_p = mxfp8 and (
-        (mask_flags == MASK_NONE and params.dtype_qkv == DTYPE_E4M3)
-        or (mask_flags == MASK_CAUSAL and not params.bottom_right)
-    )
+    fused_corr_split_p = mxfp8 and mask_flags == MASK_CAUSAL and not params.bottom_right
     pt_lpt_l2 = (
         not mxfp8
         and mask_flags == MASK_CAUSAL
@@ -460,14 +457,14 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
             248
             if fused_corr_split_p
             else 256
-            if mxfp8 and split_p and params.dtype_qkv == DTYPE_E5M2
+            if mxfp8 and split_p and mask_flags == MASK_NONE
             else (
                 248
                 if mxfp8
                 and mask_flags != MASK_NONE
                 and (
                     params.dtype_qkv == DTYPE_E5M2
-                    or (params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right)
+                    or (params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL)
                 )
                 else 216
                 if not mxfp8
@@ -488,12 +485,12 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
             else 216
             if fused_corr_split_p
             else 144
-            if mxfp8 and split_p and params.dtype_qkv == DTYPE_E5M2
+            if mxfp8 and split_p and mask_flags == MASK_NONE
             else 136 if split_p else 40
         ),
         CORRECTION_REGS=(
             72
-            if mxfp8 and split_p and params.dtype_qkv == DTYPE_E5M2
+            if mxfp8 and split_p and mask_flags == MASK_NONE
             else (
                 64
                 if mxfp8 and mask_flags != MASK_NONE

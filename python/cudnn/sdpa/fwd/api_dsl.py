@@ -1063,6 +1063,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         elif self._fp8 and self._pertensor and self.flavor == (256, 256) and not self.thd:
             lpt_q_tiles = (self.s_q_max + 255) // 256
         template_window_right = self.window_right
+        template_bottom_right = self.causal_bottom_right
+        if (
+            self._fp8
+            and self._pertensor
+            and self.flavor == (256, 256)
+            and template_bottom_right
+            and self.s_q_max == self.s_k_max
+            and self.window_left is None
+            and self.window_right == 0
+            and not self.seq_kv_lens_present
+            and not self.seq_q_lens_present
+            and not self.thd
+        ):
+            # With equal dense sequence lengths, the bottom-right causal
+            # diagonal has zero offset and is identical to top-left causal.
+            template_bottom_right = False
         if (
             self._fp8
             and self._pertensor
@@ -1082,7 +1098,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
             window_right=template_window_right,
-            bottom_right=self.causal_bottom_right,
+            bottom_right=template_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,

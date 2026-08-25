@@ -234,7 +234,7 @@ class KernelTmemLayout:
 LAYOUT = KernelTmemLayout()
 SCHED_PAYLOAD_WORDS = 12 if CFG.MASK_FLAGS != 0 else 8
 _E5_STYLE_KV_PIPELINE = CFG.DTYPE_QKV == 1 or (
-    CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0
+    CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS in (MASK_NONE, MASK_CAUSAL)
 )
 
 
@@ -1564,10 +1564,7 @@ def _mma_warp_group(
                                     tmem_sf_b=tmem_SF_V.subview(n_block * SF_V_COLS_PER_NBLOCK),
                                     issue_mma=bmm2_issue,
                                 )
-                elif cutlass.const_expr(
-                    CFG.DTYPE_QKV == 1
-                    or (CFG.FUSED_CORR_SPLIT_P and CFG.MASK_FLAGS == MASK_NONE)
-                ):
+                elif cutlass.const_expr(_E5_STYLE_KV_PIPELINE):
                     bmm2_issue_dense = nvvm.elect_sync()
                     for k in cutlass.range_constexpr(NUM_KPHASES_PV):
                         if k % k_per_chunk == 0:
@@ -1661,10 +1658,7 @@ def _mma_warp_group(
                                 tmem_sf_b=tmem_SF_V.subview(n_block * SF_V_COLS_PER_NBLOCK),
                                 issue_mma=bmm2_issue,
                             )
-            elif cutlass.const_expr(
-                CFG.DTYPE_QKV == 1
-                or (CFG.FUSED_CORR_SPLIT_P and CFG.MASK_FLAGS == MASK_NONE)
-            ):
+            elif cutlass.const_expr(_E5_STYLE_KV_PIPELINE):
                 bmm2_issue_dense_epi = nvvm.elect_sync()
                 for k in cutlass.range_constexpr(NUM_KPHASES_PV):
                     if k % k_per_chunk == 0:
@@ -1823,7 +1817,7 @@ def _softmax_warp_group(
                 stats_addr = tmem_base + s_off_rt
 
                 if cutlass.const_expr(softmax_half == 0):
-                    if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                    if cutlass.const_expr(_E5_STYLE_KV_PIPELINE):
                         raw_hi = nvvm.tcgen05_ld(
                             "32x32b",
                             nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(CHUNK), cutlass.Float32),
@@ -1845,7 +1839,7 @@ def _softmax_warp_group(
                             for c in range(N_CHUNKS)
                         ]
                     reg_S_full = RegTile(vec_concat(raw_chunks), size=CFG.TILE_N)
-                    if cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                    if cutlass.const_expr(_E5_STYLE_KV_PIPELINE):
                         max_hi = row_max_reduction(reg_S_full[CHUNK : 2 * CHUNK].vec)
                         max_lo = row_max_reduction(reg_S_full[0:CHUNK].vec)
                         current_max_unscaled = cute.math.max(max_lo, max_hi, ftz=True)
@@ -1896,7 +1890,7 @@ def _softmax_warp_group(
                     if cutlass.const_expr(CFG.FUSED_CORR_SPLIT_P):
                         exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
                         softmax_exchange.subview(exchange_base + tid_in_wg).store(alpha)
-                    elif cutlass.const_expr(CFG.DTYPE_QKV == 1):
+                    elif cutlass.const_expr(_E5_STYLE_KV_PIPELINE):
                         exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
                         softmax_exchange.subview(exchange_base + tid_in_wg).store(alpha)
                     else:
