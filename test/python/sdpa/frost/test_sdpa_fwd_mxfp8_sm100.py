@@ -86,7 +86,8 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
         lim = i + (s_kv - s_q) if bottom_right else i
         masked = masked | (j > lim)
     if swa_window is not None:
-        masked = masked | (j < i - swa_window)
+        swa_base = i + (s_kv - s_q) if bottom_right else i
+        masked = masked | (j < swa_base - swa_window)
     if seq_lens_kv is not None:
         # Per-batch KV padding: columns j >= seq_len_kv[b] are padding -> masked.
         slk = torch.as_tensor(seq_lens_kv, device=dev, dtype=torch.long).view(b, 1, 1, 1)
@@ -541,7 +542,23 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     return data_d, dq_d.reshape(1, h, s, d), swz_d.view(torch.uint8).reshape(h, n_tiles, -1)
 
 
-def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causal=False, sink=None, stats=False, cu_lens=False, d=128):
+def _run_thd(
+    seq_lens_q,
+    seq_lens_kv,
+    H_q,
+    H_kv,
+    in_key,
+    out_dt,
+    *,
+    scale,
+    causal=False,
+    bottom_right=False,
+    swa_window=None,
+    sink=None,
+    stats=False,
+    cu_lens=False,
+    d=128,
+):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
     (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF."""
     import cudnn
@@ -665,8 +682,12 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
         kw.update(cu_seq_len_q=sq_h, cu_seq_len_kv=skv_h)
     else:
         kw.update(seq_len_q=sq_h, seq_len_kv=skv_h)
-    if causal:
+    if bottom_right:
+        kw["use_causal_mask_bottom_right"] = True
+    elif causal:
         kw["use_causal_mask"] = True
+    if swa_window is not None:
+        kw["diagonal_band_left_bound"] = swa_window + 1
     vp = {
         tq: q_gpu,
         tk: k_gpu,
@@ -720,7 +741,11 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
         qd = q8_seqs[b].float() * dq_seqs[b]
         kd = k8_seqs[b].float() * dk_seqs[b]
         vd = v8_seqs[b].float() * dv_seqs[b]
-        ref_kw = dict(is_causal=True) if causal else {}
+        ref_kw = dict(
+            is_causal=causal or bottom_right,
+            bottom_right=bottom_right,
+            swa_window=swa_window,
+        )
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
         ob = _ref(qd, kd, vd, scale=scale, **ref_kw)
@@ -763,6 +788,35 @@ def test_mxfp8_d256_thd(in_key, causal):
     )
     _check(o_out, o_ref, torch.float16, in_key, d_qk=256)
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("bottom_right", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_sliding_window(d, in_key, bottom_right):
+    """MXFP8 THD sliding window uses each sequence's local causal diagonal."""
+    q_lens = [173, 97] if bottom_right else [257, 193]
+    kv_lens = [257, 193] if bottom_right else q_lens
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, amax, lse = _run_thd(
+        q_lens,
+        kv_lens,
+        8,
+        2,
+        in_key,
+        torch.float16,
+        scale=scale,
+        causal=not bottom_right,
+        bottom_right=bottom_right,
+        swa_window=73,
+        stats=True,
+        d=d,
+    )
+    _check(o_out, o_ref, torch.float16, in_key, d_qk=d)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert lse is not None and torch.isfinite(lse).all()
 
 
 @pytest.mark.L0
