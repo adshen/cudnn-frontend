@@ -504,7 +504,7 @@ def test_fp8_stats_less_zero_workspace(in_key):
     _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
-def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False, sink=None, stats=False, cu_lens=False):
+def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False, sink=None, stats=False, cu_lens=False, d=128):
     """THD/varlen: packed [T,H,D] Q/K/V/O + per-operand ragged_offset + per-batch
     lengths (or their cu prefix-sum form).
 
@@ -516,7 +516,7 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, *, scale, causal=False,
     import cudnn
 
     dev = "cuda"
-    D = 128
+    D = d
     B = len(seq_lens_q)
     S_max_q, S_max_kv = max(seq_lens_q), max(seq_lens_kv)
     T_q, T_kv = sum(seq_lens_q), sum(seq_lens_kv)
@@ -704,55 +704,80 @@ def test_fp8_thd(in_key, causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
-def test_fp8_thd_cross_gqa():
+def test_fp8_d256_thd(in_key, causal):
+    """D256 THD/varlen uses the same packed contract as the D128 sibling."""
+    scale = 1.0 / math.sqrt(256)
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd(
+        [160, 96],
+        [160, 96],
+        8,
+        8,
+        in_key,
+        scale=scale,
+        causal=causal,
+        d=256,
+    )
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@torch_fork_set_rng(seed=0)
+def test_fp8_thd_cross_gqa(d):
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
-    scale = 1.0 / math.sqrt(128)
-    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", scale=scale)
+    scale = 1.0 / math.sqrt(d)
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", scale=scale, d=d)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_fp8_thd_sink():
+def test_fp8_thd_sink(d):
     """THD causal + attention sink."""
-    scale = 1.0 / math.sqrt(128)
+    scale = 1.0 / math.sqrt(d)
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
-    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", scale=scale, causal=True, sink=sink)
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", scale=scale, causal=True, sink=sink, d=d)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_fp8_thd_stats():
+def test_fp8_thd_stats(d):
     """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
-    scale = 1.0 / math.sqrt(128)
-    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", scale=scale, causal=True, stats=True)
+    scale = 1.0 / math.sqrt(d)
+    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", scale=scale, causal=True, stats=True, d=d)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
     torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_fp8_thd_zero_len_kv():
+def test_fp8_thd_zero_len_kv(d):
     """Zero-length Q and KV sequences (test_mhas_v2 ragged parity, e.g.
     seq_len_q=[126, 0, 60] / seq_len_kv=[0, 83, 77]): the zero-KV sequence's
     rows are dead — the epilogue must come back O := 0 / LSE := -inf, not the
     unwritten O TMEM (garbage survives `* inv_sum(=0)` when it is NaN)."""
-    scale = 1.0 / math.sqrt(128)
-    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([126, 40, 60], [0, 83, 77], 8, 8, "e4m3", scale=scale, stats=True)
+    scale = 1.0 / math.sqrt(d)
+    out, o_ref, a_o, a_o_ref, lse, lse_ref = _run_thd([126, 40, 60], [0, 83, 77], 8, 8, "e4m3", scale=scale, stats=True, d=d)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
     torch.testing.assert_close(lse, lse_ref, atol=2e-2, rtol=2e-2, equal_nan=False)
-    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e5m2", scale=scale)
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e5m2", scale=scale, d=d)
     _check(out, o_ref, torch.float16, "e5m2", a_o, a_o_ref)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_fp8_thd_cu_seq_len():
+def test_fp8_thd_cu_seq_len(d):
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""
-    scale = 1.0 / math.sqrt(128)
-    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", scale=scale, cu_lens=True)
+    scale = 1.0 / math.sqrt(d)
+    out, o_ref, a_o, a_o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", scale=scale, cu_lens=True, d=d)
     _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 

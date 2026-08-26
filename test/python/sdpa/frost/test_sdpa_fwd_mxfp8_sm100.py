@@ -525,17 +525,29 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     data_d, dq_d, swz_d, data_s, dq_s, swz_s = quantize_to_mxfp8(t_1hsd, 1, h, s, d, _BLOCK, fp8, with_ref=True)
     n_tiles = _cdiv(s, 128)
     if columnwise:
-        return data_s, dq_s.reshape(1, h, s, d), swz_s.view(torch.uint8).reshape(h, n_tiles, -1)
+        # Columnwise F8_128x4 is plane-major for D > 128. THD's packed
+        # contract keeps every sequence tile contiguous, so transpose
+        # [D/128, H, tile, 512] into [H, tile, D/128, 512] before sequences
+        # are concatenated in cu_seqlens order.
+        planes = d // 128
+        sf = (
+            swz_s.view(torch.uint8)
+            .reshape(planes, h, n_tiles, 512)
+            .permute(1, 2, 0, 3)
+            .contiguous()
+            .reshape(h, n_tiles, -1)
+        )
+        return data_s, dq_s.reshape(1, h, s, d), sf
     return data_d, dq_d.reshape(1, h, s, d), swz_d.view(torch.uint8).reshape(h, n_tiles, -1)
 
 
-def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causal=False, sink=None, stats=False, cu_lens=False):
+def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causal=False, sink=None, stats=False, cu_lens=False, d=128):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
     (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF."""
     import cudnn
 
     dev = "cuda"
-    D = 128
+    D = d
     fp8 = _FP8[in_key]
     B = len(seq_lens_q)
     S_max_q, S_max_kv = max(seq_lens_q), max(seq_lens_kv)
@@ -732,49 +744,76 @@ def test_mxfp8_thd(in_key, causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_cross_gqa():
+def test_mxfp8_d256_thd(in_key, causal):
+    """D256 MXFP8 THD uses packed per-sequence SF tiles."""
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, _ = _run_thd(
+        [160, 96],
+        [160, 96],
+        8,
+        8,
+        in_key,
+        torch.float16,
+        scale=scale,
+        causal=causal,
+        d=256,
+    )
+    _check(o_out, o_ref, torch.float16, in_key, d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_cross_gqa(d):
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
-    scale = 1.0 / math.sqrt(128)
-    o_out, o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", torch.float16, scale=scale)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", torch.float16, scale=scale, d=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_sink():
+def test_mxfp8_thd_sink(d):
     """THD causal + attention sink."""
-    scale = 1.0 / math.sqrt(128)
+    scale = 1.0 / math.sqrt(d)
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
-    o_out, o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, sink=sink)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+    o_out, o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, sink=sink, d=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_stats():
+def test_mxfp8_thd_stats(d):
     """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
-    scale = 1.0 / math.sqrt(128)
-    o_out, o_ref, _, lse = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, stats=True)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, _, lse = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, stats=True, d=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
     assert lse is not None and torch.isfinite(lse).all()
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_zero_len_kv():
+def test_mxfp8_thd_zero_len_kv(d):
     """Zero-length Q and KV sequences (test_mhas_v2 ragged parity): the
     zero-KV sequence's rows are dead — the epilogue must come back O := 0,
     not the unwritten O TMEM (garbage survives `* inv_sum(=0)` when NaN)."""
-    scale = 1.0 / math.sqrt(128)
-    o_out, o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, _, _ = _run_thd([126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale, d=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_thd_cu_seq_len():
+def test_mxfp8_thd_cu_seq_len(d):
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""
-    scale = 1.0 / math.sqrt(128)
-    o_out, o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", torch.float16, scale=scale, cu_lens=True)
-    _check(o_out, o_ref, torch.float16, "e4m3")
+    scale = 1.0 / math.sqrt(d)
+    o_out, o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", torch.float16, scale=scale, cu_lens=True, d=d)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)

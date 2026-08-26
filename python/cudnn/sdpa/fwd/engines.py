@@ -525,7 +525,7 @@ def _sm100_spec() -> EngineSpec:
 def _sm100_mxfp8_spec() -> EngineSpec:
     """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen (d128/d128 only — the d192/d128 and d256 kernels are dense-only) rides the
+    THD/varlen (exact d128/d128 and d256/d256; d192/d128 remains dense-only) rides the
     shared packed lowering (write_thd_meta envelope design, issue #552; packed
     Q/K/V/O contract only). The SF tensors travel PACKED
     per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
@@ -543,9 +543,9 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             # not audited for envelope zero-padding.
             d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             d_pad_multiple=0,
-            # Only the d128 kernel carries the write_thd_meta THD leg and
-            # wires SplitHelpers; the d192x128 file is dense-only.
-            thd_d_shapes=frozenset({(128, 128)}),
+            # D128 and D256 carry the write_thd_meta THD leg. SplitHelpers
+            # remain D128-only; D192/D128 remains dense-only.
+            thd_d_shapes=frozenset({(128, 128), (256, 256)}),
             split_d_shapes=frozenset({(128, 128)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
@@ -604,8 +604,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
     per-row softmax normalization stays well-defined — no
-    fully-masked row can poison the global amax.  THD/varlen (d128/d128 only —
-    the d192/d128 kernel is dense-only) rides the shared packed lowering
+    fully-masked row can poison the global amax. THD/varlen (exact d128/d128
+    and d256/d256 on pre-Rubin SM100; d192/d128 remains dense-only) rides the shared packed lowering
     (write_thd_meta envelope design, issue #552; packed Q/K/V/O contract
     only) — on cc10.7 (Rubin) through the SM107 sibling kernel, which carries
     the same THD leg.
@@ -623,7 +623,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             phase="prefill",
             d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (192, 128), (256, 256)}),
             d_pad_multiple=16,
-            thd_d_shapes=frozenset({(128, 128)}),
+            thd_d_shapes=frozenset({(128, 128)}) if rubin_row else frozenset({(128, 128), (256, 256)}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
