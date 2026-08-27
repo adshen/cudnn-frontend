@@ -621,9 +621,7 @@ def _kernel(
     scale_log2_fused = scale_softmax_log2
     if cutlass.const_expr(not CFG.THD_VARLEN):
         scale_log2_fused = (
-            scale_softmax_log2
-            * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
-            * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+            scale_softmax_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
         )
     o_scale_fused = o_scale_fused * cutlass.Float32(cutlass.make_array_view(descale_v_t)[0]) * cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
 
@@ -645,9 +643,7 @@ def _kernel(
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(CFG.THD_VARLEN):
             scale_log2_fused = (
-                scale_softmax_log2
-                * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
-                * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+                scale_softmax_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
             )
         _softmax_warp_group(
             softmax_half=0,
@@ -677,9 +673,7 @@ def _kernel(
         nvvm.setmaxregister(CFG.SOFTMAX_WG1_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(CFG.THD_VARLEN):
             scale_log2_fused = (
-                scale_softmax_log2
-                * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
-                * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+                scale_softmax_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
             )
         _softmax_warp_group(
             softmax_half=1,
@@ -2423,6 +2417,21 @@ def _correction_warp_group(
         bars.mb_bmm2_done[parity_last_rt].wait(bmm2_done_phase_last)
         bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_last_rt)
 
+        if cutlass.const_expr(_PADDED_TOP_LEFT_CAUSAL):
+            if bounds.right <= bounds.left:
+                zero_o = cutlass.Vector.from_elements(
+                    tuple(cutlass.Float32(0.0) for _ in range(O_CHUNK)),
+                    cutlass.Float32,
+                )
+                for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                    o_addr = tmem_base_epi + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
+                    nvvm.tcgen05_st(
+                        "32x32b",
+                        nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                        zero_o,
+                    )
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+
         O_EPI_BLK = 64 // CFG.BPE_O
         N_BLOCKS_EPI = CFG.TILE_O // O_EPI_BLK
         CHUNKS_PER_BLK = O_EPI_BLK // O_CHUNK
@@ -2443,9 +2452,11 @@ def _correction_warp_group(
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 o_scaled = o_chunk * inv_sum
                 # Empty BMM2 leaves O TMEM unwritten, and NaN * 0 does not
-                # sanitize it. Plain top-left/SWA and square bottom-right
-                # always retain the diagonal, so keep this off their hot path.
-                if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal)):
+                # sanitize it. Padded top-left clears an empty tile once above;
+                # keep per-element selects for the remaining dynamic bounds.
+                if cutlass.const_expr(
+                    not _PADDED_TOP_LEFT_CAUSAL and (CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal))
+                ):
                     zero = cutlass.Float32(0.0)
                     invalid = row_dead
                     if cutlass.const_expr(CFG.THD_VARLEN):
