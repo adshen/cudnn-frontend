@@ -193,14 +193,50 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 
-_dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
-_dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 _thd_sf_tile_bases = _sdpa_h.thd_sf_tile_bases
 
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_sm100 import (
+    build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel,
+    thd_decode_unit,
+    TENSOR_MAP_QWORDS,
+)
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
+_THD_REVERSE_CAUSAL_ROWS = (
+    CFG.THD_VARLEN
+    and CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED)
+    and CFG.BOTTOM_RIGHT == 0
+    and CFG.WINDOW_RIGHT == 0
+)
+
+
+@cute.jit
+def _thd_decode_causal(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
+    unit = linear_cta // cutlass.Int32(CFG.CGA_M)
+    q_tile, batch, head = thd_decode_unit(
+        cutlass.make_array_view(seq_kv_lens_t),
+        n_batch,
+        unit,
+        n_qh,
+        cutlass.Int32(CGA_TILE_M),
+        True,
+    )
+    return q_tile * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair, head, batch
+
+
+@cute.jit
+def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
+    if cutlass.const_expr(_THD_REVERSE_CAUSAL_ROWS):
+        return _thd_decode_causal(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+    return _sdpa_h.dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
+
+
+@cute.jit
+def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
+    if cutlass.const_expr(_THD_REVERSE_CAUSAL_ROWS):
+        return _thd_decode_causal(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+    return _sdpa_h.dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
 
 
 # Each split runs one contiguous slice of a Q tile's KV range and writes a
