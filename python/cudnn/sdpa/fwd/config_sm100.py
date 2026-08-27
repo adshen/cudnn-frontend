@@ -484,7 +484,15 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     if params.cta_mma != cga:
         raise ValueError(f"d256: {'FP8/MXFP8' if fp8 else 'BF16/FP16'} requires cta_mma={cga}; got {params.cta_mma}")
     mask_flags = _mask_flags_from(params)
-    split_p = fp8 and (mask_flags == MASK_NONE or (not mxfp8 and mask_flags == MASK_CAUSAL and not params.bottom_right))
+    pt_plain_top_left_causal = (
+        not mxfp8
+        and (mask_flags & ~MASK_PADDED) == MASK_CAUSAL
+        and not params.bottom_right
+        and not params.window_left
+        and not params.window_right
+    )
+    split_p = fp8 and (mask_flags == MASK_NONE or pt_plain_top_left_causal)
+    pt_thd_split_p = pt_plain_top_left_causal and bool(mask_flags & MASK_PADDED)
     # The fused correction/split-P schedule is the strict top-left causal fast
     # path. Right-band widening uses the generic masked schedule; forcing the
     # widened specialization through this path makes CUTLASS DSL 4.7 lowering
@@ -531,27 +539,31 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SOFTMAX_WG1_REGS=(
             168
             if split_p and not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
-            else 216 if fused_corr_split_p else 144 if mxfp8 and split_p and mask_flags == MASK_NONE else 136 if split_p else 40
+            else 216 if fused_corr_split_p else 144 if pt_thd_split_p or (mxfp8 and split_p and mask_flags == MASK_NONE) else 136 if split_p else 40
         ),
         CORRECTION_REGS=(
-            72
-            if mxfp8 and split_p and mask_flags == MASK_NONE
+            88
+            if pt_thd_split_p
             else (
-                64
-                if mxfp8 and mask_flags != MASK_NONE
+                72
+                if mxfp8 and split_p and mask_flags == MASK_NONE
                 else (
-                    112
-                    if not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right and not split_p
+                    64
+                    if mxfp8 and mask_flags != MASK_NONE
                     else (
-                        96
-                        if not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
+                        112
+                        if not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right and not split_p
                         else (
-                            64
-                            if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
+                            96
+                            if not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
                             else (
-                                104
-                                if not mxfp8 and fp8 and mask_flags != MASK_NONE
-                                else 88 if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_NONE else 96
+                                64
+                                if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
+                                else (
+                                    104
+                                    if not mxfp8 and fp8 and mask_flags != MASK_NONE
+                                    else 88 if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_NONE else 96
+                                )
                             )
                         )
                     )
