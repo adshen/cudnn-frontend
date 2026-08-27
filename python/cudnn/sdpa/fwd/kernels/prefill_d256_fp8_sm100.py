@@ -161,6 +161,7 @@ _THD_REVERSE_CAUSAL_ROWS = (
     and CFG.BOTTOM_RIGHT == 0
     and CFG.WINDOW_RIGHT == 0
 )
+_PADDED_TOP_LEFT_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.BOTTOM_RIGHT == 0 and CFG.WINDOW_RIGHT == 0
 
 
 @cute.jit
@@ -1535,6 +1536,11 @@ def _softmax_warp_group(
         )
         q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE)
         q_abs = q_row_coord + (tid_in_wg // cutlass.Int32(HEADS_PER_TILE))
+        mask_q_abs = q_abs
+        mask_flags = CFG.MASK_FLAGS
+        if cutlass.const_expr(_PADDED_TOP_LEFT_CAUSAL):
+            mask_q_abs = cute.math.min(q_abs, eff_seqlen_kv - cutlass.Int32(1))
+            mask_flags = MASK_CAUSAL
 
         if cutlass.const_expr(CFG.DTYPE_QKV != 1):
             bars.mb_o_empty.wait(epilogue_state)
@@ -1735,11 +1741,11 @@ def _softmax_warp_group(
                         chunks_S = [
                             apply_mask_chunk(
                                 raw_chunks[c],
-                                q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
+                                mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                                 cutlass.Int32(0),
                                 eff_seqlen_kv - (kv_col_base + cutlass.Int32(c * CHUNK)),
                                 CFG.WINDOW_LEFT,
-                                CFG.MASK_FLAGS,
+                                mask_flags,
                                 N=CHUNK,
                                 bottom_right=mask_bottom_right,
                                 causal_diag=causal_diag,
@@ -1773,11 +1779,11 @@ def _softmax_warp_group(
                         )
                         masked_chunk = apply_mask_chunk(
                             raw_chunk,
-                            q_abs - (kv_col_base + cutlass.Int32(CHUNK)),
+                            mask_q_abs - (kv_col_base + cutlass.Int32(CHUNK)),
                             cutlass.Int32(0),
                             eff_seqlen_kv - (kv_col_base + cutlass.Int32(CHUNK)),
                             CFG.WINDOW_LEFT,
-                            CFG.MASK_FLAGS,
+                            mask_flags,
                             N=CHUNK,
                             bottom_right=mask_bottom_right,
                             causal_diag=causal_diag,
@@ -1873,11 +1879,11 @@ def _softmax_warp_group(
                 chunks_S = [
                     apply_mask_chunk(
                         raw_chunks[c],
-                        q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
+                        mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                         cutlass.Int32(0),
                         eff_seqlen_kv - (kv_col_base + cutlass.Int32(c * CHUNK)),
                         CFG.WINDOW_LEFT,
-                        CFG.MASK_FLAGS,
+                        mask_flags,
                         N=CHUNK,
                         bottom_right=mask_bottom_right,
                         causal_diag=causal_diag,
@@ -2078,11 +2084,11 @@ def _softmax_warp_group(
                 chunks_S = [
                     apply_mask_chunk(
                         raw_chunks[c],
-                        q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
+                        mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                         cutlass.Int32(0),
                         eff_seqlen_kv - (kv_col_base + cutlass.Int32(c * CHUNK)),
                         CFG.WINDOW_LEFT,
-                        CFG.MASK_FLAGS,
+                        mask_flags,
                         N=CHUNK,
                         bottom_right=mask_bottom_right,
                         causal_diag=causal_diag,
