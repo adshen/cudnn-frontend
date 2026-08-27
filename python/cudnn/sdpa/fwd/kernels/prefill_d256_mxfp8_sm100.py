@@ -2917,31 +2917,39 @@ def _correction_warp_group(
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             for sub in cutlass.range_constexpr(CHUNKS_PER_BLK):
                 chunk_idx_total = block_idx * CHUNKS_PER_BLK + sub
-                if cutlass.const_expr(_E5_STYLE_SOFTMAX and CFG.MASK_FLAGS != 0):
-                    o_chunk = o_chunks[sub]
-                else:
-                    o_addr = tmem_base_epi + cutlass.Int32(LAYOUT.O_OFF + chunk_idx_total * O_CHUNK)
-                    o_chunk = nvvm.tcgen05_ld(
-                        "32x32b",
-                        nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                        num=O_CHUNK,
-                    )
-                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                o_scaled = o_chunk * inv_sum
-                # Empty BMM2 leaves O TMEM unwritten, and NaN * 0 does not
-                # sanitize it. Plain top-left/SWA and square bottom-right
-                # always retain the diagonal, so keep this off their hot path.
-                if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal)):
-                    zero = cutlass.Float32(0.0)
-                    invalid = row_dead
-                    if cutlass.const_expr(CFG.THD_VARLEN):
-                        invalid = invalid | (~_row_valid)
-                    o_scaled = cutlass.Vector.from_elements(
-                        tuple(cutlass.Float32(arith.select(invalid.ir_value(), zero.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
-                        cutlass.Float32,
-                    )
-                _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled), ftz=True)
-                o_out = o_scaled.to(OUT_STORAGE_DTYPE)
+                o_out = cutlass.Vector.from_elements(
+                    tuple(OUT_STORAGE_DTYPE(0.0) for _ in range(O_CHUNK)),
+                    OUT_STORAGE_DTYPE,
+                )
+                if cutlass.const_expr(not _PADDED_TOP_LEFT_CAUSAL) or (bounds.right > bounds.left):
+                    if cutlass.const_expr(_E5_STYLE_SOFTMAX and CFG.MASK_FLAGS != 0):
+                        o_chunk = o_chunks[sub]
+                    else:
+                        o_addr = tmem_base_epi + cutlass.Int32(LAYOUT.O_OFF + chunk_idx_total * O_CHUNK)
+                        o_chunk = nvvm.tcgen05_ld(
+                            "32x32b",
+                            nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                            num=O_CHUNK,
+                        )
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    o_scaled = o_chunk * inv_sum
+                    # Empty BMM2 leaves O TMEM unwritten, and NaN * 0 does not
+                    # sanitize it. Plain top-left/SWA and square bottom-right
+                    # always retain the diagonal, so keep this off their hot path.
+                    if cutlass.const_expr(
+                        not _PADDED_TOP_LEFT_CAUSAL
+                        and (CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal))
+                    ):
+                        zero = cutlass.Float32(0.0)
+                        invalid = row_dead
+                        if cutlass.const_expr(CFG.THD_VARLEN):
+                            invalid = invalid | (~_row_valid)
+                        o_scaled = cutlass.Vector.from_elements(
+                            tuple(cutlass.Float32(arith.select(invalid.ir_value(), zero.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
+                            cutlass.Float32,
+                        )
+                    _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled), ftz=True)
+                    o_out = o_scaled.to(OUT_STORAGE_DTYPE)
 
                 col_offset_const = (chunk_idx_total * O_CHUNK) % D_BLOCK_SIZE
                 block_offset_const = ((chunk_idx_total * O_CHUNK) // D_BLOCK_SIZE) * TMA_O_GRANU_ELEMS_LOCAL
