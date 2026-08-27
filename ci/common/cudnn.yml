@@ -1,4 +1,10 @@
+.cudnn_dev_version:template:
+  variables:
+    CUDNN_FETCH_BASE_URL: "https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/CUDNN/v9.27"
+    CUDNN_FETCH_CUDA_VERSION: "13.4"
+
 .fetch_cudnn_dev:template:
+  extends: .cudnn_dev_version:template
   cache:
     - key: dev_cudnn_9_27_cuda_13_4
       paths:
@@ -6,13 +12,19 @@
   before_script:
     - mkdir -p downloads
     - ls -1 downloads/
-    - python3 ci/common/fetch_cudnn.py --base-url https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/BLOSSOM/v9.27 --cuda-version 13.4 --require-artifact-prop pipeline_type=merge_request
+    - python3 ci/common/fetch_cudnn.py --base-url ${CUDNN_FETCH_BASE_URL} --cuda-version ${CUDNN_FETCH_CUDA_VERSION} --require-artifact-prop pipeline_type=schedule
     - find /debug_cudnn
     - export CUDNN_PATH=/debug_cudnn # This is required for source building FE
     - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/debug_cudnn/lib64 # This is required for dlopening BE
     - export CUDNN_VERSION_=$(ls /debug_cudnn/lib/libcudnn.so.*.*.* | sed 's/.*libcudnn\.so\.//')
 
+.cudnn_rel_version:template:
+  variables:
+    CUDNN_FETCH_BASE_URL: "https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/CUDNN/v9.26"
+    CUDNN_FETCH_CUDA_VERSION: "13.4"
+
 .fetch_cudnn_rel:template:
+  extends: .cudnn_rel_version:template
   cache:
     - key: rel_cudnn_9_26_cuda_13_4
       paths:
@@ -20,7 +32,7 @@
   before_script:
     - mkdir -p downloads
     - ls -1 downloads
-    - python3 ci/common/fetch_cudnn.py --base-url https://artifactory.nvidia.com/artifactory/hw-cudnn-generic-local/BLOSSOM/v9.26 --cuda-version 13.4 --require-artifact-prop pipeline_type=merge_train
+    - python3 ci/common/fetch_cudnn.py --base-url ${CUDNN_FETCH_BASE_URL} --cuda-version ${CUDNN_FETCH_CUDA_VERSION} --require-artifact-prop pipeline_type=schedule
     - find /debug_cudnn
     - export CUDNN_PATH=/debug_cudnn # This is required for source building FE
     - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/debug_cudnn/lib64 # This is required for dlopening BE

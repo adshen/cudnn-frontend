@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import platform
 import re
 import os
 import subprocess
@@ -12,6 +13,11 @@ import requests
 
 # <a*>x.y.w.z[-{hex}-{hex}]/</a> DD-month-YYYY HH:MM, [] is optional
 PATTERN = re.compile(r"<a.*?>v(\d+\.\d+\.\d+\.\d+(?:-[a-f0-9]+-[a-f0-9]+)?)/</a>\s+(\d{2}-[A-Za-z]+-\d{4} \d{2}:\d{2})\s")
+
+ARCH_MAPPING = {
+    "x86_64": "x86_64",
+    "aarch64": "sbsa",
+}
 
 
 def request_kwargs(url):
@@ -37,16 +43,16 @@ def _parse_artifactory_base_url(base_url):
     return api_base, repo_key, path_in_repo
 
 
-def _tarball_path(version, cuda_version):
-    """Relative path to tarball: v{version}/{cuda_version}/cudnn_debug-linux-x86_64-{version_num}.tar.gz."""
+def _tarball_path(version, cuda_version, arch):
+    """Relative path to tarball: v{version}/{cuda_version}/cudnn_debug-linux-{arch}-{version_num}.tar.gz."""
     version_num = version.split("-")[0]
-    return f"v{version}/{cuda_version}/cudnn_debug-linux-x86_64-{version_num}.tar.gz"
+    return f"v{version}/{cuda_version}/cudnn_debug-linux-{ARCH_MAPPING[arch]}-{version_num}.tar.gz"
 
 
-def get_artifact_properties(base_url, version, cuda_version, property_keys):
-    """Get Artifactory properties for the tarball at base_url/v{version}/{cuda_version}/cudnn_debug-linux-x86_64-{version}.tar.gz."""
+def get_artifact_properties(base_url, version, cuda_version, arch, property_keys):
+    """Get Artifactory properties for the tarball at base_url/v{version}/{cuda_version}/cudnn_debug-linux-{arch}-{version}.tar.gz."""
     api_base, repo_key, path_in_repo = _parse_artifactory_base_url(base_url)
-    rel = _tarball_path(version, cuda_version)
+    rel = _tarball_path(version, cuda_version, arch)
     artifact_path = f"{path_in_repo}/{rel}" if path_in_repo else rel
     url = f"{api_base}/api/storage/{repo_key}/{artifact_path}?properties={','.join(property_keys)}"
     try:
@@ -57,14 +63,14 @@ def get_artifact_properties(base_url, version, cuda_version, property_keys):
         return None
 
 
-def filter_matches_by_artifact_property(matches, base_url, cuda_version, cudnn_version, artifact_property_dict, max_count=3):
+def filter_matches_by_artifact_property(matches, base_url, cuda_version, arch, cudnn_version, artifact_property_dict, max_count=3):
     """Keep only matches for which the tarball two levels down has Artifactory properties passing predicate."""
     result = []
     for m in matches:
         if len(result) >= max_count:
             break
         if not cudnn_version or m["version_num"] == cudnn_version:
-            props = get_artifact_properties(base_url, m["version"], cuda_version, artifact_property_dict.keys())
+            props = get_artifact_properties(base_url, m["version"], cuda_version, arch, artifact_property_dict.keys())
             if not props:
                 continue
             add_match = True
@@ -77,10 +83,10 @@ def filter_matches_by_artifact_property(matches, base_url, cuda_version, cudnn_v
     return result
 
 
-def get_artifact_sha256(base_url, version, cuda_version):
+def get_artifact_sha256(base_url, version, cuda_version, arch):
     """SHA-256 of the tarball per Artifactory's storage API, or None if unavailable."""
     api_base, repo_key, path_in_repo = _parse_artifactory_base_url(base_url)
-    rel = _tarball_path(version, cuda_version)
+    rel = _tarball_path(version, cuda_version, arch)
     artifact_path = f"{path_in_repo}/{rel}" if path_in_repo else rel
     url = f"{api_base}/api/storage/{repo_key}/{artifact_path}"
     try:
@@ -114,7 +120,7 @@ def download_url(url, path):
             tmp.unlink()
 
 
-def fetch_cudnn(base_url, cuda_version, download_dir, unzip_dir, output_dir, cudnn_version=None, artifact_property_dict=None):
+def fetch_cudnn(base_url, cuda_version, arch, download_dir, unzip_dir, output_dir, cudnn_version=None, artifact_property_dict=None):
     response = requests.get(base_url, **request_kwargs(base_url), timeout=30)
     response.raise_for_status()
     response = response.text
@@ -125,7 +131,7 @@ def fetch_cudnn(base_url, cuda_version, download_dir, unzip_dir, output_dir, cud
     matches = sorted(matches, key=lambda x: (tuple(map(int, x["version_num"].split("."))), x["last_modified"]), reverse=True)
 
     if artifact_property_dict:
-        matches = filter_matches_by_artifact_property(matches, base_url, cuda_version, cudnn_version, artifact_property_dict, max_count=3)
+        matches = filter_matches_by_artifact_property(matches, base_url, cuda_version, arch, cudnn_version, artifact_property_dict, max_count=3)
         if not matches:
             raise Exception("No version had tarball with required Artifactory properties")
 
@@ -140,14 +146,14 @@ def fetch_cudnn(base_url, cuda_version, download_dir, unzip_dir, output_dir, cud
     for match in candidates:
         version_num = match["version_num"]
         tarball_path = downloads_dir / f"cudnn-{version_num}.tar.gz"
-        url = f"{base_url}/{_tarball_path(match['version'], cuda_version)}"
+        url = f"{base_url}/{_tarball_path(match['version'], cuda_version, arch)}"
 
         if tarball_path.exists():
             # A version tag can be republished with new bits, so the cached
             # tarball is only trusted when its SHA-256 matches what Artifactory
             # currently serves. On a match the multi-GB download is skipped;
             # if the checksum can't be fetched, fall back to re-downloading.
-            remote_sha256 = get_artifact_sha256(base_url, match["version"], cuda_version)
+            remote_sha256 = get_artifact_sha256(base_url, match["version"], cuda_version, arch)
             if remote_sha256 and sha256_of_file(tarball_path) == remote_sha256:
                 print(f"Cached tarball for {version_num} at {tarball_path} matches Artifactory SHA-256; skipping download")
                 break
@@ -210,6 +216,7 @@ if __name__ == "__main__":
     parser.add_argument("--unzip-dir", dest="unzip_dir", default="/", help="Directory where the tarball is extracted before moving cudnn/ into place.")
     parser.add_argument("--output-dir", dest="output_dir", default="/debug_cudnn", help="Directory where the extracted cudnn/ tree will be moved.")
     parser.add_argument("--cudnn-version", dest="cudnn_version", help="Optional cuDNN version x.y.w.z")
+    parser.add_argument("--arch", dest="arch", default=platform.machine(), choices=sorted(ARCH_MAPPING), help="Which arch's tarball to fetch. Defaults to the current machine.")
     parser.add_argument(
         "--require-artifact-prop",
         action="append",
@@ -218,9 +225,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if args.arch not in ARCH_MAPPING:
+        raise SystemExit(f"unsupported arch {args.arch!r}; pass --arch with one of {sorted(ARCH_MAPPING)}")
+
     prop_dict = None
 
     if args.require_artifact_prop:
         prop_dict = create_prop_dict(args.require_artifact_prop)
 
-    fetch_cudnn(args.base_url, args.cuda_version, args.download_dir, args.unzip_dir, args.output_dir, args.cudnn_version, artifact_property_dict=prop_dict)
+    fetch_cudnn(args.base_url, args.cuda_version, args.arch, args.download_dir, args.unzip_dir, args.output_dir, args.cudnn_version, artifact_property_dict=prop_dict)

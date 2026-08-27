@@ -13,6 +13,7 @@
 analysis:cudnn_clang_disable_exception:
     extends:
         - .analysis_job_template
+        - .cudnn_dev_version:template
     needs: []
     stage: analysis
     script:
@@ -43,6 +44,7 @@ analysis:cudnn_clang:
         - cmake --build . -j16 --verbose
     extends:
         - .analysis_job_template
+        - .cudnn_dev_version:template
 
 analysis:check-relative-includes:
     stage: analysis

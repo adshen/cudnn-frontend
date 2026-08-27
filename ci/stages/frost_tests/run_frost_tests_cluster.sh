@@ -4,8 +4,8 @@
 # tagged hecate / lyris).
 #
 # Differs from run_frost_tests.sh (docker-runner path) in three ways:
-#   1. cuDNN comes from the container, not from ci/common/fetch_cudnn.py, so
-#      there is no /debug_cudnn to put on LD_LIBRARY_PATH.
+#   1. ci/common/fetch_cudnn.py runs here rather than in a before_script,
+#      because it has to run on the compute node inside the container.
 #   2. cudnn_frontend is pip-installed from the mounted source rather than
 #      imported from build/, so PYTHONPATH is left alone.
 #   3. The results dir is a mounted host path, because the job that reads the
@@ -42,6 +42,13 @@ mkdir -p /tmp/cudnn_frontend_src
 tar -C /workspace --exclude="./${RESULTS_DIR_NAME}" --exclude=./.git -cf - . \
     | tar -C /tmp/cudnn_frontend_src -xf -
 cd /tmp/cudnn_frontend_src
+
+python3 ci/common/fetch_cudnn.py \
+    --base-url "${CUDNN_FETCH_BASE_URL:?CUDNN_FETCH_BASE_URL must be set}" \
+    --cuda-version "${CUDNN_FETCH_CUDA_VERSION:?CUDNN_FETCH_CUDA_VERSION must be set}" \
+    --require-artifact-prop pipeline_type=schedule
+export CUDNN_PATH=/debug_cudnn
+export LD_LIBRARY_PATH=/debug_cudnn/lib:${LD_LIBRARY_PATH}
 
 # --- install ----------------------------------------------------------------
 # These are devel PyTorch images, not CI images: they have no pytest.
@@ -107,7 +114,13 @@ PY
 # tvm_ffi is missing, so a lost dependency would hide as a green build.
 python -c "import tvm_ffi; print('tvm_ffi', tvm_ffi.__version__)"
 python -c 'import pytest, xdist; print("pytest:", pytest.__version__)'
-python -c 'import cudnn; print("cudnn frontend:", cudnn.__version__); print("cudnn backend:", cudnn.backend_version_string())'
+cudnn_fetched=$(ls /debug_cudnn/lib/libcudnn.so.*.*.* | sed 's/.*libcudnn\.so\.//')
+CUDNN_FETCHED="${cudnn_fetched}" python -c '
+import os, cudnn
+print("cudnn frontend:", cudnn.__version__)
+print("cudnn backend:", cudnn.backend_version_string(), "(fetched", os.environ["CUDNN_FETCHED"] + ")")
+assert os.environ["CUDNN_FETCHED"].startswith(cudnn.backend_version_string()), "loaded the image cuDNN, not the fetched one"
+'
 
 # --- test -------------------------------------------------------------------
 # The FROST engines are opt-in manifest rows (cudnn/engines/manifest.py): off by

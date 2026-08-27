@@ -192,6 +192,7 @@ frost:cutlass-dsl-4.8:gemm:sm100:
 # ==============================================================================
 .frost:cluster:template:
   stage: frost_tests
+  extends: .cudnn_dev_version:template
   needs: ["manual:frost"]
   allow_failure: true
   timeout: 2h
@@ -263,7 +264,7 @@ frost:cutlass-dsl-4.8:gemm:sm100:
           --container-image="${ENROOT_IMAGE}"
           --container-mounts="${CI_PROJECT_DIR}:/workspace"
           --container-workdir=/workspace
-          --container-env=RESULTS_DIR_NAME,EXPECTED_COMPUTE_CAP,FROST_TEST_PATHS,FROST_CUTLASS_DSL_VERSION,FROST_CUTLASS_DSL_INDEX_URL,PYTEST_WORKERS
+          --container-env=RESULTS_DIR_NAME,EXPECTED_COMPUTE_CAP,FROST_TEST_PATHS,FROST_CUTLASS_DSL_VERSION,FROST_CUTLASS_DSL_INDEX_URL,PYTEST_WORKERS,CUDNN_FETCH_BASE_URL,CUDNN_FETCH_CUDA_VERSION,ARTIFACTORY_USER,ARTIFACTORY_TOKEN
         )
         echo "srun ${srun_args[*]}"
         set +e
