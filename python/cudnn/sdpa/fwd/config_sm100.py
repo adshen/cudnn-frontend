@@ -413,7 +413,9 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
     fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
     split_p = cfg.SOFTMAX_WARPGROUPS == 2
     fused_corr_split_p = cfg.FUSED_CORR_SPLIT_P == 1
-    split_p_supported = fp8 and (cfg.MASK_FLAGS == MASK_NONE or (cfg.MASK_FLAGS == MASK_CAUSAL and cfg.BOTTOM_RIGHT == 0))
+    split_p_supported = fp8 and (
+        cfg.MASK_FLAGS == MASK_NONE or ((cfg.MASK_FLAGS & ~MASK_PADDED) == MASK_CAUSAL and cfg.BOTTOM_RIGHT == 0)
+    )
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (
@@ -455,7 +457,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     # path. Right-band widening uses the generic masked schedule; forcing the
     # widened specialization through this path makes CUTLASS DSL 4.7 lowering
     # grow pathologically without changing the supported mask semantics.
-    strict_top_left_causal = mask_flags == MASK_CAUSAL and not params.bottom_right and not params.window_right
+    strict_top_left_causal = (mask_flags & ~MASK_PADDED) == MASK_CAUSAL and not params.bottom_right and not params.window_right
     fused_corr_split_p = mxfp8 and strict_top_left_causal
     pt_lpt_l2 = not mxfp8 and mask_flags == MASK_CAUSAL and not params.bottom_right and params.lpt_q_tiles >= 16
     mx_causal_role_swap = mxfp8 and strict_top_left_causal
