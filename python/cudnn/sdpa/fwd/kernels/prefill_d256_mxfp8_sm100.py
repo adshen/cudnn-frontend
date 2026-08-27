@@ -72,6 +72,7 @@ from cudnn.frost.tile_dsl.mask import (
     apply_mask_chunk,
     MASK_NONE,
     MASK_CAUSAL,
+    MASK_PADDED,
 )
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
@@ -251,7 +252,9 @@ LAYOUT = KernelTmemLayout()
 # Slots 6:10 carry predecoded bounds and slot 10 carries the split index.  The
 # unsplit/no-mask specialization retains the original eight-word payload.
 SCHED_PAYLOAD_WORDS = 12 if (CFG.MASK_FLAGS != 0 or SPLIT_KV > 1) else 8
-_E5_STYLE_KV_PIPELINE = CFG.DTYPE_QKV == 1 or (CFG.DTYPE_QKV == 0 and CFG.MASK_FLAGS in (MASK_NONE, MASK_CAUSAL))
+_E5_STYLE_KV_PIPELINE = CFG.DTYPE_QKV == 1 or (
+    CFG.DTYPE_QKV == 0 and (CFG.MASK_FLAGS & ~MASK_PADDED) in (MASK_NONE, MASK_CAUSAL)
+)
 
 
 @cute.jit
