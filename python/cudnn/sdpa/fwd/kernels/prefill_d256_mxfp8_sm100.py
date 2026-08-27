@@ -2557,13 +2557,19 @@ def _correction_warp_group(
             nvvm.mbarrier_arrive(mb_qk_sf_reuse_arg.subview(parity_cur_rt))
         if cutlass.const_expr(masked):
             kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+            mask_q_abs = q_abs - (kv_col_base + cutlass.Int32(64))
+            mask_seq_kv = eff_seqlen_kv - (kv_col_base + cutlass.Int32(64))
+            mask_flags = CFG.MASK_FLAGS
+            if cutlass.const_expr(_PADDED_TOP_LEFT_CAUSAL):
+                mask_q_abs = cute.math.min(mask_q_abs, mask_seq_kv - cutlass.Int32(1))
+                mask_flags = MASK_CAUSAL
             raw_hi = apply_mask_chunk(
                 raw_hi,
-                q_abs - (kv_col_base + cutlass.Int32(64)),
+                mask_q_abs,
                 cutlass.Int32(0),
-                eff_seqlen_kv - (kv_col_base + cutlass.Int32(64)),
+                mask_seq_kv,
                 CFG.WINDOW_LEFT,
-                CFG.MASK_FLAGS,
+                mask_flags,
                 N=64,
                 bottom_right=0,
                 causal_diag=None,
