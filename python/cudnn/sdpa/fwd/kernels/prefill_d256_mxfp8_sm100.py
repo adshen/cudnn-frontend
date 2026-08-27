@@ -255,6 +255,7 @@ SCHED_PAYLOAD_WORDS = 12 if (CFG.MASK_FLAGS != 0 or SPLIT_KV > 1) else 8
 _E5_STYLE_KV_PIPELINE = CFG.DTYPE_QKV == 1 or (
     CFG.DTYPE_QKV == 0 and (CFG.MASK_FLAGS & ~MASK_PADDED) in (MASK_NONE, MASK_CAUSAL)
 )
+_PADDED_TOP_LEFT_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.BOTTOM_RIGHT == 0 and CFG.WINDOW_RIGHT == 0
 
 
 @cute.jit
@@ -2293,14 +2294,19 @@ def _softmax_warp_group(
                     else:
                         mask_bottom_right = CFG.BOTTOM_RIGHT
                         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
+                    mask_q_abs = q_abs
+                    mask_flags = CFG.MASK_FLAGS
+                    if cutlass.const_expr(_PADDED_TOP_LEFT_CAUSAL):
+                        mask_q_abs = cute.math.min(q_abs, eff_seqlen_kv - cutlass.Int32(1))
+                        mask_flags = MASK_CAUSAL
                     chunks_S = [
                         apply_mask_chunk(
                             raw_chunks[c],
-                            q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
+                            mask_q_abs - (kv_col_base + cutlass.Int32(c * CHUNK)),
                             cutlass.Int32(0),
                             eff_seqlen_kv - (kv_col_base + cutlass.Int32(c * CHUNK)),
                             CFG.WINDOW_LEFT,
-                            CFG.MASK_FLAGS,
+                            mask_flags,
                             N=CHUNK,
                             bottom_right=mask_bottom_right,
                             causal_diag=causal_diag,
