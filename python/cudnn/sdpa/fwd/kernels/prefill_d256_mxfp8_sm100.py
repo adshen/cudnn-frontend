@@ -223,25 +223,25 @@ def _thd_decode_causal(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
         cutlass.Int32(CGA_TILE_M),
         True,
     )
-    # Keep the heavy-to-light traversal, but interleave pairs of heads so the
-    # last wave is not dominated by one head.  The odd final head, if present,
-    # retains the original head-major order.
+    # Keep the heavy-to-light traversal, but interleave groups of four heads so
+    # the last wave is not dominated by one head.  A partial final group, if
+    # present, retains the original head-major order.
     cuq0 = n_batch
     live = batch < n_batch
     safe_batch = cute.math.min(batch, n_batch - cutlass.Int32(1))
     seq_q = cutlass.Int32(meta[cuq0 + safe_batch + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + safe_batch])
     tiles_q = (seq_q + cutlass.Int32(CGA_TILE_M - 1)) // cutlass.Int32(CGA_TILE_M)
     rank = tiles_q - cutlass.Int32(1) - q_tile
-    pair = head // cutlass.Int32(2)
-    pair_head0 = pair * cutlass.Int32(2)
-    pair_is_full = live & (pair_head0 + cutlass.Int32(1) < n_qh)
-    pair_linear = (head - pair_head0) * tiles_q + rank
-    grouped_head = pair_head0 + (pair_linear & cutlass.Int32(1))
-    grouped_rank = pair_linear // cutlass.Int32(2)
-    head = cutlass.Int32(arith.select(pair_is_full.ir_value(), grouped_head.ir_value(), head.ir_value()))
+    group = head // cutlass.Int32(4)
+    group_head0 = group * cutlass.Int32(4)
+    group_is_full = live & (group_head0 + cutlass.Int32(3) < n_qh)
+    group_linear = (head - group_head0) * tiles_q + rank
+    grouped_head = group_head0 + (group_linear & cutlass.Int32(3))
+    grouped_rank = group_linear // cutlass.Int32(4)
+    head = cutlass.Int32(arith.select(group_is_full.ir_value(), grouped_head.ir_value(), head.ir_value()))
     q_tile = cutlass.Int32(
         arith.select(
-            pair_is_full.ir_value(),
+            group_is_full.ir_value(),
             (tiles_q - cutlass.Int32(1) - grouped_rank).ir_value(),
             q_tile.ir_value(),
         )
