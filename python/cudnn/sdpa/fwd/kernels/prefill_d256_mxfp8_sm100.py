@@ -2033,7 +2033,9 @@ def _softmax_warp_group(
         else:
             # Exact top-left causal has no lower masking boundary.
             left_edge_end = (
-                bounds.left if cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and (CFG.BOTTOM_RIGHT == 0 or bottom_right_diagonal)) else bounds.unmasked_lo
+                bounds.left
+                if cutlass.const_expr((CFG.MASK_FLAGS & ~MASK_PADDED) == MASK_CAUSAL and (CFG.BOTTOM_RIGHT == 0 or bottom_right_diagonal))
+                else bounds.unmasked_lo
             )
             for kv_loop in cutlass.range(bounds.left, left_edge_end, 1, unroll=1):
                 parity_rt = kv_loop & cutlass.Int32(1)
