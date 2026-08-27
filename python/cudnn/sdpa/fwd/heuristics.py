@@ -49,7 +49,7 @@ from cudnn.engines.base import PlanConfig
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.sdpa.fwd.config_sm100 import cga_tile_m, pack_gqa_supported
 from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
-from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, EngineSpec, SdpaFwdKnobs, _band_covers_kv_tail, mismatch
+from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, EngineSpec, SdpaFwdKnobs, _band_covers_kv_tail, effective_cgas, mismatch
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
 _TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
@@ -342,18 +342,19 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int]) -> int:
     """The Q rows one grid tile covers, for :func:`_pack_gqa_wins`.
 
     The SM100 family runs CGA tiles — ``cga_tile_m`` of the flavor the envelope
-    lowering picks for the graph's head dims (d128/d192: 512; d256/d512:
-    256). SM120 launches one CTA per tile, so it is ``tile_m`` itself.
+    lowering picks for the graph's head dims and that flavor's effective CTA
+    group width. SM120 launches one CTA per tile, so it is ``tile_m`` itself.
     """
     if caps.sm_lo >= 120 and caps.sm_hi < 130:
         return tile_m or 128
+    cga = _cga_points(caps, facts)[0]
     if facts.d_qk <= 128 and facts.d_v <= 128:
-        return cga_tile_m(128)
+        return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
-        return cga_tile_m(192)
+        return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
-        return cga_tile_m(256)
-    return cga_tile_m(512)
+        return cga_tile_m(256, cga)
+    return cga_tile_m(512, cga)
 
 
 def _pack_gqa_points(caps: Capabilities, facts, tile_m: int) -> Tuple[bool, ...]:
@@ -440,9 +441,9 @@ def _softmax_points(caps: Capabilities) -> List[Optional[int]]:
     return [None if sole == cudnn.data_type.HALF else sole]
 
 
-def _cga_points(caps: Capabilities) -> List[Optional[int]]:
-    """CGA candidates — every row today declares a single honest point."""
-    return [_sole(caps.cgas)]
+def _cga_points(caps: Capabilities, facts) -> List[Optional[int]]:
+    """CGA candidates for the native flavor selected by this graph."""
+    return [_sole(effective_cgas(caps, facts))]
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +465,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     caps = spec.capabilities
     tiles = _tile_points(spec, facts)
     scheds = _sched_points(caps, facts)
-    cga = _cga_points(caps)[0]
+    cga = _cga_points(caps, facts)[0]
     # pack_gqa couples with the tile axis: a packed set rides the LARGEST
     # SMEM-fitting tile that admits the ratio — packing fixes the underfill
     # small tiles exist for, and a bigger tile admits a bigger G (G must
@@ -528,7 +529,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     return unique[:_MAX_SETS_PER_ENGINE]
 
 
-def _fallback_knobs(caps: Capabilities) -> SdpaFwdKnobs:
+def _fallback_knobs(caps: Capabilities, facts) -> SdpaFwdKnobs:
     """The config expected to build where the tuned choice may not.
 
     Today this is the smallest tile the row admits with the plain scheduler
@@ -539,7 +540,7 @@ def _fallback_knobs(caps: Capabilities) -> SdpaFwdKnobs:
         sched_policy=SCHED_NATURAL if SCHED_NATURAL in caps.sched_policies else _sole(caps.sched_policies),
         tile_m=min(caps.tile_ms, default=None),
         tile_n=min(caps.tile_ns, default=None),
-        cga=_sole(caps.cgas),
+        cga=_sole(effective_cgas(caps, facts)),
         pack_gqa=False if False in caps.pack_gqas else _sole(caps.pack_gqas),
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace
         softmax_precision=_sole(caps.softmax_precisions),
@@ -572,7 +573,7 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities
-        sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(caps)]
+        sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(caps, facts)]
         for knobs in sets:
             if mismatch(caps, facts, knobs) is None:
                 out.append(PlanConfig(engine_id, knobs))
