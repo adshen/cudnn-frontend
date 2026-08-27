@@ -621,7 +621,13 @@ def _kernel(
 
             bars.mb_q_o_alias.arrive()
 
-    scale_log2_fused = scale_softmax_log2 * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+    scale_log2_fused = scale_softmax_log2
+    if cutlass.const_expr(not CFG.THD_VARLEN):
+        scale_log2_fused = (
+            scale_softmax_log2
+            * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+            * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+        )
     o_scale_fused = o_scale_fused * cutlass.Float32(cutlass.make_array_view(descale_v_t)[0]) * cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
 
     nvvm.fence_mbarrier_init()
@@ -640,6 +646,12 @@ def _kernel(
 
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            scale_log2_fused = (
+                scale_softmax_log2
+                * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+                * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+            )
         _softmax_warp_group(
             softmax_half=0,
             seqlen_q=seqlen_q,
@@ -666,6 +678,12 @@ def _kernel(
 
     elif cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 2) and warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_WG1_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        if cutlass.const_expr(CFG.THD_VARLEN):
+            scale_log2_fused = (
+                scale_softmax_log2
+                * cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+                * cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+            )
         _softmax_warp_group(
             softmax_half=1,
             seqlen_q=seqlen_q,
