@@ -1111,13 +1111,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
         )
-        # Of the FP8/MXFP8 flavors only d128/d128 carries the write_thd_meta
-        # THD leg; the d192/d128 siblings are dense-only. The engine specs
-        # already route this (their d192 rows declare thd=False); the gate
-        # covers direct construction.
+        # Per-tensor FP8 carries THD at d128/d128 and d192/d128. MXFP8 still
+        # has only the d128 write_thd_meta path; keep the direct-construction
+        # gate aligned with the engine's per-family thd_d_shapes.
         self._not_implemented_error_if(
-            self.thd and self._fp8 and (int(d_qk), int(d_v)) != (128, 128),
-            f"THD/varlen on the FP8/MXFP8 path requires D_QK=D_V=128 (the d192/d128 " f"kernels are dense-only); got (D_QK={d_qk}, D_V={d_v})",
+            self.thd
+            and self._fp8
+            and not (
+                (self._pertensor and (int(d_qk), int(d_v)) in ((128, 128), (192, 128)))
+                or (not self._pertensor and (int(d_qk), int(d_v)) == (128, 128))
+            ),
+            f"THD/varlen requires per-tensor FP8 at (128, 128) or (192, 128), or MXFP8 at (128, 128); " f"got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -1599,8 +1603,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lse_head_stride=(self.thd_stats_head_stride if (has_lse and self.thd_stats_head_major) else 0),
         )
         if self._fp8:
-            # The FP8/MXFP8 cells serve only the packed contract at exact
-            # d128 (check_support) — no stride/head-dim keys.
+            # FP8/MXFP8 THD serves only native packed contracts. Flavor
+            # selection chooses the exact kernel module, so no stride or
+            # head-dim entries are needed in this per-module compile key.
             return kwargs
         kwargs.update(
             d_qk=self.head_dim_qk,

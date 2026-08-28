@@ -230,6 +230,8 @@ def build_thd_meta_o_kv_descs_kernel(
     n_qh: cutlass.Int32,
     n_batch: cutlass.Int32,
     o_row_stride: cutlass.Int32,
+    k_seq_dim: cutlass.Constexpr[int] = 2,
+    v_seq_dim: cutlass.Constexpr[int] = 2,
 ) -> None:
     """``build_thd_meta_o_descs_kernel`` + packed-total-clamped K/V descriptors
     (the FP8/MXFP8 THD flavors).
@@ -282,12 +284,12 @@ def build_thd_meta_o_kv_descs_kernel(
         k_src = Pointer(base_k_desc.get_ptr(), dtype=cutlass.Int64)
         for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
             (k_dptr + i).store((k_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=2)
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, k_dptr, new_value=t_kv, ord=k_seq_dim)
         v_dptr = desc_base + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)
         v_src = Pointer(base_v_desc.get_ptr(), dtype=cutlass.Int64)
         for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
             (v_dptr + i).store((v_src + i).load())
-        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=2)
+        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, v_dptr, new_value=t_kv, ord=v_seq_dim)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,
