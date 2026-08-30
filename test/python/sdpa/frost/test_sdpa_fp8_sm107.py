@@ -284,7 +284,8 @@ def test_fp8_rows_serve_dense_envelope():
     for arch in ("sm100", "sm107"):
         row = caps[engines.engine_name(arch=arch, fp8=True)]
         assert row.d_pad_multiple == 16, arch
-        assert row.thd_d_shapes == frozenset({(128, 128)}), arch
+        expected_thd = frozenset({(128, 128), (192, 128)}) if arch == "sm100" else frozenset({(128, 128)})
+        assert row.thd_d_shapes == expected_thd, arch
     assert caps[engines.engine_name(mxfp8=True)].d_pad_multiple == 0
 
 
@@ -326,8 +327,8 @@ def test_fp8_envelope_mismatch_rules():
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
     assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
-    # THD at the d192 native shape is dense-only (thd_d_shapes = {(128, 128)}).
-    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True))
+    # SM100 carries THD at both native per-tensor FP8 shapes.
+    assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True)) is None
     # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case)
     # but has no d192 flavor at all.
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
