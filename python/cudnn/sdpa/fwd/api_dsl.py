@@ -1111,17 +1111,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
         )
-        # Per-tensor FP8 carries THD at d128/d128 and d192/d128. MXFP8 still
-        # has only the d128 write_thd_meta path; keep the direct-construction
-        # gate aligned with the engine's per-family thd_d_shapes.
+        # Both FP8 families carry THD at their two native SM100 shapes.
         self._not_implemented_error_if(
             self.thd
             and self._fp8
             and not (
-                (self._pertensor and (int(d_qk), int(d_v)) in ((128, 128), (192, 128)))
-                or (not self._pertensor and (int(d_qk), int(d_v)) == (128, 128))
+                (int(d_qk), int(d_v)) in ((128, 128), (192, 128))
             ),
-            f"THD/varlen requires per-tensor FP8 at (128, 128) or (192, 128), or MXFP8 at (128, 128); " f"got (D_QK={d_qk}, D_V={d_v})",
+            f"THD/varlen requires a native FP8-family shape at (128, 128) or (192, 128); " f"got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -1221,14 +1218,72 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
             # selects the equivalent masked-interior lowering.
             template_window_right = self.s_k_max
+        dtype_qkv_code = _SM100_DTYPE_QKV_CODE[self.dtype]
+        # For an unpadded square matrix the bottom-right diagonal shift
+        # S_KV-S_Q is zero, so it can reuse the measured top-left specialization.
+        d192_square_br_as_tl = (
+            self.flavor == (192, 128)
+            and self.split_kv == 1
+            and not self.thd
+            and not self.seq_q_lens_present
+            and not self.seq_kv_lens_present
+            and self.window_left is None
+            and self.window_right == 0
+            and self.causal_bottom_right
+            and self.s_q_max == self.s_k_max
+            and 4096 < self.s_k_max <= 8192
+        )
+        template_bottom_right = False if d192_square_br_as_tl else self.causal_bottom_right
+        d192_mx_dense_mid_causal_cga1 = (
+            mxfp8
+            and self.flavor == (192, 128)
+            and self.split_kv == 1
+            and not self.thd
+            and self.window_left is None
+            and self.window_right == 0
+            and not template_bottom_right
+            and 4096 < self.s_k_max <= 8192
+            and (dtype_qkv_code == DTYPE_E5M2 or self.s_q_max >= 4096)
+        )
+        if d192_mx_dense_mid_causal_cga1:
+            sched_policy = SCHED_NATURAL
+        # Per-tensor D192 favors independent CTAs for dense sliding windows and
+        # E5M2 no-mask.  Keep cga2's KV reuse for causal, THD, and split-KV.
+        d192_pt_cga1 = (
+            self._pertensor
+            and self.flavor == (192, 128)
+            and self.split_kv == 1
+            and not self.thd
+            and (self.window_left is not None or (dtype_qkv_code == DTYPE_E5M2 and self.window_right is None))
+        )
+        d192_mx_cga1 = False
+        # D192 MX cga1 trades two-CTA cooperation for twice as many independent
+        # cluster work assignments and half the KV stage depth. Small packed
+        # SWA tiles need cga2's reuse;
+        # masked dense and sufficiently long packed tiles favor cga1.
+        if mxfp8 and self.flavor == (192, 128) and self.split_kv == 1:
+            masked = self.window_right is not None
+            sliding = self.window_left is not None
+            if self.thd:
+                if dtype_qkv_code == DTYPE_E5M2 and not masked:
+                    d192_mx_cga1 = True
+                elif masked and sliding:
+                    min_s_k = 4096 if dtype_qkv_code == DTYPE_E4M3 else 2048
+                    d192_mx_cga1 = self.s_k_max >= min_s_k
+                elif masked:
+                    d192_mx_cga1 = self.s_k_max >= 2048
+            elif masked:
+                d192_mx_cga1 = dtype_qkv_code == DTYPE_E4M3 or sliding or self.s_k_max <= 4096
+        if d192_mx_dense_mid_causal_cga1:
+            d192_mx_cga1 = True
         from cudnn import data_type as _cudnn_dtype
 
         params = Sm100TemplateParams(
-            dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
+            dtype_qkv=dtype_qkv_code,
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
             window_right=template_window_right,
-            bottom_right=self.causal_bottom_right,
+            bottom_right=template_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
@@ -1239,6 +1294,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
+            cta_mma=1 if d192_pt_cga1 or d192_mx_cga1 else 2,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
         )
