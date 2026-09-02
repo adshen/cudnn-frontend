@@ -1151,10 +1151,9 @@ def _run_thd(
         kw.update(seq_len_q=sq_h, seq_len_kv=skv_h)
     if bottom_right:
         kw["use_causal_mask_bottom_right"] = True
-    elif causal:
+    elif causal or swa_window is not None:
         kw["use_causal_mask"] = True
     if swa_window is not None:
-        kw["use_causal_mask"] = True
         kw["left_bound"] = swa_window + 1
     vp = {
         tq: q_gpu,
@@ -1775,17 +1774,14 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 
 @pytest.mark.L0
 @_skip_d512_on_rubin
-def test_fp8_d512_envelope_floor_declines_below_256():
-    """Below the d512 floor the adapter declines instead of routing a much
-    smaller graph onto a kernel tuned for d = 512 (there is no d256 FP8
-    kernel, so d256 has no home -- that is the honest answer, not a 2x-padded
-    d512 launch).  Straddling the floor is declined too."""
+def test_fp8_d512_envelope_floor_declines_straddling_shapes():
+    """D256 serves its own envelope; shapes straddling the D512 floor decline."""
     from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
 
     shapes = _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    for d_qk, d_v in [(384, 448), (464, 368), (272, 272), (512, 512)]:
+    for d_qk, d_v in [(160, 160), (256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
-    for d_qk, d_v in [(256, 256), (160, 160), (384, 128), (512, 256)]:
+    for d_qk, d_v in [(272, 256), (384, 128), (512, 256)]:
         assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
 

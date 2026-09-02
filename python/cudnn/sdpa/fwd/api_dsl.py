@@ -1754,7 +1754,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             #
             # CGA_SIZE (= CGA_M * CGA_N) is the CTA count of ONE cluster, which
             # is what the grid is laid out in: grid_x = units * CGA_M. It equals
-            # CTA_MMA on the cga2 flavors (d128/d192/d256) but NOT on d512,
+            # CTA_MMA on the d128/d192/d256 flavors but NOT on d512,
             # which pairs CGA_M=4 with CTA_MMA=2 — capping on CTA_MMA there
             # would launch 2x the CTAs the device holds resident. CTA_MMA stays
             # as the fallback so a module predating CGA_SIZE still caps.

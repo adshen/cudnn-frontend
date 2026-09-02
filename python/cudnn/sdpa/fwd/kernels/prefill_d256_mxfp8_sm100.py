@@ -2018,9 +2018,7 @@ def _softmax_warp_group(
                         size=CHUNK,
                     )
 
-                    cute.arch.inline_ptx('.pragma "set knob SchedResBusyXU64=1";')
                     reg_S_half = reg_S_half * scale_log2
-                    cute.arch.inline_ptx('.pragma "reset knob SchedResBusyXU64=1";')
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 if cutlass.const_expr(CFG.SOFTMAX_WARPGROUPS == 1 or softmax_half == 0):
                     if nvvm.elect_sync():
@@ -2649,8 +2647,9 @@ def _correction_warp_group(
         if has_previous_o:
             all_alpha_one = vote_sync(0xFFFFFFFF, alpha == cutlass.Float32(1.0), VoteSync.ALL)
             bmm2_done_phase_prev = (bmm2_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
+            # Each iteration must consume its BMM2 phase before O can be reused.
+            bars_arg.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
             if ~all_alpha_one:
-                bars_arg.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
                 for chunk_idx in cutlass.range_constexpr(n_chunks_o):
                     o_addr = tmem_base_arg + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * o_chunk_size)
                     o_vec = nvvm.tcgen05_ld(
@@ -2821,11 +2820,10 @@ def _correction_warp_group(
             bars.mb_stat_empty.arrive()
 
             bmm2_done_phase_prev = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
+            # Each iteration must consume its BMM2 phase before O can be reused.
+            bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
             if cutlass.const_expr(CFG.MASK_FLAGS != MASK_NONE):
-                # Consecutive BMM2s are ordered by their single MMA warp.  The
-                # correction role needs completion only before it modifies O.
                 if ~all_alpha_one:
-                    bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                         o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
                         o_chunk = nvvm.tcgen05_ld(
@@ -2838,7 +2836,6 @@ def _correction_warp_group(
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             else:
                 if ~all_alpha_one:
-                    bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                         o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
                         o_chunk = nvvm.tcgen05_ld(
@@ -3249,6 +3246,9 @@ def _host(
             cutlass.Int32(QH),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int32(rows_per_cluster),
+            n_thd_units,
+            1,
             1,
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
@@ -3429,7 +3429,7 @@ def compile(  # noqa: A001
         fake_thd_kv_lens,
         fake_thd_lens_form,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options=("--enable-tvm-ffi --ptxas-options -uumn" if CFG.MASK_FLAGS == MASK_NONE else "--enable-tvm-ffi"),
+        options="--enable-tvm-ffi",
     )
 
 

@@ -1047,7 +1047,7 @@ def _run_thd(
         kw.update(cu_seq_len_q=sq_h, cu_seq_len_kv=skv_h)
     else:
         kw.update(seq_len_q=sq_h, seq_len_kv=skv_h)
-    assert not (bottom_right and (causal or swa_window is not None))
+    assert not (bottom_right and causal)
     if bottom_right:
         kw["use_causal_mask_bottom_right"] = True
     elif causal or swa_window is not None:

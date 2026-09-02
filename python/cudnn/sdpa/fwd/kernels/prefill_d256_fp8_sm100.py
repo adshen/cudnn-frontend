@@ -2300,12 +2300,10 @@ def _correction_warp_group(
             _stat_arrive(bars.mb_stat_empty, _STAT_EMPTY_WARP_ARRIVALS)
 
             bmm2_done_phase_prev = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
-            if cutlass.const_expr(not _RARE_RESCALE_CORRECTION):
-                bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
+            # Each iteration must consume its BMM2 phase before O can be reused.
+            bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
 
             if ~all_alpha_one:
-                if cutlass.const_expr(_RARE_RESCALE_CORRECTION):
-                    bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
                 for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                     o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
                     o_chunk = nvvm.tcgen05_ld(
@@ -2640,6 +2638,9 @@ def _host(
             cutlass.Int32(QH),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int32(rows_per_cluster),
+            n_thd_units,
+            1,
             1,
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
