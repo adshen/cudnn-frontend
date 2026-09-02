@@ -212,7 +212,8 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                     !d512_supported,
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "hidden_dim d_v should be less than or equal to 128 and hidden_dim d_v should be multiple of 16 "
-                "unless d_qk == d_v == 256 (requires cuDNN 9.26+) or both head dims are in (256, 512] and multiples of 16");
+                "unless d_qk == d_v == 256 (requires cuDNN 9.26+) or both head dims are in (256, 512] and multiples of "
+                "16");
         } else {
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 (d_qk > 256) || (d_qk % 16 != 0) || (d_v > 256) || (d_v % 16 != 0),

@@ -1322,8 +1322,7 @@ def _mma_warp_group(
                 desc_Q,
                 desc_K,
                 tmem_raw.subview(tmem_S_acc_lo_addr),
-                elect_once=(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0)
-                or (CFG.DTYPE_QKV == 0 and _PADDED_TOP_LEFT_CAUSAL),
+                elect_once=(CFG.DTYPE_QKV == 1 and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0) or (CFG.DTYPE_QKV == 0 and _PADDED_TOP_LEFT_CAUSAL),
             )
             elect_p = nvvm.elect_sync()
             bars.mb_bmm1_done[lo_parity_runtime].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)

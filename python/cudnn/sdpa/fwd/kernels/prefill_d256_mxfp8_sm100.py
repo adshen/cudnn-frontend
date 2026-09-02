@@ -203,12 +203,7 @@ from cudnn.sdpa.fwd.kernels.thd_sm100 import (
 )
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
-_THD_REVERSE_CAUSAL_ROWS = (
-    CFG.THD_VARLEN
-    and CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED)
-    and CFG.BOTTOM_RIGHT == 0
-    and CFG.WINDOW_RIGHT == 0
-)
+_THD_REVERSE_CAUSAL_ROWS = CFG.THD_VARLEN and CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.BOTTOM_RIGHT == 0 and CFG.WINDOW_RIGHT == 0
 
 
 @cute.jit
@@ -312,9 +307,7 @@ LAYOUT = KernelTmemLayout()
 # Slots 6:10 carry predecoded bounds and slot 10 carries the split index.  The
 # unsplit/no-mask specialization retains the original eight-word payload.
 SCHED_PAYLOAD_WORDS = 12 if (CFG.MASK_FLAGS != 0 or SPLIT_KV > 1) else 8
-_E5_STYLE_KV_PIPELINE = CFG.DTYPE_QKV == 1 or (
-    CFG.DTYPE_QKV == 0 and (CFG.MASK_FLAGS & ~MASK_PADDED) in (MASK_NONE, MASK_CAUSAL)
-)
+_E5_STYLE_KV_PIPELINE = CFG.DTYPE_QKV == 1 or (CFG.DTYPE_QKV == 0 and (CFG.MASK_FLAGS & ~MASK_PADDED) in (MASK_NONE, MASK_CAUSAL))
 _PADDED_TOP_LEFT_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.BOTTOM_RIGHT == 0 and CFG.WINDOW_RIGHT == 0
 
 
@@ -2994,8 +2987,7 @@ def _correction_warp_group(
                     # sanitize it. Plain top-left/SWA and square bottom-right
                     # always retain the diagonal, so keep this off their hot path.
                     if cutlass.const_expr(
-                        not _PADDED_TOP_LEFT_CAUSAL
-                        and (CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal))
+                        not _PADDED_TOP_LEFT_CAUSAL and (CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal))
                     ):
                         zero = cutlass.Float32(0.0)
                         invalid = row_dead
