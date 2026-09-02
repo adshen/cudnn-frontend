@@ -500,9 +500,44 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     strict_top_left_causal = (mask_flags & ~MASK_PADDED) == MASK_CAUSAL and not params.bottom_right and not params.window_right
     fused_corr_split_p = mxfp8 and strict_top_left_causal
     pt_lpt_l2 = not mxfp8 and mask_flags == MASK_CAUSAL and not params.bottom_right and params.lpt_q_tiles >= 16
-    mx_causal_role_swap = mxfp8 and strict_top_left_causal
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+
+    # These register profiles are coupled to the kernel's role topologies;
+    # they are not independent public knobs.
+    pt_e4_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
+    pt_e5_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
+    softmax_regs, softmax_wg1_regs, correction_regs = 240, 136 if split_p else 40, 96
+    if fused_corr_split_p:
+        softmax_regs, softmax_wg1_regs, correction_regs = 248, 216, 64
+    elif mxfp8 and split_p:
+        softmax_regs, softmax_wg1_regs, correction_regs = 256, 144, 72
+    elif pt_thd_split_p:
+        softmax_wg1_regs, correction_regs = 144, 88
+    elif pt_e4_causal_regs:
+        correction_regs = 64
+        if split_p:
+            softmax_regs = 216
+            softmax_wg1_regs = 168
+    elif pt_e5_causal_regs:
+        correction_regs = 96 if split_p else 112
+    elif mxfp8 and mask_flags != MASK_NONE:
+        correction_regs = 64
+        if params.dtype_qkv == DTYPE_E5M2 or (params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL):
+            softmax_regs = 248
+    elif not mxfp8 and fp8 and mask_flags != MASK_NONE:
+        correction_regs = 104
+    elif not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_NONE:
+        correction_regs = 88
+
+    if fused_corr_split_p:
+        total_warps, softmax_wg1_base, correction_warp_base, mma_warp_id, read_tile_arrivers = 12, 4, 64, 8, 11
+    elif split_p:
+        total_warps, softmax_wg1_base, correction_warp_base, mma_warp_id, read_tile_arrivers = 16, 4, 8, 12, 15
+    else:
+        total_warps, softmax_wg1_base, correction_warp_base, mma_warp_id = 12, 64, 4, 8
+        read_tile_arrivers = 11 if fp8 else 21
+
     cfg = CfgD256(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -523,62 +558,18 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SOFTMAX_WARPGROUPS=2 if split_p or fused_corr_split_p else 1,
         CORRECTION_WARPS=0 if fused_corr_split_p else 4,
         FUSED_CORR_SPLIT_P=1 if fused_corr_split_p else 0,
-        SOFTMAX_REGS=(
-            248
-            if fused_corr_split_p
-            else (
-                256
-                if mxfp8 and split_p and mask_flags == MASK_NONE
-                else (
-                    248
-                    if mxfp8 and mask_flags != MASK_NONE and (params.dtype_qkv == DTYPE_E5M2 or (params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL))
-                    else 216 if not mxfp8 and split_p and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right else 240
-                )
-            )
-        ),
-        SOFTMAX_WG1_REGS=(
-            168
-            if split_p and not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
-            else 216 if fused_corr_split_p else 144 if pt_thd_split_p or (mxfp8 and split_p and mask_flags == MASK_NONE) else 136 if split_p else 40
-        ),
-        CORRECTION_REGS=(
-            88
-            if pt_thd_split_p
-            else (
-                72
-                if mxfp8 and split_p and mask_flags == MASK_NONE
-                else (
-                    64
-                    if mxfp8 and mask_flags != MASK_NONE
-                    else (
-                        112
-                        if not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right and not split_p
-                        else (
-                            96
-                            if not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
-                            else (
-                                64
-                                if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
-                                else (
-                                    104
-                                    if not mxfp8 and fp8 and mask_flags != MASK_NONE
-                                    else 88 if not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_NONE else 96
-                                )
-                            )
-                        )
-                    )
-                )
-            )
-        ),
-        TOTAL_WARPS=12 if fused_corr_split_p else 16 if split_p else 12,
-        THREADS_PER_CTA=(12 if fused_corr_split_p else 16 if split_p else 12) * 32,
-        SOFTMAX_WG1_BASE=4 if fused_corr_split_p or split_p else 64,
-        CORR_WARP_BASE=64 if fused_corr_split_p else 8 if split_p or mx_causal_role_swap else 4,
-        MMA_WARP_ID=8 if fused_corr_split_p else 4 if mx_causal_role_swap else 12 if split_p else 8,
-        TMALDG_WARP_ID=9 if fused_corr_split_p else 5 if mx_causal_role_swap else 13 if split_p else 9,
-        TMASTG_WARP_ID=10 if fused_corr_split_p else 6 if mx_causal_role_swap else 14 if split_p else 10,
-        SCHED_WARP_ID=11 if fused_corr_split_p else 7 if mx_causal_role_swap else 15 if split_p else 11,
-        READ_TILE_ARRIVERS=11 if fused_corr_split_p else 15 if split_p else 11 if fp8 else 21,
+        SOFTMAX_REGS=softmax_regs,
+        SOFTMAX_WG1_REGS=softmax_wg1_regs,
+        CORRECTION_REGS=correction_regs,
+        TOTAL_WARPS=total_warps,
+        THREADS_PER_CTA=total_warps * 32,
+        SOFTMAX_WG1_BASE=softmax_wg1_base,
+        CORR_WARP_BASE=correction_warp_base,
+        MMA_WARP_ID=mma_warp_id,
+        TMALDG_WARP_ID=mma_warp_id + 1,
+        TMASTG_WARP_ID=mma_warp_id + 2,
+        SCHED_WARP_ID=mma_warp_id + 3,
+        READ_TILE_ARRIVERS=read_tile_arrivers,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
