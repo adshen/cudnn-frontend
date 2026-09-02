@@ -198,8 +198,9 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             # The sink logit is folded into the softmax denominator in the
             # per-tile epilogue, so every split would add its own copy of it.
             raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
-    if k.lpt_head_group not in (1, 8, 16, 32):
-        raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, 16, or 32; got {k.lpt_head_group}")
+    lpt_head_groups = (1, 8, 16, 32) if flavor == "d256" else (1, 8, 16)
+    if k.lpt_head_group not in lpt_head_groups:
+        raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be one of {lpt_head_groups}; got {k.lpt_head_group}")
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
@@ -475,13 +476,12 @@ def derive_d256_internal_params(
     pack_gqa_ratio = params.qh_per_kh if params.pack_gqa else 1
     groups = batch_size * h_q // pack_gqa_ratio
     lpt_head_group = 32 if pertensor and groups % 32 == 0 else 8 if not pertensor and groups % 8 == 0 else 1
-    lpt_q_tiles = (s_q + 255) // 256 if pertensor else 0
+    q_tiles = (s_q + 255) // 256 if pertensor else 0
     mask_flags = _mask_flags_from(params)
-    pt_lpt_l2 = pertensor and params.sched_policy == SCHED_LPT_L2 and mask_flags == MASK_CAUSAL and not params.bottom_right and lpt_q_tiles >= 16
+    pt_lpt_l2 = pertensor and params.sched_policy == SCHED_LPT_L2 and mask_flags == MASK_CAUSAL and not params.bottom_right and q_tiles >= 16
     return replace(
         params,
         lpt_head_group=lpt_head_group,
-        lpt_q_tiles=lpt_q_tiles,
         lpt_l2_size_mib=32 if pt_lpt_l2 else 0,
     )
 
