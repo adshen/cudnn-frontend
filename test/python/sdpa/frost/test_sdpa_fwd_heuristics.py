@@ -202,6 +202,47 @@ def test_d256_fp8_config_requires_cga1():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("mxfp8", [False, True], ids=["per_tensor", "block_scale"])
+@pytest.mark.parametrize("sched_policy", [0, 1, 2], ids=["natural", "lpt", "lpt_l2"])
+def test_d256_config_honors_explicit_scheduler(mxfp8, sched_policy):
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3, DTYPE_FP16
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256, make_cfg_d256_mxfp8
+
+    params = TemplateParams(
+        dtype_qkv=DTYPE_E4M3,
+        dtype_o=DTYPE_FP16,
+        window_right=0,
+        sched_policy=sched_policy,
+        cta_mma=1,
+    )
+    make_cfg = make_cfg_d256_mxfp8 if mxfp8 else make_cfg_d256
+    assert make_cfg(params)[0].SCHEDULER_POLICY == sched_policy
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("mxfp8", "expected_sched"),
+    [(False, 2), (True, 1)],
+    ids=["per_tensor_lpt_l2", "block_scale_lpt"],
+)
+def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
+    name = engines.engine_name(mxfp8=mxfp8, fp8=not mxfp8)
+    facts = _facts(
+        s_q=8192,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.HALF,
+        is_mxfp8=mxfp8,
+        is_fp8=not mxfp8,
+    )
+    plans = recommend("A", facts, {name: 20510})
+    assert plans[0].knobs.cga == 1
+    assert plans[0].knobs.split_kv == 1
+    assert plans[0].knobs.sched_policy == expected_sched
+
+
+@pytest.mark.L0
 def test_assemble_strips_mode_dedups_and_our_proposals_lead():
     """Placement is the SHARED layer's job (engines/heuristics._assemble):
     proposals lead the backend's entries inside each mode block by standing

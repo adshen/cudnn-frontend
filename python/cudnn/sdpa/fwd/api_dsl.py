@@ -1291,6 +1291,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 s_kv=self.s_k_max,
             )
         elif self.flavor == (256, 256):
+            from cudnn.sdpa.fwd.heuristics import select_d256_auto_knobs
+
+            auto_sched, auto_cga = select_d256_auto_knobs(
+                params,
+                pertensor=self._pertensor,
+                s_q=self.s_q_max,
+                s_kv=self.s_k_max,
+            )
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
+            )
             params = canonicalize_d256_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
             params = derive_d256_internal_params(
                 params,

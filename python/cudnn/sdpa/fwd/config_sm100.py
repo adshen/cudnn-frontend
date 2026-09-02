@@ -408,9 +408,7 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
     fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
     split_p = cfg.SOFTMAX_WARPGROUPS == 2
     fused_corr_split_p = cfg.FUSED_CORR_SPLIT_P == 1
-    split_p_supported = fp8 and (
-        cfg.MASK_FLAGS == MASK_NONE or ((cfg.MASK_FLAGS & ~MASK_PADDED) == MASK_CAUSAL and cfg.BOTTOM_RIGHT == 0)
-    )
+    split_p_supported = fp8 and (cfg.MASK_FLAGS == MASK_NONE or ((cfg.MASK_FLAGS & ~MASK_PADDED) == MASK_CAUSAL and cfg.BOTTOM_RIGHT == 0))
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (
@@ -439,10 +437,10 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
             raise ValueError(msg)
 
 
-def canonicalize_d256_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -> TemplateParams:
-    """Apply strictly equivalent D256 lowering canonicalizations."""
+def d256_square_br_as_tl(params: TemplateParams, *, s_q: int, s_kv: int) -> bool:
+    """Whether a D256 bottom-right mask is exactly top-left causal."""
 
-    square_bottom_right = (
+    return (
         params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
         and not params.thd_varlen
         and not params.seq_q_lens_present
@@ -452,7 +450,12 @@ def canonicalize_d256_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -
         and params.bottom_right
         and s_q == s_kv
     )
-    return replace(params, bottom_right=False) if square_bottom_right else params
+
+
+def canonicalize_d256_lowering(params: TemplateParams, *, s_q: int, s_kv: int) -> TemplateParams:
+    """Apply strictly equivalent D256 lowering canonicalizations."""
+
+    return replace(params, bottom_right=False) if d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params
 
 
 def derive_d256_internal_params(
@@ -473,7 +476,14 @@ def derive_d256_internal_params(
     groups = batch_size * h_q // pack_gqa_ratio
     lpt_head_group = 32 if pertensor and groups % 32 == 0 else 8 if not pertensor and groups % 8 == 0 else 1
     lpt_q_tiles = (s_q + 255) // 256 if pertensor else 0
-    return replace(params, lpt_head_group=lpt_head_group, lpt_q_tiles=lpt_q_tiles)
+    mask_flags = _mask_flags_from(params)
+    pt_lpt_l2 = pertensor and params.sched_policy == SCHED_LPT_L2 and mask_flags == MASK_CAUSAL and not params.bottom_right and lpt_q_tiles >= 16
+    return replace(
+        params,
+        lpt_head_group=lpt_head_group,
+        lpt_q_tiles=lpt_q_tiles,
+        lpt_l2_size_mib=32 if pt_lpt_l2 else 0,
+    )
 
 
 def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, TmaIters]:
@@ -485,11 +495,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         raise ValueError(f"d256: {'FP8/MXFP8' if fp8 else 'BF16/FP16'} requires cta_mma={cga}; got {params.cta_mma}")
     mask_flags = _mask_flags_from(params)
     pt_plain_top_left_causal = (
-        not mxfp8
-        and (mask_flags & ~MASK_PADDED) == MASK_CAUSAL
-        and not params.bottom_right
-        and not params.window_left
-        and not params.window_right
+        not mxfp8 and (mask_flags & ~MASK_PADDED) == MASK_CAUSAL and not params.bottom_right and not params.window_left and not params.window_right
     )
     split_p = fp8 and (mask_flags == MASK_NONE or pt_plain_top_left_causal)
     pt_thd_split_p = pt_plain_top_left_causal and bool(mask_flags & MASK_PADDED)
@@ -499,7 +505,6 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     # grow pathologically without changing the supported mask semantics.
     strict_top_left_causal = (mask_flags & ~MASK_PADDED) == MASK_CAUSAL and not params.bottom_right and not params.window_right
     fused_corr_split_p = mxfp8 and strict_top_left_causal
-    pt_lpt_l2 = not mxfp8 and mask_flags == MASK_CAUSAL and not params.bottom_right and params.lpt_q_tiles >= 16
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
 
@@ -575,8 +580,8 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
-        SCHEDULER_POLICY=(SCHED_NATURAL if mask_flags == MASK_NONE else params.sched_policy if pt_lpt_l2 else SCHED_LPT) if fp8 else params.sched_policy,
-        L2_SIZE_MIB=32 if pt_lpt_l2 else 60,
+        SCHEDULER_POLICY=params.sched_policy,
+        L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
