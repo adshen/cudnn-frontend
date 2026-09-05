@@ -1800,11 +1800,10 @@ def test_fp8_envelope_floor_matches_engine_row():
 
 @pytest.mark.L0
 @_skip_d512_on_rubin
-def test_fp8_d512_mxfp8_declines():
-    """There is no d512 block-scale kernel: an MXFP8 d512 graph must be
-    rejected up front, not fail late in the lowering."""
+def test_fp8_d512_family_shape_maps():
+    """D512 per-tensor and MXFP8 are native SM100 shapes; Rubin has neither."""
     from cudnn.sdpa.fwd.api_dsl import _sm100_fp8_shapes
 
     assert (512, 512) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
-    assert (512, 512) not in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
+    assert (512, 512) in _sm100_fp8_shapes(pertensor=False, device_cc=(10, 0))
     assert (512, 512) not in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))

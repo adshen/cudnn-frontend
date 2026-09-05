@@ -87,6 +87,7 @@ _SM100_MXFP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_mxfp8_sm100.py",
     (192, 128): "prefill_d192_d128_mxfp8_sm100.py",
     (256, 256): "prefill_d256_mxfp8_sm100.py",
+    (512, 512): "prefill_d512_mxfp8_sm100.py",
 }
 _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_FP8_KERNEL_FILES = {
@@ -1116,7 +1117,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
-        supported_cgas = (1, 2) if self.flavor == (192, 128) else (1,) if self._fp8 and self.flavor == (256, 256) else (2,)
+        single_cta_fp8 = self._fp8 and (self.flavor == (256, 256) or (not self._pertensor and self.flavor == (512, 512)))
+        supported_cgas = (1, 2) if self.flavor == (192, 128) else (1,) if single_cta_fp8 else (2,)
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",
@@ -1340,6 +1342,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 batch_size=self.batch_size,
                 h_q=self.h_q,
                 s_q=self.s_q_max,
+            )
+        elif self.flavor == (512, 512) and not self._pertensor:
+            from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
+
+            auto_sched, auto_cga = select_d512_auto_knobs(params, pertensor=False)
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
